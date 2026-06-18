@@ -58,7 +58,7 @@ does not support VP9 hardware decode. The app could:
     - d8 binary (native, ARM)
     - JS driver
     - Wasm module under test
-  - Modes
+  - Shell wrappers
     - Generate x86 or ARM asm for this wasm module
     - Benchmark this many frames for this video on host or device
     - Benchmark function slot X in this wasm module
