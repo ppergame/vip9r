@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "crates/vip9r-core",
+  "crates/vip9r-tools",
+  "crates/vip9r-wasm",
+]
+default-members = [
+  "crates/vip9r-tools",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+publish = false
+version = "0.1.0"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+overflow-checks = true

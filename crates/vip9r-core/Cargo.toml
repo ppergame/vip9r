@@ -1,0 +1,9 @@
+[package]
+name = "vip9r-core"
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[features]
+default = ["std"]
+std = []

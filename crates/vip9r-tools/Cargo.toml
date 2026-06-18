@@ -1,0 +1,12 @@
+[package]
+name = "vip9r-tools"
+edition.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "vip9r"
+path = "src/main.rs"
+
+[dependencies]
+vip9r-core = { path = "../vip9r-core" }
