@@ -44,9 +44,9 @@
         patchelf \
           --set-interpreter ${pkgs.stdenv.cc.bintools.dynamicLinker} \
           --set-rpath ${pkgs.lib.makeLibraryPath [
-            pkgs.glibc
-            pkgs.stdenv.cc.cc.lib
-          ]} \
+          pkgs.glibc
+          pkgs.stdenv.cc.cc.lib
+        ]} \
           "$out/d8"
       '';
     v8 = {
@@ -82,6 +82,12 @@
           "wasm32-unknown-unknown"
         ];
       };
+    npmUnavailable = pkgs.writeShellScriptBin "npm" ''
+            cat >&2 <<'EOF'
+      use pnpm
+      EOF
+            exit 1
+    '';
   in {
     devShells.${system}.default = pkgs.mkShell {
       V8_LINUX64 = "${v8.linux64}";
@@ -92,7 +98,13 @@
       D8_ANDROID_ARM32 = "${v8.androidArm32}/d8";
       D8_ANDROID_ARM64 = "${v8.androidArm64}/d8";
 
+      shellHook = ''
+        export PATH="${npmUnavailable}/bin:$PATH"
+        alias npm='${npmUnavailable}/bin/npm'
+      '';
+
       packages = with pkgs; [
+        npmUnavailable
         binaryen
         libvpx
         nodejs

@@ -1,1 +1,8 @@
+minimumReleaseAge: 10080
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
+trustLockfile: false
+allowBuilds:
+  '@google/genai': true
+  protobufjs: true
 storeDir: ${HOME}/.local/share/pnpm/store

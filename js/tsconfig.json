@@ -8,7 +8,8 @@
     "noEmit": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "lib": ["ES2022", "WebWorker"]
+    "lib": ["ES2022", "WebWorker"],
+    "types": ["node"]
   },
-  "include": ["src", "vite.config.ts", "vite.d8.config.ts"]
+  "include": ["src", "vite.config.ts", "vite.d8.config.ts", "vite.pi-harness.config.ts"]
 }
