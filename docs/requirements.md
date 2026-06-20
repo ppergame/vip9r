@@ -63,6 +63,17 @@ does not support VP9 hardware decode. The app could:
     - Benchmark this many frames for this video on host or device
     - Benchmark function slot X in this wasm module
 
+## Testing strategy
+
+- Unit tests: disposable, as needed to pin decisions and bug fixes. Not
+  interested in full coverage
+- Integration tests
+  - Partial computation within a frame: nice-to-have. Remove if the test blocks
+    a desired architecture change
+  - Frame-level correctness: mandatory
+  - Clip-level correctness: mandatory
+  - H.264 output quality: nice-to-have
+
 ## Agent roles and scope
 
 ### You, the agent reading this
@@ -109,7 +120,7 @@ moment the session is done.
 Scope: one decoder implementation functional block or optimization strategy.
 Roughly a commit's worth.
 
-Sandboxed implementation agent with no network access and limited inputs:
+Sandboxed implementation agent with limited inputs:
 
 - specs and test media
 - handle to performance oracle and instructions for use

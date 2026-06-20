@@ -1,91 +1,72 @@
 # vip9r — tracker
 
-The "what's next" surface. Co-maintained by the user and the agent. Keep this
-as an ordered backlog, not an architecture commitment.
+The "what's next" surface. Co-maintained by the user and the agent. Keep this as
+an ordered backlog, not an architecture commitment.
 
-## How to read this
+## How to edit this
 
-Every item carries a **next-step tag** — what kind of action unblocks it:
-
-- `[define]` — needs more specification (user + agent edit AGENTS.md / design.md)
-- `[procure]` — needs an external input (user supplies: corpus, device, specs)
-- `[tool]` — needs trusted harness/oracle code (built at the top layer, never by
-  grinders)
-- `[grind]` — ready for a codex implementor / optimizer
-
-Status: `todo` / `wip` / `done`. "What's next" = the lowest open milestone's
-unblocked items; the tag says who acts.
-
-**Two independent tracks until M2.** The correctness path runs on host d8
-against conformance vectors and generated goldens; it needs no device. The
-device path (rooting, pinning, the device d8 endpoint) only gates the optimize
-campaign. Don't sink time into device plumbing before the decode-correct loop
-exists.
+- Prefix a task with `user:` only when it needs external input or a decision
+  from the user.
+- Move bullets to change priority. `Now` is the default work queue.
 
 ## Now
 
-M0 bootstrap. Nothing built yet. The first unblocks are `[procure]`
-(conformance vectors) and `[tool]` (wasm skeleton + host d8 build + frame-output
-golden harness) on the correctness path. Device path can wait.
+M0 bootstrap, host-only correctness path. Nothing built yet.
 
----
+- [ ] user: VP9 profile 0 / 8-bit spec source
+- [ ] user: conformance vectors for the profile 0 / 8-bit subset
+- [ ] prebuilt d8 binaries for host and ARM
+- [ ] freestanding `no_std` wasm skeleton with a minimal decode API
+- [ ] golden comparison loop for conformance vectors and frame-output goldens
+- [ ] implementor handoff packet for the first decode slice
+- [ ] implementation-agent sandbox and workspace plan for the first handoff
 
-## M0 — Bootstrap (top layer, trusted)
+## Waiting
 
-### Correctness path (host-only; gates M1)
-- `[tool]` todo — freestanding `no_std` wasm skeleton with the minimal decode API
-- `[tool]` todo — host d8 build + JS driver
-- `[tool]` todo — golden harness: conformance vectors and libvpx-generated
-  frame-output goldens
-- `[procure]` todo — conformance vectors, profile 0 / 8-bit subset (user)
-- `[define]` todo — first-failure debugging strategy: which intermediate checks
-  are worth adding, if frame-output diffs are too coarse
-- `[define]` todo — implementor task template: spec excerpts, fixtures, expected
-  outputs, and oracle instructions
-- `[tool]` todo — grinder container environment (nix, host store shared)
-- `[define]` todo — grinder commit/workspace mechanics under jj
+Deferrable external inputs for M2 performance work.
 
-### Device path (gates M2; deferrable)
-- `[procure]` todo — root the Pixel 9a (user)
-- `[procure]` todo — performance corpus: ~4 distinct-character 720p clips, one
-  held out (user)
-- `[tool]` todo — oracle daemon: owns adb + device, queues access
-- `[tool]` todo — simulator d8 build (`v8_target_cpu="arm64"`, `--print-wasm-code`)
-- `[tool]` todo — device d8 endpoint: taskset big-core pin, cpufreq lock, A/B
-  interleave with confidence intervals
-- `[define]` todo — device-time + token budget per explore step, and cadence
+- [ ] user: root the Pixel 9a
+- [ ] user: performance corpus representative of the 720p target, with a held
+      out clip
 
-## M1 — Decode, correct (implement campaign)
+## Later
+
+### M0 device path — gates M2
+
+- [ ] device oracle that serializes access to adb and hardware
+- [ ] host and ARM d8 paths for wasm inspection and timing, JIT tier control
+- [ ] repeatable device timing protocol with CPU control and confidence checks
+
+### M1 — Decode, correct (implement campaign)
 
 VP9 profile 0 / 8-bit from the spec, passing the conformance subset on full
 frames. Scalar, no performance bar. Gated on the M0 correctness path.
 
-- `[grind]` todo — implement the smallest useful decode slice and make it
-  reviewable
-- `[grind]` todo — add intermediate checks only where full-frame failures are not
-  local enough
-- `[grind]` todo — conformance subset green on full frames
+- [ ] define and implement the first reviewable decode slice
+- [ ] add intermediate checks only where full-frame failures are not local
+      enough
+- [ ] conformance subset green on full frames
 
-## M2 — Decode, fast (optimize campaign)
+### M2 — Decode, fast (optimize campaign)
 
 Sustained 720p30 on the pinned big core. Gated on M1 + the M0 device path.
 
-- `[grind]` todo — optimize measured full-decode hotspots; confirm wins against
-  full-decode wall time
+- [ ] optimize measured full-decode hotspots; confirm wins against full-decode
+      wall time
 
-## M3 — Encode
+### M3 — Encode
 
 minih264 in, MSE-playable H.264 out. Fitness gains a VMAF/size floor.
 
-- `[grind]` todo — integrate minih264 behind the libc shims
-- `[define]` todo — VMAF/size floor
+- [ ] integrate minih264 behind the required wasm/libc boundary
+- [ ] establish the VMAF/size floor
 
-## M4 — Chrome demo
+### M4 — Chrome demo
 
 Real browser on the phone, MSE player page, full VP9→H.264 loop.
 
-- `[tool]` todo — demo page (vite/TS), WebM demux + ISO BMFF mux, MSE append
+- [ ] demo page: vite/TS, WebM demux + ISO BMFF mux, MSE append
 
 ## M5 — Stretch
 
-- relaxed-simd · threads · little-core (Cortex-A520) · 1080p
+relaxed-simd · threads · little-core (Cortex-A520) · 1080p

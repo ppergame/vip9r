@@ -21,11 +21,11 @@ session without pretending the decoder architecture is settled.
 The first correctness bar is simple: VP9 profile 0 / 8-bit conformance vectors
 and selected corpus clips must decode bit-exactly at frame output.
 
-libvpx-generated outputs are useful when the spec or test vectors are not enough.
-Intermediate checks may be added when they make failures easier to localize, but
-the tap points and granularity should follow the implementation we actually have.
-Do not commit the project to libvpx component boundaries just because they are
-available to instrument.
+libvpx-generated outputs are useful when the spec or test vectors are not
+enough. Intermediate checks may be added when they make failures easier to
+localize, but the tap points and granularity should follow the implementation we
+actually have. Do not commit the project to libvpx component boundaries just
+because they are available to instrument.
 
 ## Measurement
 
@@ -59,8 +59,8 @@ citable in `docs/log.md`. Ad-hoc blobs are for exploration.
 - `docs/log.md` is the human-facing implementation/optimization record. Entries
   should cite a revision and either a first-correctness milestone or a measured
   performance delta.
-- Add extra notes only when they prevent rediscovering a real decision or failure
-  mode. Avoid ledgers for speculative module pieces.
+- Add extra notes only when they prevent rediscovering a real decision or
+  failure mode. Avoid ledgers for speculative module pieces.
 
 ## Corpus
 
