@@ -120,9 +120,11 @@ moment the session is done.
 Scope: one decoder implementation functional block or optimization strategy.
 Roughly a commit's worth.
 
-Sandboxed implementation agent with limited inputs:
+Sandboxed non-interactive implementation agent with limited inputs:
 
 - specs and test media
 - handle to performance oracle and instructions for use
 - Toolchain
 - Wasm module source directory
+
+The sandbox's purpose is context management, not security. The implmentor has access to the common Nix store and is free to download the necessary specs. It can also ask the orchestrator for tools to be added to the ambient context on the next run.
