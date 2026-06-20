@@ -127,4 +127,7 @@ Sandboxed non-interactive implementation agent with limited inputs:
 - Toolchain
 - Wasm module source directory
 
-The sandbox's purpose is context management, not security. The implmentor has access to the common Nix store and is free to download the necessary specs. It can also ask the orchestrator for tools to be added to the ambient context on the next run.
+The sandbox's purpose is context management, not security. The implementor has
+access to the common Nix store and is free to download the necessary specs. It
+can also ask the orchestrator for tools to be added to the ambient context on
+the next run.
