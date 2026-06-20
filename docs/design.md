@@ -45,24 +45,9 @@ citable in `docs/log.md`. Ad-hoc blobs are for exploration.
 
 ### V8 artifacts
 
-The devshell pins Google-published V8 canary bundles from
-`https://storage.googleapis.com/chromium-v8/official/canary/`.
-
-- Bundle directories: `V8_LINUX64`, `V8_ANDROID_ARM32`, `V8_ANDROID_ARM64`
-- `d8` paths: `D8_LINUX64`, `D8_ANDROID_ARM32`, `D8_ANDROID_ARM64`
-
-To bump:
-
-1. List candidates with the GCS API, filtered by artifact prefix:
-   `https://storage.googleapis.com/storage/v1/b/chromium-v8/o?prefix=official/canary/v8-linux64-rel-`.
-   Use corresponding `v8-android-arm32-rel-` and `v8-android-arm64-rel-`
-   prefixes for Android. Follow `nextPageToken` if present.
-2. Pick the highest semantic version available for each target. Android may lag
-   Linux; pin what exists.
-3. Copy the object `generation` into the URL query and refresh the Nix hash:
-   `nix store prefetch-file --unpack --name ARTIFACT-VERSION.zip --json URL`.
-4. Update `flake.nix`, enter `nix develop`, and smoke-test
-   `$D8_LINUX64 --version`. Android binaries are checked on device.
+The devshell pins Google-published V8 canary bundles. Operational details for
+bumping those pins, running Android `d8` under qemu user emulation, and
+extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 
 ## Work shape
 
