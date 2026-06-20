@@ -80,6 +80,7 @@
         binaryen
         libvpx
         nodejs
+        pnpm
         rustToolchain
         wabt
         wasm-tools
