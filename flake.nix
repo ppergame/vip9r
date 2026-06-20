@@ -33,13 +33,29 @@
         extension = "zip";
         stripRoot = false;
       };
+    patchLinuxD8 = source:
+      pkgs.runCommand "${source.name}-nix-friendly" {
+        nativeBuildInputs = [pkgs.patchelf];
+      } ''
+        mkdir -p "$out"
+        cp -R ${source}/. "$out/"
+        chmod -R u+w "$out"
+
+        patchelf \
+          --set-interpreter ${pkgs.stdenv.cc.bintools.dynamicLinker} \
+          --set-rpath ${pkgs.lib.makeLibraryPath [
+            pkgs.glibc
+            pkgs.stdenv.cc.cc.lib
+          ]} \
+          "$out/d8"
+      '';
     v8 = {
-      linux64 = fetchV8 {
+      linux64 = patchLinuxD8 (fetchV8 {
         artifact = "v8-linux64-rel";
         version = "15.1.158";
         generation = "1781886252619364";
         hash = "sha256-CaEY/v7j9uyAC8Q/zI4AnpXVFCR/BEB33Ht6RobygTw=";
-      };
+      });
       androidArm32 = fetchV8 {
         artifact = "v8-android-arm32-rel";
         version = "14.1.63";
