@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  scripts/implementor-sandbox run TASK_FILE
+  scripts/implementor-sandbox shell [TASK_FILE]
+
+Creates a reflinked temp implementor run under ./temp and enters the fixed
+sandbox ABI:
+
+  /run      per-run directory; /run/rust is mutable source
+  /auth     shared mutable Pi auth directory
+  /specs    read-only VP9 spec material
+  /harness  built pi harness bundle
+EOF
+}
+
+repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mode="${1:-run}"
+case "$mode" in
+  run|shell)
+    shift || true
+    ;;
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  *)
+    mode="run"
+    ;;
+esac
+
+task_file="${1:-}"
+if [[ "$mode" == "run" && -z "$task_file" ]]; then
+  usage
+  exit 2
+fi
+if [[ -n "$task_file" && ! -f "$task_file" ]]; then
+  echo "task file not found: $task_file" >&2
+  exit 2
+fi
+if [[ $# -gt 1 ]]; then
+  usage
+  exit 2
+fi
+
+system_prompt="$repo/scripts/implementor-system-prompt.md"
+if [[ ! -f "$system_prompt" ]]; then
+  echo "system prompt not found: $system_prompt" >&2
+  exit 1
+fi
+
+require_command() {
+  local name="$1"
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "$name not found; enter the devshell" >&2
+    exit 1
+  fi
+}
+
+require_command bwrap
+require_command bash
+require_command cp
+require_command git
+require_command node
+
+if [[ "$mode" == "run" ]]; then
+  require_command pnpm
+  (cd "$repo/js" && pnpm build:pi-harness) >&2
+fi
+
+harness_dir="$repo/js/dist/pi-harness"
+if [[ ! -f "$harness_dir/pi-harness.mjs" ]]; then
+  echo "harness bundle not found: $harness_dir/pi-harness.mjs" >&2
+  exit 1
+fi
+
+temp_dir="$repo/temp"
+auth_dir="$temp_dir/pi-auth"
+mkdir -p "$temp_dir" "$auth_dir"
+
+run="$(mktemp -d -p "$temp_dir" implementor.XXXXXX)"
+mkdir -p "$run/home"
+cp -a --reflink=auto "$repo/rust" "$run/rust"
+cp "$system_prompt" "$run/system.md"
+if [[ -n "$task_file" ]]; then
+  cp "$task_file" "$run/task.md"
+else
+  printf 'Sandbox shell.\n' > "$run/task.md"
+fi
+
+git -C "$run/rust" init -q
+git -C "$run/rust" add .
+git -C "$run/rust" \
+  -c user.name=vip9r-orchestrator \
+  -c user.email=vip9r@example.invalid \
+  commit -q -m baseline
+git -C "$run/rust" tag orchestrator-base
+
+sandbox_path() {
+  local out="" seen=":"
+  local entry
+  IFS=: read -r -a entries <<< "${PATH:-}"
+  for entry in "${entries[@]}"; do
+    [[ "$entry" == /nix/store/* ]] || continue
+    case "$seen" in
+      *":$entry:"*) continue ;;
+    esac
+    seen="$seen$entry:"
+    if [[ -z "$out" ]]; then
+      out="$entry"
+    else
+      out="$out:$entry"
+    fi
+  done
+  printf '%s' "$out"
+}
+
+entry_script="$repo/scripts/implementor-entry"
+bash_path="$(command -v bash)"
+env_path="$(command -v env)"
+path="$(sandbox_path)"
+if [[ -z "$path" ]]; then
+  echo "no /nix/store PATH entries found; enter the devshell" >&2
+  exit 1
+fi
+
+bwrap_args=(
+  --die-with-parent
+  --clearenv
+  --setenv PATH "$path:/bin:/usr/bin"
+  --setenv HOME /run/home
+  --setenv SHELL /bin/bash
+  --setenv TMPDIR /tmp
+  --setenv XDG_CACHE_HOME /run/home/.cache
+  --ro-bind /nix /nix
+  --bind "$run" /run
+  --bind "$auth_dir" /auth
+  --ro-bind "$repo/docs/specs" /specs
+  --ro-bind "$harness_dir" /harness
+  --ro-bind "$entry_script" /entry
+  --tmpfs /tmp
+  --proc /proc
+  --dev /dev
+  --dir /bin
+  --symlink "$bash_path" /bin/bash
+  --symlink "$bash_path" /bin/sh
+  --dir /usr
+  --dir /usr/bin
+  --symlink "$env_path" /usr/bin/env
+  --dir /etc
+  --dir /etc/ssl
+  --ro-bind-try /etc/resolv.conf /etc/resolv.conf
+  --ro-bind-try /etc/hosts /etc/hosts
+  --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
+  --ro-bind-try /etc/ssl/certs /etc/ssl/certs
+)
+
+for name in D8_LINUX64 D8_ANDROID_ARM32 D8_ANDROID_ARM64 V8_LINUX64 V8_ANDROID_ARM32 V8_ANDROID_ARM64 SSL_CERT_FILE NIX_SSL_CERT_FILE NODE_EXTRA_CA_CERTS SYSTEM_CERTIFICATE_PATH; do
+  if [[ -n "${!name:-}" ]]; then
+    bwrap_args+=(--setenv "$name" "${!name}")
+  fi
+done
+
+set +e
+bwrap "${bwrap_args[@]}" "$bash_path" /entry "$mode"
+status=$?
+set -e
+
+echo "source: $run/rust" >&2
+exit "$status"

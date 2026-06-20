@@ -97,6 +97,9 @@
       D8_LINUX64 = "${v8.linux64}/d8";
       D8_ANDROID_ARM32 = "${v8.androidArm32}/d8";
       D8_ANDROID_ARM64 = "${v8.androidArm64}/d8";
+      SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+      NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+      NODE_EXTRA_CA_CERTS = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 
       shellHook = ''
         export PATH="${npmUnavailable}/bin:$PATH"
@@ -106,12 +109,17 @@
       packages = with pkgs; [
         npmUnavailable
         binaryen
+        bubblewrap
+        cacert
+        git
         libvpx
         nodejs
         pnpm
+        ripgrep
         rustToolchain
         wabt
         wasm-tools
+        which
       ];
     };
   };

@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import {
 	AuthStorage,
 	DefaultResourceLoader,
@@ -12,6 +12,12 @@ const CODEX_PROVIDER = "openai-codex";
 const CODEX_MODEL = "gpt-5.5";
 const THINKING_LEVEL = "xhigh" as const;
 const ALL_BUILT_IN_PI_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+const RUN_ROOT = "/run";
+const WORK_DIR = `${RUN_ROOT}/rust`;
+const TASK_PATH = `${RUN_ROOT}/task.md`;
+const SYSTEM_PROMPT_PATH = `${RUN_ROOT}/system.md`;
+const AGENT_DIR = `${RUN_ROOT}/home/.pi-harness`;
+const AUTH_PATH = "/auth/auth.json";
 
 type AssistantLike = {
 	role?: unknown;
@@ -20,46 +26,16 @@ type AssistantLike = {
 	content?: unknown;
 };
 
-function usage(): string {
-	return [
-		"Usage: node dist/pi-harness/pi-harness.mjs [prompt]",
-		"",
-		"If no prompt argument is provided, the harness reads the prompt from stdin.",
-		"",
-		"Fixed configuration:",
-		"  cwd: current working directory",
-		"  agent dir: <cwd>/.pi-harness",
-		"  auth: <cwd>/.pi-harness/auth.json",
-		`  model: ${CODEX_PROVIDER}/${CODEX_MODEL}`,
-		`  thinking: ${THINKING_LEVEL}`,
-	].join("\n");
+function readRequiredFile(path: string, label: string): string {
+	const text = readFileSync(path, "utf8");
+	if (!text.trim()) {
+		throw new Error(`${label} is empty: ${path}`);
+	}
+	return text;
 }
 
-async function readPrompt(): Promise<string> {
-	const args = process.argv.slice(2);
-	if (args.includes("--help") || args.includes("-h")) {
-		process.stdout.write(`${usage()}\n`);
-		process.exit(0);
-	}
-
-	const positional = args.filter((arg) => arg !== "--");
-	if (positional.length > 0) {
-		return positional.join(" ");
-	}
-
-	if (process.stdin.isTTY) {
-		throw new Error("No prompt provided. Pass it as argv or pipe it on stdin.");
-	}
-
-	const chunks: Buffer[] = [];
-	for await (const chunk of process.stdin) {
-		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-	}
-	const prompt = Buffer.concat(chunks).toString("utf8").trim();
-	if (!prompt) {
-		throw new Error("stdin did not contain a prompt");
-	}
-	return prompt;
+function readPrompt(): string {
+	return readRequiredFile(TASK_PATH, "task prompt");
 }
 
 function finalAssistantText(messages: unknown[]): { text?: string; error?: string } {
@@ -98,18 +74,17 @@ function finalAssistantText(messages: unknown[]): { text?: string; error?: strin
 }
 
 async function main(): Promise<number> {
-	const prompt = await readPrompt();
-	const cwd = process.cwd();
-	const agentDir = join(cwd, ".pi-harness");
-	const authPath = join(agentDir, "auth.json");
+	const prompt = readPrompt();
+	const systemPrompt = readRequiredFile(SYSTEM_PROMPT_PATH, "system prompt");
+	const cwd = WORK_DIR;
 
-	const authStorage = AuthStorage.create(authPath);
+	const authStorage = AuthStorage.create(AUTH_PATH);
 	const authError = authStorage.drainErrors()[0];
 	if (authError) {
-		throw new Error(`${authPath}: ${authError.message}`);
+		throw new Error(`${AUTH_PATH}: ${authError.message}`);
 	}
 	if (!authStorage.has(CODEX_PROVIDER)) {
-		throw new Error(`Missing Codex credentials in ${authPath}`);
+		throw new Error(`Missing Codex credentials in ${AUTH_PATH}`);
 	}
 
 	const modelRegistry = ModelRegistry.inMemory(authStorage);
@@ -125,13 +100,14 @@ async function main(): Promise<number> {
 
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
-		agentDir,
+		agentDir: AGENT_DIR,
 		settingsManager,
 		noExtensions: true,
 		noSkills: true,
 		noPromptTemplates: true,
 		noThemes: true,
-		noContextFiles: false,
+		noContextFiles: true,
+		appendSystemPrompt: [systemPrompt],
 	});
 	await resourceLoader.reload();
 
@@ -142,7 +118,7 @@ async function main(): Promise<number> {
 
 	const { session } = await createAgentSession({
 		cwd,
-		agentDir,
+		agentDir: AGENT_DIR,
 		authStorage,
 		modelRegistry,
 		settingsManager,

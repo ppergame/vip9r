@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mode="${1:-run}"
+
+case "$mode" in
+  run)
+    cd /run/rust
+    exec node /harness/pi-harness.mjs
+    ;;
+  shell)
+    cd /run/rust
+    cat >&2 <<'EOF'
+implementor sandbox
+
+  worktree: /run/rust
+  task:     /run/task.md
+  specs:    /specs
+  harness:  /harness/pi-harness.mjs
+  base:     git tag orchestrator-base
+EOF
+    exec bash -i
+    ;;
+  *)
+    echo "unknown implementor-entry mode: $mode" >&2
+    exit 2
+    ;;
+esac
