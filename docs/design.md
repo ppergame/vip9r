@@ -54,6 +54,9 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 - The interactive session owns intent, trusted harness work, and review.
 - Implementation agents should receive narrow, reviewable tasks with the needed
   spec excerpts, tests, and oracle handle.
+- Rust implementation state lives in the self-contained Cargo workspace under
+  `rust/`. Keep maintainer/orchestrator tooling outside that tree unless the
+  implementor needs it for the task.
 - Keep task boundaries provisional. Split by whatever makes correctness,
   measurement, and review easiest at the time.
 - Do not turn temporary boundaries into architecture unless they survive contact
@@ -80,4 +83,4 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 - Minimal wasm/JS API needed for the first decode-correct loop.
 - Which intermediate checks, if any, are worth adding after the first failures.
 - Device-time and token budget per optimization pass.
-- Implementation-agent workspace mechanics under jj.
+- Exact generated implementor handoff mechanics under jj.

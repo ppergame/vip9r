@@ -7,13 +7,6 @@ name = "vip9r-core"
 version = "0.1.0"
 
 [[package]]
-name = "vip9r-tools"
-version = "0.1.0"
-dependencies = [
- "vip9r-core",
-]
-
-[[package]]
 name = "vip9r-wasm"
 version = "0.1.0"
 dependencies = [
