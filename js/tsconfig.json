@@ -1,15 +1,8 @@
 {
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
-    "noEmit": true,
-    "isolatedModules": true,
-    "skipLibCheck": true,
     "lib": ["ES2022", "WebWorker"],
-    "types": ["node"]
+    "types": []
   },
-  "include": ["src", "vite.config.ts", "vite.d8.config.ts", "vite.pi-harness.config.ts"]
+  "include": ["src/d8", "src/wasm", "src/web", "src/webm"]
 }
