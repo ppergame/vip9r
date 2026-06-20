@@ -78,6 +78,7 @@
 
       packages = with pkgs; [
         binaryen
+        libvpx
         nodejs
         rustToolchain
         wabt

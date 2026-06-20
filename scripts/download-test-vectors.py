@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -28,11 +31,13 @@ CHROMIUM_BEAR_VP9_IVF_URL = (
     "https://chromium.googlesource.com/chromium/src/+/refs/tags/87.0.4280.52/"
     "media/test/data/bear-vp9.ivf?format=TEXT"
 )
+VPXDEC_MD5_OUTPUT_PATTERN = "img-%w-%h-%4.i420"
 
 # Source: https://github.com/webmproject/libvpx/blob/v1.16.0/test/test-data.sha1
 # Selection: valid VP9 profile-0 decoder media from test/test-data.mk, including
-# CONFIG_DECODE_PERF_TESTS media; excluding .md5, invalid/crbug, raw, and profiles
-# 1/2/3.
+# CONFIG_DECODE_PERF_TESTS media; excluding invalid/crbug, raw, and profiles 1/2/3.
+# Upstream .md5 sidecars are included when present. Missing sidecars, including
+# the libvpx decode perf clips, are generated locally with the devshell vpxdec.
 LIBVPX_SHA1_LINES = """ce881e567fe1d0fbcb2d3e9e6281a1a8d74d82e0 *vp90-2-00-quantizer-00.webm
 2ca0463f2cfb93d25d7dded174db70b7cb87cb48 *vp90-2-00-quantizer-01.webm
 d80a2920a5e0819d69dcba8fe260c01f820f8982 *vp90-2-00-quantizer-02.webm
@@ -358,6 +363,312 @@ c64b03b5c090e6888cb39685c31f00a6b79fa45c *vp90-2-tos_854x356_tile_1x2_656kbps.we
 94b533dbcf94292001e27cc51fec87f9e8c90c0b *vp90-2-tos_854x356_tile_1x2_fpm_546kbps.webm
 """
 
+LIBVPX_MD5_SHA1_LINES = """ac5eda33407d0521c7afca43a63fd305c0cd9d13 *vp90-2-00-quantizer-00.webm.md5
+10d98884fc6d9a5f47a2057922b8e25dd48d7786 *vp90-2-00-quantizer-01.webm.md5
+c964c8e5e04165fabbf1c6ee8ee5121d35921965 *vp90-2-00-quantizer-02.webm.md5
+f270bee0b0c7aa2bf4c5afe098556b4f3f890faf *vp90-2-00-quantizer-03.webm.md5
+427433bfe121c4aea1095ec3124fdc174d200e3a *vp90-2-00-quantizer-04.webm.md5
+c98f6a9a1af4cfd71416792827304266aad4bd46 *vp90-2-00-quantizer-05.webm.md5
+5080e940a23805c82e578e21b57fc2c511e76376 *vp90-2-00-quantizer-06.webm.md5
+76c429a02b56762e10ee4db88729d8834b3a70f4 *vp90-2-00-quantizer-07.webm.md5
+ab94aabf9316111b52d7c531962ed4123313b6ba *vp90-2-00-quantizer-08.webm.md5
+e1f7690cd83ccc56d045e17cce552544a5f03810 *vp90-2-00-quantizer-09.webm.md5
+9b37bed893b5f6a4e12f2aa40f02dd40f944d0f8 *vp90-2-00-quantizer-10.webm.md5
+fe4620a4bb0e4f5cb9bbfedc4039a22b81b0f5c0 *vp90-2-00-quantizer-11.webm.md5
+0961d060cc8dd469c6dac8d7d75f927c0bb971b8 *vp90-2-00-quantizer-12.webm.md5
+df29e5e0f95772af482f540d776f6b9dea4bfa29 *vp90-2-00-quantizer-13.webm.md5
+ce96a2cc312942f0427a463f15a392870dd69764 *vp90-2-00-quantizer-14.webm.md5
+40f700db606501aa7cb49049624cbdde6409b122 *vp90-2-00-quantizer-15.webm.md5
+039b742d149c945ed79c7b9a6384352852a1c116 *vp90-2-00-quantizer-16.webm.md5
+90c5a39bf76e6b3e0a1c0d3e9b68a9fd78be963e *vp90-2-00-quantizer-17.webm.md5
+cda0a1c0fca2ec2976ae55124a8a67305508bae6 *vp90-2-00-quantizer-18.webm.md5
+5b8ec169ccf67d8a0a8e46a62eb173f5a1dbaf4f *vp90-2-00-quantizer-19.webm.md5
+4b26f7edb4fcd3a1b4cce9ba3cb8650e3ee6e063 *vp90-2-00-quantizer-20.webm.md5
+e216b4a1eceac03efcc433759be54ab8ea87b24b *vp90-2-00-quantizer-21.webm.md5
+1aa813bd45ae831bf5e79ace4d73dfd25989a07d *vp90-2-00-quantizer-22.webm.md5
+0de0af34abd843d5b37e58baf3ed96a6104b64c3 *vp90-2-00-quantizer-23.webm.md5
+db6033af2ba2f2bca62468fb4b8808e474f93923 *vp90-2-00-quantizer-24.webm.md5
+3499e00c2cc15876f61f07e3d3cfca54ebcd98fd *vp90-2-00-quantizer-25.webm.md5
+cd6fe3d14dab48886ebf65be00e6ed9616ebe5a7 *vp90-2-00-quantizer-26.webm.md5
+fe72154ef196067d6c272521012dd79706496cac *vp90-2-00-quantizer-27.webm.md5
+40b2e24b542206a6bfd746ef199e49ccea07678a *vp90-2-00-quantizer-28.webm.md5
+eb59745e0912d8ed6c928268bcf265237c9ba93f *vp90-2-00-quantizer-29.webm.md5
+ad0f4fe6733e4e7cdfe8ef8722bb341dcc7538c0 *vp90-2-00-quantizer-30.webm.md5
+4654b40792572f0a790874c6347ef9196d86c1a7 *vp90-2-00-quantizer-31.webm.md5
+659a2e6dd02df323f62600626859006640b445df *vp90-2-00-quantizer-32.webm.md5
+5b175ef1120ddeba4feae1247bf381bbc4e816ce *vp90-2-00-quantizer-33.webm.md5
+22a739de95acfeb27524e3700b8f678a9ad744d8 *vp90-2-00-quantizer-34.webm.md5
+c532c9c8dc7b3506fc6a51e5c20c17ef0ac039e7 *vp90-2-00-quantizer-35.webm.md5
+0b3573f5addea4e3eb11a0b85f068299d5bdad78 *vp90-2-00-quantizer-36.webm.md5
+2b4fb6f8ba975237858e61cc8f560bcfc87cb38e *vp90-2-00-quantizer-37.webm.md5
+fb76771f3a795054b9936f70da7505c3ac585284 *vp90-2-00-quantizer-38.webm.md5
+39e162c09a20e7e684868097766347014371fee6 *vp90-2-00-quantizer-39.webm.md5
+872cc0f2cc9dbf000f89eadb4d8f9940e48e00b1 *vp90-2-00-quantizer-40.webm.md5
+5b4f7217e57fa2a221011d0b32f8d0409496b7b6 *vp90-2-00-quantizer-41.webm.md5
+0219d090cf37daabe19256ba8e932ba4874b92e4 *vp90-2-00-quantizer-42.webm.md5
+3c9b0b4c607f9579a31726bfcf56729334ddc686 *vp90-2-00-quantizer-43.webm.md5
+73bc8f675103abaef3d9f73a2742b3bffd726d23 *vp90-2-00-quantizer-44.webm.md5
+c907b29da821f790c6748de61f592689312e4e36 *vp90-2-00-quantizer-45.webm.md5
+7b2b7ce60c50bc970bc0ada46d7a7ce440148da3 *vp90-2-00-quantizer-46.webm.md5
+527e0a9fb932efe915027ffe077f9e8d3a4fb139 *vp90-2-00-quantizer-47.webm.md5
+65ab6c9d1b682c183b201c7ff42b90343ce3e304 *vp90-2-00-quantizer-48.webm.md5
+ac68c4387ce11fcc998d8ba455ab9b2bb361d240 *vp90-2-00-quantizer-49.webm.md5
+d0576bfede46fd55659f028f2fd28554ceb3e6cc *vp90-2-00-quantizer-50.webm.md5
+89fcfe04f4457a7f02ab4a2f94aacbb88aee5789 *vp90-2-00-quantizer-51.webm.md5
+f3dd52b70c18345fee740220f35da9c4def2017a *vp90-2-00-quantizer-52.webm.md5
+1cdcb1d4f3a37cf83ad235eb27ec62ed2a01afc7 *vp90-2-00-quantizer-53.webm.md5
+36c35353f2c03cb099bd710d9994de7d9ed88834 *vp90-2-00-quantizer-54.webm.md5
+2cf3570542d984f167ab087f59493c7fb47e0ed2 *vp90-2-00-quantizer-55.webm.md5
+d3f93f8272b6de31cffb011a26f11abb514efb12 *vp90-2-00-quantizer-56.webm.md5
+6478fdf1d7faf6db5f19dffc5e1363af358699ee *vp90-2-00-quantizer-57.webm.md5
+cf231d4a52d492fa692ea4194ec5eb7511fec54e *vp90-2-00-quantizer-58.webm.md5
+4681f7ef96f63e085c41bb1a964b0df7e67e0b38 *vp90-2-00-quantizer-59.webm.md5
+58691ef53b6b623810e2c57ded374c77535df935 *vp90-2-00-quantizer-60.webm.md5
+76436eace62f08ff92b61a0845e66667a027db1b *vp90-2-00-quantizer-61.webm.md5
+2d937cc011eeddd95222b960982da5cd18db580f *vp90-2-00-quantizer-62.webm.md5
+5a829031055d70565f57dbcd47a6ac33619952b3 *vp90-2-00-quantizer-63.webm.md5
+5a0476be4448bae8f8ca17ea236c98793a755948 *vp90-2-01-sharpness-1.webm.md5
+a0ca5bc87a5ed7c7051f59078daa0d03be1b45b6 *vp90-2-01-sharpness-2.webm.md5
+3af8000a69c72fe77881e3176f026c2affb78cc7 *vp90-2-01-sharpness-3.webm.md5
+08832a1494f84fa9edd40e080bcf2c0e80100c76 *vp90-2-01-sharpness-4.webm.md5
+93ceee30c140f0b406726c0d896b9db6031c4c7f *vp90-2-01-sharpness-5.webm.md5
+da83efe59e537ce538e8b03a6eac63cf25849c9a *vp90-2-01-sharpness-6.webm.md5
+2957408d20deac8633941a2169f801bae6f086e1 *vp90-2-01-sharpness-7.webm.md5
+e36d2ed6fa2746347710b750586aafa6a01ff3ae *vp90-2-02-size-08x08.webm.md5
+079157a19137ccaebba606f2871f45a397347150 *vp90-2-02-size-08x10.webm.md5
+9aa45ffdf2078f883bbed01450031b691819c144 *vp90-2-02-size-08x16.webm.md5
+59a5cc17d354c6a23e5e959d666b1456a5d49c56 *vp90-2-02-size-08x18.webm.md5
+2bdddd6878f05d37d84cde056a3f5e7f926ba3d6 *vp90-2-02-size-08x32.webm.md5
+6b5812cfb8a82d378ea2913bf009e93668020147 *vp90-2-02-size-08x34.webm.md5
+84b55fdee6d9aa820c7a8c62822446184b191767 *vp90-2-02-size-08x64.webm.md5
+6b1fa0a885947b3cc0fe58f75f838e662bd9bb8b *vp90-2-02-size-08x66.webm.md5
+71c752c51aec9f48de286b93f4c20e9c11cad7d0 *vp90-2-02-size-10x08.webm.md5
+1da524d24af1944b671d4d3f2b398d6e336584c3 *vp90-2-02-size-10x10.webm.md5
+7cfd960f232c34c641a4a2a9411b6fd0efb2fc50 *vp90-2-02-size-10x16.webm.md5
+db5626275cc55ce970b91c995e74f6838d943aca *vp90-2-02-size-10x18.webm.md5
+5cae51b0c71cfc131651f345f87583eb2903afaf *vp90-2-02-size-10x32.webm.md5
+bb0efe058122641e7f73e94497dda2b9e6c21efd *vp90-2-02-size-10x34.webm.md5
+b9c0e3b054463546356acf5157f9be92fd34732f *vp90-2-02-size-10x64.webm.md5
+bab5f539c2f91952e187456b4beafbb4c01e25ee *vp90-2-02-size-10x66.webm.md5
+512dad5eabbed37b4bbbc64ce153f1a5484427b8 *vp90-2-02-size-130x132.webm.md5
+4a94275328ae076cf60f966c097a8721010fbf5a *vp90-2-02-size-132x130.webm.md5
+1a69e989f697e424bfe3e3e8a77bb0c0992c8e47 *vp90-2-02-size-132x132.webm.md5
+7f48a0fcf8c25963f3057d7f6669c5f2415834b8 *vp90-2-02-size-16x08.webm.md5
+73a7c209a46dd051c9f7339b6e02ccd5b3b9fc81 *vp90-2-02-size-16x10.webm.md5
+faec542f52f37601cb9c480d887ae9355be99372 *vp90-2-02-size-16x16.webm.md5
+5a92e19e624c0376321d4d0e22c0c91995bc23e1 *vp90-2-02-size-16x18.webm.md5
+ea622d1c817dd174556f7ee7ccfe4942b34d4845 *vp90-2-02-size-16x32.webm.md5
+1b8645ef64239334921c5f56b24ce815e6070b05 *vp90-2-02-size-16x34.webm.md5
+a03d8c1179ca626a8856fb416d635dbf377979cd *vp90-2-02-size-16x64.webm.md5
+8cb6736dc2d897c1283919a32068af377d66c59c *vp90-2-02-size-16x66.webm.md5
+dedfecf1d784bcf70629592fa5e6f01d5441ccc9 *vp90-2-02-size-178x180.webm.md5
+423da2b861050c969d78ed8e8f8f14045d1d8199 *vp90-2-02-size-180x178.webm.md5
+6c2ef013392310778dca5dd5351160eca66b0a60 *vp90-2-02-size-180x180.webm.md5
+874c7fb505be9db3160c57cb405c4dbd5b990dc2 *vp90-2-02-size-18x08.webm.md5
+1d80eb36557ea5f25a386495a36f93da0f25316b *vp90-2-02-size-18x10.webm.md5
+1ab6cdd89a53662995d103546e6611c84f9292ab *vp90-2-02-size-18x16.webm.md5
+ace8a66328f7802b15f9989c2720c029c6abd279 *vp90-2-02-size-18x18.webm.md5
+34fbd7036752232d1663e70d7f7cdc93f7129202 *vp90-2-02-size-18x32.webm.md5
+2c4d622a9ea548791c1a07903d3702e9774388bb *vp90-2-02-size-18x34.webm.md5
+e7fd4462527bac38559518ba80e41847db880f15 *vp90-2-02-size-18x64.webm.md5
+45c04e422fb383c1f3be04beefaa4490e83bdb1a *vp90-2-02-size-18x66.webm.md5
+ad018be39e493ca2405225034b1a5b7a42af6f3a *vp90-2-02-size-32x08.webm.md5
+2294425d4e55d275af5e25a0beac9738a1b4ee73 *vp90-2-02-size-32x10.webm.md5
+ae10981d93913f0ab1f28c1146255e01769aa8c0 *vp90-2-02-size-32x16.webm.md5
+1ba76f4c4a4ac7aabfa3ce195c1b473535eb7cc8 *vp90-2-02-size-32x18.webm.md5
+e39c067a8ee2da52a51641eb1cb7f8eba935eb6b *vp90-2-02-size-32x32.webm.md5
+56888e7834f52b106e8911e3a7fc0f473b609995 *vp90-2-02-size-32x34.webm.md5
+8950485fb3f68b0e8be234db860e4ec5f5490fd0 *vp90-2-02-size-32x64.webm.md5
+225df9d7d72ec711b0b60f4aeb65311c97db054a *vp90-2-02-size-32x66.webm.md5
+5bb4262030018dd01883965c6aa6070185924ef6 *vp90-2-02-size-34x08.webm.md5
+71c100b437d3e8701632ae8d65c3555339b1c68f *vp90-2-02-size-34x10.webm.md5
+5d5a52f3535b4d2698dd3d87f4a13fdc9b57163d *vp90-2-02-size-34x16.webm.md5
+a164c7f3c424987df2340496e6a8cf76e973f0f1 *vp90-2-02-size-34x18.webm.md5
+22a79d3bd1c9b85dfe8c70bb2e19f08a92a8be03 *vp90-2-02-size-34x32.webm.md5
+0c099638e79c273546523e06704553e42eb00b00 *vp90-2-02-size-34x34.webm.md5
+9317b63987cddab8389510a27b86f9f3d46e3fa5 *vp90-2-02-size-34x64.webm.md5
+e18d68b35428f46a84a947c646804a51ef1d7cec *vp90-2-02-size-34x66.webm.md5
+87f9f7087b6489d45e9e4b38ede2c5aef4a4928f *vp90-2-02-size-64x08.webm.md5
+447ce03938ab53bffcb4a841ee0bfaa90462dcb9 *vp90-2-02-size-64x10.webm.md5
+84e355761dd2e0361b904c84c52a0dd0384d89cf *vp90-2-02-size-64x16.webm.md5
+666824e5ba746779eb46079e0631853dcc86d48b *vp90-2-02-size-64x18.webm.md5
+97086eadedce1d0d9c072b585ba7b49aec69b1e7 *vp90-2-02-size-64x32.webm.md5
+253a1d38d452e7826b086846c6f872f829c276bb *vp90-2-02-size-64x34.webm.md5
+2cd6ebeca0f82e9f505616825c07950371b905ab *vp90-2-02-size-64x64.webm.md5
+5806be11a1d346be235f88d3683e69f73746166c *vp90-2-02-size-64x66.webm.md5
+23c3cd0dca20a2f71f036e77ea92025ff4e7a298 *vp90-2-02-size-66x08.webm.md5
+e041eaf6841d775f8fde8bbb4949d2733fdaab7f *vp90-2-02-size-66x10.webm.md5
+2ec85ee18119e6798968571ea6e1b93ca386e3af *vp90-2-02-size-66x16.webm.md5
+77c4d53e2a5c96b70af9d575fe6811e0f5ee627b *vp90-2-02-size-66x18.webm.md5
+53728fae2a428f16d376a29f341a64ddca97996a *vp90-2-02-size-66x32.webm.md5
+f69a6a555e3f614b0a35f9bfc313d8ebb35bc725 *vp90-2-02-size-66x34.webm.md5
+69486e7fd9e380b6c97a03d3e167affc79f73840 *vp90-2-02-size-66x64.webm.md5
+7f008c7f48d55e652fbd6bac405b51e0015c94f2 *vp90-2-02-size-66x66.webm.md5
+e3b28ddcfaeb37fb4d132b93f92642a9ad17c22d *vp90-2-02-size-lf-1920x1080.webm.md5
+65f45ec9a55537aac76104818278e0978f94a678 *vp90-2-03-deltaq.webm.md5
+6788a561466dace32d500194bf042e19cccc35e1 *vp90-2-03-size-196x196.webm.md5
+6bf9d6a8e2bdc5bf4f8a78071a3fed5ca02ad6f2 *vp90-2-03-size-196x198.webm.md5
+bbfc260b2bfd872cc6054272bb6b7f959a9e1c6e *vp90-2-03-size-196x200.webm.md5
+158ee72af578f39aad0c3b8f4cbed2fc78b57e0f *vp90-2-03-size-196x202.webm.md5
+7546be847efce2d1c0a23f807bfb03f91b764e1e *vp90-2-03-size-196x208.webm.md5
+9444fdf632d6a1b6143f4cb10fed8f63c1d67ec1 *vp90-2-03-size-196x210.webm.md5
+858361d8f79b44df5545feabbc9754ec9ede632f *vp90-2-03-size-196x224.webm.md5
+72006a5f42031a43d70a2cd9fc1958962a86628f *vp90-2-03-size-196x226.webm.md5
+2d6841901b72000c5340f30be602853438c1b787 *vp90-2-03-size-198x196.webm.md5
+3f2544b4f3b4b643a98f2c3b15ea5826fc702fa1 *vp90-2-03-size-198x198.webm.md5
+5d537e3c9b9c54418c79677543454c4cda3de1af *vp90-2-03-size-198x200.webm.md5
+1b59f5e111265615a7a459eeda8cc9045178d228 *vp90-2-03-size-198x202.webm.md5
+a58a67f4fb357c73ca078aeecbc0f782975630b1 *vp90-2-03-size-198x208.webm.md5
+18d3be7935e52217e2e9400b6f2c681a9e45dc89 *vp90-2-03-size-198x210.webm.md5
+efa366a299817e2da51c00623b165aab9fbb8d91 *vp90-2-03-size-198x224.webm.md5
+534524a0b2dbff852e0b92ef09939db072f83243 *vp90-2-03-size-198x226.webm.md5
+41795f548181717906e7a504ba551f06c32102ae *vp90-2-03-size-200x196.webm.md5
+43df5d8c46a40089441392e6d096c588c1079a68 *vp90-2-03-size-200x198.webm.md5
+757b2ef96b82093255725bab9690bbafe27f3caf *vp90-2-03-size-200x200.webm.md5
+3022c4a1c625b5dc04fdb1052d17d45b4171cfba *vp90-2-03-size-200x202.webm.md5
+c4ab8c66f3cf2dc8e8dd7abae9ac21f4d32cd6be *vp90-2-03-size-200x208.webm.md5
+3f0b40da7eef7974b9bc326562f251feb67d9c7c *vp90-2-03-size-200x210.webm.md5
+a259df2ac0e294492e3f9d4315baa34cab044f04 *vp90-2-03-size-200x224.webm.md5
+714cec61e3575581e4f1a0e3921f4dfdbbd316c5 *vp90-2-03-size-200x226.webm.md5
+5b8e2e50fcea2c43b12fc067b8a9cc117af77bda *vp90-2-03-size-202x196.webm.md5
+517e91204b25586da943556f4adc5951c9be8bee *vp90-2-03-size-202x198.webm.md5
+55b8ec4a2513183144a8e27564596c06c7576fce *vp90-2-03-size-202x200.webm.md5
+c79afc6660df2824e7df314e5bfd71f0d8acf76b *vp90-2-03-size-202x202.webm.md5
+0b887ff30409c58f2ccdc3bfacd6be7c69f8997a *vp90-2-03-size-202x208.webm.md5
+f78f8e79533c0c88dd2bfdcec9b1c07848568ece *vp90-2-03-size-202x210.webm.md5
+bf52a104074d0c5942aa7a5b31e11db47e43d48e *vp90-2-03-size-202x224.webm.md5
+2fa2f87502fda756b319389c8975204e130a2e3f *vp90-2-03-size-202x226.webm.md5
+50c60792305d6a99be376dd596a6ff979325e6cc *vp90-2-03-size-208x196.webm.md5
+be85fb2c8d435a75484231356f07d06ebddd13cd *vp90-2-03-size-208x198.webm.md5
+74f8ec3b3a2fe81767ed1ab36a47bc0062d6223c *vp90-2-03-size-208x200.webm.md5
+0614a1e8d92048852adcf605a51333f5fabc7f03 *vp90-2-03-size-208x202.webm.md5
+37de5aca59bb900228400b0e115d3229edb9dcc0 *vp90-2-03-size-208x208.webm.md5
+d646eccb3cd578f94b54777e32b88898bef6e17a *vp90-2-03-size-208x210.webm.md5
+85c0361d93bf85a335248fef2767ff43eeef23db *vp90-2-03-size-208x224.webm.md5
+a6d583a57876e7b7ec48625b2b2cdbcf70cab837 *vp90-2-03-size-208x226.webm.md5
+a3580fc7816d7fbcfb54fdba501cabbd06ba2f1d *vp90-2-03-size-210x196.webm.md5
+eda20f8268c7f4147bead4059e9c4897e09140a9 *vp90-2-03-size-210x198.webm.md5
+79d73b7f623082d2a00aa33e95c79d11c7d9c3a8 *vp90-2-03-size-210x200.webm.md5
+f69414c5677ed2f2b8b37ae76429e509a92276a5 *vp90-2-03-size-210x202.webm.md5
+27b18562faa1b3184256f4eae8114b539b3e9d3e *vp90-2-03-size-210x208.webm.md5
+c853a1670465eaa04ca31b3511995f1b6ed4f58f *vp90-2-03-size-210x210.webm.md5
+93b793e79d987065b39ad8e2e71244368435fc25 *vp90-2-03-size-210x224.webm.md5
+5230f31a57ca3b5311698a12035d2644533b3ec4 *vp90-2-03-size-210x226.webm.md5
+65411da07f60113f2be05c807879072b161d561e *vp90-2-03-size-224x196.webm.md5
+46ea3641d41acd4bff347b224646c060d5620385 *vp90-2-03-size-224x198.webm.md5
+196aefb854c8b95b9330263d6690b7ee15693ecf *vp90-2-03-size-224x200.webm.md5
+840ad8455dcf2be378c14b007e66fa642fc8196d *vp90-2-03-size-224x202.webm.md5
+40b9801d5620467499ac70fa6b7c40aaa5e1c331 *vp90-2-03-size-224x208.webm.md5
+1e4acd4b6334ae260c3eed08652d0ba8122073f2 *vp90-2-03-size-224x210.webm.md5
+37db449ad86fb286c2c02d94aa8fe0379c05044a *vp90-2-03-size-224x224.webm.md5
+5cc3ac5dc9f6912491aa2ddac863f8187f34c569 *vp90-2-03-size-224x226.webm.md5
+fe83655c0f1888f0af7b047785f01ba7ca9f1324 *vp90-2-03-size-226x196.webm.md5
+e3ddfdc650acb95adb45abd9b634e1f09ea8ac96 *vp90-2-03-size-226x198.webm.md5
+abb83edc868a3523ccd4e5523fac2efbe7c3df1f *vp90-2-03-size-226x200.webm.md5
+1d22d2d0f375251c2d5a1acb4714bc35d963865b *vp90-2-03-size-226x202.webm.md5
+6feb0e7325386275719f3511ada9e248a2ae7df4 *vp90-2-03-size-226x208.webm.md5
+49a8fa87945f47208168d541c068e78d878075d5 *vp90-2-03-size-226x210.webm.md5
+83c6d8f2969b759e10e5c6542baca1265c874c29 *vp90-2-03-size-226x224.webm.md5
+94ad19b8b699cea105e2ff18f0df2afd7242bcf7 *vp90-2-03-size-226x226.webm.md5
+3084d6d0a1eec22e85a394422fbc8faae58930a5 *vp90-2-03-size-352x288.webm.md5
+7f6d8879336239a43dbb6c9f13178cb11cf7ed09 *vp90-2-05-resize.ivf.md5
+f6235f937552e11d8eb331ec55da6b3aa596b9ac *vp90-2-06-bilinear.webm.md5
+bfc82bf848e9c05020d61e3ffc1e62f25df81d19 *vp90-2-07-frame_parallel-1.webm.md5
+e5c2c9fb383e5bf3b563480adaeba5b7e3475ecd *vp90-2-07-frame_parallel.webm.md5
+0094f5ee5e46345017c30e0aa4835b550212d853 *vp90-2-08-tile-4x1.webm.md5
+ae7451810247fd13975cc257aa0301ff17102255 *vp90-2-08-tile-4x4.webm.md5
+45b404e025841c9750895fc1a9f6bd384fe6a315 *vp90-2-08-tile_1x2.webm.md5
+e981ecaabb29a80e0cbc1f4002384965ce8e95bb *vp90-2-08-tile_1x2_frame_parallel.webm.md5
+c9b237dfcc01c1b414fbcaa481d014a906ef7998 *vp90-2-08-tile_1x4.webm.md5
+a481fbea465010b57af5a19ebf6d4a5cfe5b9278 *vp90-2-08-tile_1x4_frame_parallel.webm.md5
+5e524165f0397e6141d914f4f0a66267d7658376 *vp90-2-08-tile_1x8.webm.md5
+c9b6850af28579b031791066457f4cb40df6e1c7 *vp90-2-08-tile_1x8_frame_parallel.webm.md5
+84c1599298aac78f2fc05ae2274575d10569dfa0 *vp90-2-09-aq2.webm.md5
+54638c38009198c38c8f3b25c182b709b6c1fd2e *vp90-2-09-lf_deltas.webm.md5
+5428efc4bf92191faedf4a727fcd1d94966a7abc *vp90-2-09-subpixel-00.ivf.md5
+14d631096f4bfa2d71f7f739aec1448fb3c33bad *vp90-2-10-show-existing-frame.webm.md5
+5f7c7811baa3e4f03be1dd78c33971b727846821 *vp90-2-10-show-existing-frame2.webm.md5
+b3c48382cf7d0454e83a02497c229d27720f9e20 *vp90-2-11-size-351x287.webm.md5
+19e003804ec1dfc5464813b32339a15d5ba7b42f *vp90-2-11-size-351x288.webm.md5
+68f515abe3858fc1eded46c8e6b2f727d43b5331 *vp90-2-11-size-352x287.webm.md5
+952eaac6eefa6f62179ed1db3e922fd42fecc624 *vp90-2-12-droppable_1.ivf.md5
+92a756469fa438220524e7fa6ac1d38c89514d17 *vp90-2-12-droppable_2.ivf.md5
+601abc9e4176c70f82ac0381365e9b151fdd24cd *vp90-2-12-droppable_3.ivf.md5
+bca1b02eebdb088fa3f389fe0e7571e75a71f523 *vp90-2-13-largescaling.webm.md5
+fc7267ab8fc2bf5d6c234e34ee6c078a967b4888 *vp90-2-14-resize-10frames-fp-tiles-1-2-4-8.webm.md5
+0c78a154956a8605d050bdd75e0dcc4d39c040a6 *vp90-2-14-resize-10frames-fp-tiles-1-2.webm.md5
+e9b4e8c7b33b5fda745d340c3f47e6623ae40cf2 *vp90-2-14-resize-10frames-fp-tiles-1-4.webm.md5
+028520578994c2d013d4c0129033d4f2ff31bbe0 *vp90-2-14-resize-10frames-fp-tiles-1-8.webm.md5
+92d5872f5bdffbed721703b7e959b4f885e3d77a *vp90-2-14-resize-10frames-fp-tiles-2-1.webm.md5
+a5db19f977094ec3fd60b4f7671b3e6740225e12 *vp90-2-14-resize-10frames-fp-tiles-2-4.webm.md5
+db17ec5d894ea8b8d0b7f32206d0dd3d46dcfa6d *vp90-2-14-resize-10frames-fp-tiles-2-8.webm.md5
+bc7c79e1bee07926dd970462ce6f64fc30eec3e1 *vp90-2-14-resize-10frames-fp-tiles-4-1.webm.md5
+22aa3dd430b69fd3d92f6561bac86deeed90486d *vp90-2-14-resize-10frames-fp-tiles-4-2.webm.md5
+508d5ebb9c0eac2a4100281a3ee052ec2fc19217 *vp90-2-14-resize-10frames-fp-tiles-4-8.webm.md5
+1c24e54fa19e94e1722f24676404444e941c3d31 *vp90-2-14-resize-10frames-fp-tiles-8-1.webm.md5
+9c0657b4d9e1d0e4c9d28a90e5a8630a65519124 *vp90-2-14-resize-10frames-fp-tiles-8-2.webm.md5
+4f454a06750614314ae15a44087b79016fe2db97 *vp90-2-14-resize-10frames-fp-tiles-8-4-2-1.webm.md5
+4eb347a0456d2c49a1e1d8de5aa1c51acc39887e *vp90-2-14-resize-10frames-fp-tiles-8-4.webm.md5
+1c199a41afe42ce303944d70089eaaa2263b4a09 *vp90-2-14-resize-fp-tiles-1-16.webm.md5
+1765315acccfe6cd12230e731369fcb15325ebfa *vp90-2-14-resize-fp-tiles-1-2-4-8-16.webm.md5
+c7b85ffd8e11500f73f52e7dc5a47f57c393d47f *vp90-2-14-resize-fp-tiles-1-2.webm.md5
+6852c783fb421bda5ded3d4c5a3ffc46de03fbc1 *vp90-2-14-resize-fp-tiles-1-4.webm.md5
+571353bac89fea60b5706073409aa3c0d42aefe9 *vp90-2-14-resize-fp-tiles-1-8.webm.md5
+0b58daf55aaf9063bf5b4fb33393d18b417dc428 *vp90-2-14-resize-fp-tiles-16-1.webm.md5
+b6415318c1c589a1f64b9d569ce3cabbec2e0d52 *vp90-2-14-resize-fp-tiles-16-2.webm.md5
+2ef8daa3c3e750fd745130d0a76a39fe86f0448f *vp90-2-14-resize-fp-tiles-16-4.webm.md5
+1ef480392112b3509cb190afbb96f9a38dd9fbac *vp90-2-14-resize-fp-tiles-16-8-4-2-1.webm.md5
+be0fe64a1a4933696ff92d93f9bdecdbd886dc13 *vp90-2-14-resize-fp-tiles-16-8.webm.md5
+db18fcf915f7ffaea6c39feab8bda6c1688af011 *vp90-2-14-resize-fp-tiles-2-1.webm.md5
+1937f5df032664ac345d4613ad4417b4967b1230 *vp90-2-14-resize-fp-tiles-2-16.webm.md5
+374c549f2839a3d0b732c4e3650700144037e76c *vp90-2-14-resize-fp-tiles-2-4.webm.md5
+e5b8820a7c823b21297d6e889e57ec401882c210 *vp90-2-14-resize-fp-tiles-2-8.webm.md5
+393211b808030d09a79927b17a4374b2f68a60ae *vp90-2-14-resize-fp-tiles-4-1.webm.md5
+5d16b7f82bf59f802724ddfd97abb487150b1c9d *vp90-2-14-resize-fp-tiles-4-16.webm.md5
+fde7b30d2aa64c1e851a4852f655d79fc542cf66 *vp90-2-14-resize-fp-tiles-4-2.webm.md5
+03cba0532bc90a05b1990db830bf5701e24e7982 *vp90-2-14-resize-fp-tiles-4-8.webm.md5
+491fd3cd78fb0577bfe905bb64bbf64bd7d29140 *vp90-2-14-resize-fp-tiles-8-1.webm.md5
+57f13a2197486584f4e1a4f82ad969f3abc5a1a2 *vp90-2-14-resize-fp-tiles-8-16.webm.md5
+edf26f0130aeee8342d49c2c8f0793ad008782d9 *vp90-2-14-resize-fp-tiles-8-2.webm.md5
+5a8ff8a52cbbde7bfab569beb6d971c5f8b904f7 *vp90-2-14-resize-fp-tiles-8-4.webm.md5
+e3ab35d4316c5e81325c50f5236ceca4bc0d35df *vp90-2-15-segkey.webm.md5
+8f46ba5f785d0c2170591a153e0d0d146a7c8090 *vp90-2-15-segkey_adpq.webm.md5
+5661b0168752969f055eec37b05fa9fa947dc7eb *vp90-2-16-intra-only.webm.md5
+cc75f351818b9a619818f5cc77b9bc013d0c1e11 *vp90-2-17-show-existing-frame.webm.md5
+c12918cf0a716417fba2de35c3fc5ab90e52dfce *vp90-2-18-resize.ivf.md5
+bd21bc9eda4a4a36b221d71ede3a139fc3c7bd85 *vp90-2-19-skip-01.webm.md5
+9020d5e260bd7df08e2b3d4b86f8623cee3daea2 *vp90-2-19-skip-02.webm.md5
+368dccdde5288c13c25695d2eacdc7402cadf613 *vp90-2-19-skip.webm.md5
+47d7d409785afa33b123376de0c907336e6c7bd7 *vp90-2-20-big_superframe-01.webm.md5
+7c0ed8d04c4d06c5411dd2e5de2411d37f092db5 *vp90-2-20-big_superframe-02.webm.md5
+a7826dd386bedfe69d02736969bfb47fb6a40a5e *vp90-2-21-resize_inter_1280x720_5_1-2.webm.md5
+a18f57db4a25e1f543a99f2ceb182e00db0ee22f *vp90-2-21-resize_inter_1280x720_5_3-4.webm.md5
+fd6f9f332cd5bea4c0f0d57be4297bea493cc5a1 *vp90-2-21-resize_inter_1280x720_7_1-2.webm.md5
+7bbb949cabc1e70dadcc74582739f63b833034e0 *vp90-2-21-resize_inter_1280x720_7_3-4.webm.md5
+66d7789992613ac9d678ff905ff1059daa1b89e4 *vp90-2-21-resize_inter_1920x1080_5_1-2.webm.md5
+f78bea1075983fd990e7f25d4f31438f9b5efa34 *vp90-2-21-resize_inter_1920x1080_5_3-4.webm.md5
+2632b635135ed5ecd67fd22dec7990d29c4f4cb5 *vp90-2-21-resize_inter_1920x1080_7_1-2.webm.md5
+d2cf3b25956415bb579d368e7098097e482dd73a *vp90-2-21-resize_inter_1920x1080_7_3-4.webm.md5
+8a3d8cf325109ffa913cc9426c32eea8c202a09a *vp90-2-21-resize_inter_320x180_5_1-2.webm.md5
+41cab1ddf7715b680a4dbce42faa9bcd72af4e5c *vp90-2-21-resize_inter_320x180_5_3-4.webm.md5
+70047377787003cc03dda7b2394e6d7eaa666d9e *vp90-2-21-resize_inter_320x180_7_1-2.webm.md5
+e69019e378114a4643db283b66d1a7e304761a56 *vp90-2-21-resize_inter_320x180_7_3-4.webm.md5
+a75653c53d22b623c1927fc0088da21dafef21f4 *vp90-2-21-resize_inter_320x240_5_1-2.webm.md5
+8d89814ff469a186312111651b16601dfbce4336 *vp90-2-21-resize_inter_320x240_5_3-4.webm.md5
+2643440898c83c08cc47bc744245af696b877c24 *vp90-2-21-resize_inter_320x240_7_1-2.webm.md5
+70ba8ec9120b26e9b0ffa2c79b432f16cbcb50ec *vp90-2-21-resize_inter_320x240_7_3-4.webm.md5
+6355a04249004a35fb386dd1024214234f044383 *vp90-2-21-resize_inter_640x360_5_1-2.webm.md5
+59e6fc381e3ec3b7bdaac586334e0bc944d18fb6 *vp90-2-21-resize_inter_640x360_5_3-4.webm.md5
+1416fc761b690c54a955c4cf017fa078520e8c18 *vp90-2-21-resize_inter_640x360_7_1-2.webm.md5
+60de1299793433a630b71130cf76c9f5965758e2 *vp90-2-21-resize_inter_640x360_7_3-4.webm.md5
+f6856f19236ee46ed462bd0a2e7e72b9c3b9cea6 *vp90-2-21-resize_inter_640x480_5_1-2.webm.md5
+68ffe59877e9a7863805e1c0a3ce18ce037d7c9d *vp90-2-21-resize_inter_640x480_5_3-4.webm.md5
+7739bfca167b1b43fea72f807f01e097b7cb98d8 *vp90-2-21-resize_inter_640x480_7_1-2.webm.md5
+4a18b09ccb36564193f0215f599d745d95bb558c *vp90-2-21-resize_inter_640x480_7_3-4.webm.md5
+e2f9e1e47a791b4e939a9bdc50bf7a25b3761f77 *vp90-2-22-svc_1280x720_1.webm.md5
+02e53e3eefbf25ec0929047fe50876acdeb040bd *vp90-2-22-svc_1280x720_3.ivf.md5
+"""
+
 
 @dataclass(frozen=True)
 class Entry:
@@ -366,6 +677,14 @@ class Entry:
     algorithm: str
     digest: str
     transform: str | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedMd5:
+    media_path: Path
+    md5_path: Path
+    media_algorithm: str
+    media_digest: str
 
 
 def realworld_entries() -> list[Entry]:
@@ -425,16 +744,17 @@ def realworld_entries() -> list[Entry]:
 
 def libvpx_entries() -> list[Entry]:
     entries: list[Entry] = []
-    for line in LIBVPX_SHA1_LINES.splitlines():
-        digest, name = line.split(" *", 1)
-        entries.append(
-            Entry(
-                path=Path("libvpx") / name,
-                url=LIBVPX_BASE_URL + name,
-                algorithm="sha1",
-                digest=digest,
+    for lines in (LIBVPX_SHA1_LINES, LIBVPX_MD5_SHA1_LINES):
+        for line in lines.splitlines():
+            digest, name = line.split(" *", 1)
+            entries.append(
+                Entry(
+                    path=Path("libvpx") / name,
+                    url=LIBVPX_BASE_URL + name,
+                    algorithm="sha1",
+                    digest=digest,
+                )
             )
-        )
     return entries
 
 
@@ -450,6 +770,33 @@ def corpus_entries() -> list[Entry]:
         *realworld_entries(),
         *libvpx_entries(),
     ]
+
+
+def is_media_path(path: Path) -> bool:
+    return path.suffix in {".ivf", ".webm"}
+
+
+def md5_sidecar_path(media_path: Path) -> Path:
+    return media_path.with_name(media_path.name + ".md5")
+
+
+def generated_sha256_path(md5_path: Path) -> Path:
+    return md5_path.with_name(md5_path.name + ".sha256")
+
+
+def generated_md5_refs(entries: Iterable[Entry]) -> list[GeneratedMd5]:
+    entries = list(entries)
+    downloaded_paths = {entry.path for entry in entries}
+    refs = []
+    for entry in entries:
+        if not is_media_path(entry.path):
+            continue
+        md5_path = md5_sidecar_path(entry.path)
+        if md5_path not in downloaded_paths:
+            refs.append(
+                GeneratedMd5(entry.path, md5_path, entry.algorithm, entry.digest)
+            )
+    return refs
 
 
 def file_digest(path: Path, algorithm: str) -> str:
@@ -469,6 +816,87 @@ def verify_entry(root: Path, entry: Entry) -> tuple[bool, str]:
     actual = file_digest(path, entry.algorithm)
     if actual != entry.digest:
         return False, f"{entry.algorithm} mismatch: got {actual}"
+    return True, "ok"
+
+
+def looks_like_md5_sidecar(path: Path) -> bool:
+    saw_line = False
+    with path.open("r", encoding="ascii") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            saw_line = True
+            fields = line.split()
+            if not fields:
+                return False
+            digest = fields[0]
+            if len(digest) != 32 or any(
+                c not in "0123456789abcdef" for c in digest
+            ):
+                return False
+    return saw_line
+
+
+def read_sha256_record(
+    path: Path,
+) -> tuple[str, tuple[str, str, str] | None] | None:
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    if not lines:
+        return None
+    fields = lines[0].split()
+    if not fields:
+        return None
+    digest = fields[0].lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None
+    source = None
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) == 4 and fields[0] == "source":
+            source = (fields[1], fields[2], fields[3])
+    return digest, source
+
+
+def verify_generated_md5(root: Path, ref: GeneratedMd5) -> tuple[bool, str]:
+    media_path = root / ref.media_path
+    md5_path = root / ref.md5_path
+    sha256_path = root / generated_sha256_path(ref.md5_path)
+
+    if not media_path.exists():
+        return False, f"source missing: {ref.media_path}"
+    if not media_path.is_file():
+        return False, f"source not a regular file: {ref.media_path}"
+    if not md5_path.exists():
+        return False, "missing"
+    if not md5_path.is_file():
+        return False, "not a regular file"
+    try:
+        if not looks_like_md5_sidecar(md5_path):
+            return False, "invalid md5 sidecar"
+    except UnicodeDecodeError:
+        return False, "invalid md5 sidecar"
+    if not sha256_path.exists():
+        return False, f"missing sha256 record: {generated_sha256_path(ref.md5_path)}"
+    if not sha256_path.is_file():
+        return False, f"sha256 record is not a regular file: {generated_sha256_path(ref.md5_path)}"
+    record = read_sha256_record(sha256_path)
+    if record is None:
+        return False, f"invalid sha256 record: {generated_sha256_path(ref.md5_path)}"
+    expected, source = record
+    expected_source = (
+        ref.media_algorithm,
+        ref.media_digest,
+        ref.media_path.as_posix(),
+    )
+    if source != expected_source:
+        return False, "source digest changed"
+    actual = file_digest(md5_path, "sha256")
+    if actual != expected:
+        return False, f"sha256 mismatch: got {actual}"
     return True, "ok"
 
 
@@ -548,6 +976,112 @@ def fetch_entry(root: Path, entry: Entry) -> None:
                 pass
 
 
+def run_vpxdec_md5(root: Path, ref: GeneratedMd5, vpxdec: str) -> str:
+    media_path = root / ref.media_path
+    md5_path = root / ref.md5_path
+    sha256_path = root / generated_sha256_path(ref.md5_path)
+    md5_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_md5_name = None
+    tmp_sha256_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=md5_path.name + ".",
+            suffix=".tmp",
+            dir=md5_path.parent,
+            delete=False,
+        ) as tmp_md5:
+            tmp_md5_name = tmp_md5.name
+            command = [
+                vpxdec,
+                "--md5",
+                "--i420",
+                "-o",
+                VPXDEC_MD5_OUTPUT_PATTERN,
+                str(media_path),
+            ]
+            result = subprocess.run(
+                command,
+                stdout=tmp_md5,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        tmp_md5_path = Path(tmp_md5_name)
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if len(stderr) > 1200:
+                stderr = stderr[-1200:]
+            raise RuntimeError(f"vpxdec failed for {ref.media_path}: {stderr}")
+        if not looks_like_md5_sidecar(tmp_md5_path):
+            raise RuntimeError(
+                f"vpxdec produced invalid md5 sidecar for {ref.media_path}"
+            )
+
+        digest = file_digest(tmp_md5_path, "sha256")
+        with tempfile.NamedTemporaryFile(
+            prefix=sha256_path.name + ".",
+            suffix=".tmp",
+            dir=md5_path.parent,
+            mode="w",
+            encoding="ascii",
+            delete=False,
+        ) as tmp_sha256:
+            tmp_sha256_name = tmp_sha256.name
+            tmp_sha256.write(f"{digest}  {md5_path.name}\n")
+            tmp_sha256.write(
+                f"source {ref.media_algorithm} {ref.media_digest} "
+                f"{ref.media_path.as_posix()}\n"
+            )
+
+        os.replace(tmp_md5_path, md5_path)
+        os.replace(Path(tmp_sha256_name), sha256_path)
+        return digest
+    finally:
+        for tmp_name in (tmp_md5_name, tmp_sha256_name):
+            if tmp_name is None:
+                continue
+            try:
+                Path(tmp_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def resolve_vpxdec(command: str) -> str:
+    resolved = shutil.which(command)
+    if resolved is None:
+        raise RuntimeError(
+            f"{command!r} not found; enter the devshell or pass --vpxdec"
+        )
+    return resolved
+
+
+def generate_md5_refs(
+    root: Path, refs: list[GeneratedMd5], jobs: int, vpxdec: str
+) -> list[tuple[GeneratedMd5, str]]:
+    failures: list[tuple[GeneratedMd5, str]] = []
+    if not refs:
+        return failures
+    resolved_vpxdec = resolve_vpxdec(vpxdec)
+    worker_count = max(1, min(jobs, len(refs)))
+    print(f"generate: {len(refs)} md5 sidecars with {worker_count} jobs")
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=worker_count
+    ) as executor:
+        futures = {
+            executor.submit(run_vpxdec_md5, root, ref, resolved_vpxdec): ref
+            for ref in refs
+        }
+        for future in concurrent.futures.as_completed(futures):
+            ref = futures[future]
+            try:
+                digest = future.result()
+            except Exception as exc:
+                failures.append((ref, str(exc)))
+                print(f"  failed {ref.md5_path}: {exc}", file=sys.stderr)
+                continue
+            print(f"  ok {ref.md5_path} sha256 {digest}")
+    return failures
+
+
 def format_size(path: Path) -> str:
     try:
         size = path.stat().st_size
@@ -560,9 +1094,16 @@ def format_size(path: Path) -> str:
     raise AssertionError("unreachable")
 
 
-def print_list(entries: Iterable[Entry]) -> None:
+def print_list(
+    entries: Iterable[Entry], generated_refs: Iterable[GeneratedMd5]
+) -> None:
     for entry in entries:
         print(f"{entry.algorithm} {entry.digest}  {entry.path}")
+    for ref in generated_refs:
+        print(
+            "generated-md5 sha256-record  "
+            f"{ref.md5_path}  source={ref.media_path}"
+        )
 
 
 def main() -> int:
@@ -581,13 +1122,28 @@ def main() -> int:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="print manifest entries and exit",
+        help="print download manifest and generated md5 refs, then exit",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=os.cpu_count() or 1,
+        help="parallel vpxdec jobs for generated md5 sidecars (default: CPU count)",
+    )
+    parser.add_argument(
+        "--vpxdec",
+        default=os.environ.get("VPXDEC", "vpxdec"),
+        help="vpxdec executable for generated md5 sidecars (default: vpxdec)",
     )
     args = parser.parse_args()
+    if args.jobs < 1:
+        parser.error("--jobs must be >= 1")
 
     entries = corpus_entries()
+    generated_refs = generated_md5_refs(entries)
     if args.list:
-        print_list(entries)
+        print_list(entries, generated_refs)
         return 0
 
     root = args.root
@@ -600,15 +1156,34 @@ def main() -> int:
         else:
             bad.append((entry, reason))
 
-    if not bad:
-        print(f"ok: {ok_count} files verified under {root}")
+    generated_bad: list[tuple[GeneratedMd5, str]] = []
+    generated_ok_count = 0
+    for ref in generated_refs:
+        ok, reason = verify_generated_md5(root, ref)
+        if ok:
+            generated_ok_count += 1
+        else:
+            generated_bad.append((ref, reason))
+
+    if not bad and not generated_bad:
+        print(
+            f"ok: {ok_count} files and {generated_ok_count} generated md5 "
+            f"sidecars verified under {root}"
+        )
         return 0
 
-    print(f"need: {len(bad)} of {len(entries)} files under {root}")
+    print(
+        f"need: {len(bad)} of {len(entries)} downloads and "
+        f"{len(generated_bad)} of {len(generated_refs)} generated md5 sidecars "
+        f"under {root}"
+    )
     for entry, reason in bad[:20]:
         print(f"  {entry.path}: {reason}")
-    if len(bad) > 20:
-        print(f"  ... {len(bad) - 20} more")
+    for ref, reason in generated_bad[:20]:
+        print(f"  {ref.md5_path}: {reason}")
+    omitted = max(0, len(bad) - 20) + max(0, len(generated_bad) - 20)
+    if omitted > 0:
+        print(f"  ... {omitted} more")
 
     if args.check_only:
         return 1
@@ -631,7 +1206,58 @@ def main() -> int:
             print(f"  {entry.path}: {reason}", file=sys.stderr)
         return 1
 
-    print(f"ok: {len(entries)} files present under {root}")
+    pending_generated: list[GeneratedMd5] = []
+    blocked_generated: list[tuple[GeneratedMd5, str]] = []
+    for ref in generated_refs:
+        ok, reason = verify_generated_md5(root, ref)
+        if ok:
+            continue
+        if not (root / ref.media_path).is_file():
+            blocked_generated.append((ref, reason))
+        else:
+            pending_generated.append(ref)
+
+    if blocked_generated:
+        print(
+            f"failed: {len(blocked_generated)} generated md5 sidecars blocked",
+            file=sys.stderr,
+        )
+        for ref, reason in blocked_generated[:20]:
+            print(f"  {ref.md5_path}: {reason}", file=sys.stderr)
+        return 1
+
+    try:
+        md5_failures = generate_md5_refs(
+            root, pending_generated, args.jobs, args.vpxdec
+        )
+    except RuntimeError as exc:
+        print(f"failed: {exc}", file=sys.stderr)
+        return 1
+    if md5_failures:
+        print(f"failed: {len(md5_failures)} generated md5 sidecars", file=sys.stderr)
+        for ref, reason in md5_failures[:20]:
+            print(f"  {ref.md5_path}: {reason}", file=sys.stderr)
+        return 1
+
+    post_generated_bad = [
+        (ref, reason)
+        for ref in generated_refs
+        for ok, reason in [verify_generated_md5(root, ref)]
+        if not ok
+    ]
+    if post_generated_bad:
+        print(
+            f"failed: {len(post_generated_bad)} generated md5 sidecars did not verify",
+            file=sys.stderr,
+        )
+        for ref, reason in post_generated_bad[:20]:
+            print(f"  {ref.md5_path}: {reason}", file=sys.stderr)
+        return 1
+
+    print(
+        f"ok: {len(entries)} downloads and {len(generated_refs)} generated md5 "
+        f"sidecars present under {root}"
+    )
     return 0
 
 
