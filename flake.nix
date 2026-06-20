@@ -40,7 +40,12 @@
       EOF
             exit 1
     '';
+    implementorSandbox = import ./nix/implementor-sandbox.nix {
+      inherit pkgs rustToolchain v8;
+    };
   in {
+    packages.${system}.implementor-sandbox = implementorSandbox;
+
     devShells.${system}.default = pkgs.mkShell {
       V8_LINUX64 = "${v8.linux64}";
       V8_ANDROID_ARM32 = "${v8.androidArm32}";
@@ -64,6 +69,7 @@
         bubblewrap
         cacert
         git
+        implementorSandbox
         libvpx
         nodejs
         pnpm
