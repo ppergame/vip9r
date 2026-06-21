@@ -83,27 +83,19 @@ in
       pkgs.coreutils
       pkgs.git
       pkgs.podman
+      pkgs.rsync
     ];
 
     text = ''
       usage() {
         cat >&2 <<'EOF'
       usage:
-        grinder [--repo DIR] run TASK_FILE
-        grinder [--repo DIR] shell [COMMAND...]
+        grinder run TASK_FILE
+        grinder shell [COMMAND...]
       EOF
       }
 
-      repo="''${VIP9R_REPO:-$PWD}"
-      if [[ "''${1:-}" == "--repo" ]]; then
-        if [[ $# -lt 2 ]]; then
-          usage
-          exit 2
-        fi
-        repo="$2"
-        shift 2
-      fi
-      repo="$(cd -- "$repo" && pwd)"
+      repo="$PWD"
 
       mode="''${1:-}"
       case "$mode" in
@@ -163,7 +155,7 @@ in
       ln -s "${bash}" "$run/rootfs/bin/sh"
       ln -s "${env}" "$run/rootfs/usr/bin/env"
 
-      cp -a --reflink=auto "$repo/rust" "$run/rust"
+      rsync -a --exclude=/target "$repo/rust/" "$run/rust/"
       cp "$system_prompt" "$run/system.md"
       if [[ -n "$task_file" ]]; then
         cp "$task_file" "$run/task.md"
