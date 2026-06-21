@@ -8,7 +8,7 @@
   bash = lib.getExe pkgs.bashInteractive;
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
-  sandboxPath = lib.makeBinPath (with pkgs; [
+  sandboxPackages = with pkgs; [
     # Shell and baseline userland.
     bashInteractive
     bc
@@ -55,19 +55,26 @@
     wasm-tools
 
     # Debugging and host inspection.
-    binutils
     strace
-  ]);
+  ];
+  sandboxEnv = pkgs.buildEnv {
+    name = "vip9r-grinder-env";
+    paths = sandboxPackages;
+    pathsToLink = ["/bin"];
+  };
   podmanEnv = name: value: ["--env" "${name}=${value}"];
   staticPodmanArgs =
     lib.escapeShellArgs
     (["run" "--rm" "-i" "--rootfs" "--userns=keep-id" "--unsetenv-all" "--workdir" "/run/rust"]
       ++ ["--storage-opt" "overlay.mount_program=${fuseOverlayfs}"]
-      ++ podmanEnv "PATH" "${sandboxPath}:/bin:/usr/bin"
+      ++ podmanEnv "PATH" "/run/tools/bin:/bin:/usr/bin"
       ++ podmanEnv "HOME" "/run/home"
       ++ podmanEnv "SHELL" "/bin/bash"
       ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
       ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
+      # TODO: decide whether grinder should provide TLS trust and related env
+      # (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) or keep
+      # network downloads explicitly unavailable to implementor sandboxes.
       ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
@@ -83,7 +90,7 @@ in
         cat >&2 <<'EOF'
       usage:
         grinder [--repo DIR] run TASK_FILE
-        grinder [--repo DIR] shell [TASK_FILE]
+        grinder [--repo DIR] shell [COMMAND...]
       EOF
       }
 
@@ -111,17 +118,27 @@ in
           ;;
       esac
 
-      task_file="''${1:-}"
-      if [[ "$mode" == "run" && -z "$task_file" ]]; then
-        usage
-        exit 2
-      fi
+      task_file=""
+      command=()
+      case "$mode" in
+        run)
+          task_file="''${1:-}"
+          if [[ -z "$task_file" ]]; then
+            usage
+            exit 2
+          fi
+          shift || true
+          if [[ $# -gt 0 ]]; then
+            usage
+            exit 2
+          fi
+          ;;
+        shell)
+          command=("''${@}")
+          ;;
+      esac
       if [[ -n "$task_file" && ! -f "$task_file" ]]; then
         echo "task file not found: $task_file" >&2
-        exit 2
-      fi
-      if [[ $# -gt 1 ]]; then
-        usage
         exit 2
       fi
 
@@ -141,6 +158,7 @@ in
       mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
       git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
+      ln -s "${sandboxEnv}" "$run/tools"
       ln -s "${bash}" "$run/rootfs/bin/bash"
       ln -s "${bash}" "$run/rootfs/bin/sh"
       ln -s "${env}" "$run/rootfs/usr/bin/env"
@@ -180,7 +198,11 @@ in
           ;;
         shell)
           trap 'rm -rf -- "$run"' EXIT
-          podman "''${podman_args[@]}" -t "$rootfs_arg" /bin/bash -i || status=$?
+          if [[ ''${#command[@]} -gt 0 ]]; then
+            podman "''${podman_args[@]}" "$rootfs_arg" "''${command[@]}" || status=$?
+          else
+            podman "''${podman_args[@]}" -t "$rootfs_arg" /bin/bash -i || status=$?
+          fi
           ;;
       esac
 
