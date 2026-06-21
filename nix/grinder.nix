@@ -139,6 +139,8 @@ in
       mkdir -p "$temp_dir" "$auth_dir"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
       mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin"
+      git config --file "$run/home/.gitconfig" user.name vip9r-implementor
+      git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
       ln -s "${bash}" "$run/rootfs/bin/bash"
       ln -s "${bash}" "$run/rootfs/bin/sh"
       ln -s "${env}" "$run/rootfs/usr/bin/env"
