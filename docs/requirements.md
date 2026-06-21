@@ -65,8 +65,8 @@ does not support VP9 hardware decode. The app could:
 
 ## Testing strategy
 
-- Unit tests: disposable, as needed to pin decisions and bug fixes. Not
-  interested in full coverage
+- Unit tests: as needed to pin decisions and bug fixes. Not interested in full
+  coverage
 - Integration tests
   - Partial computation within a frame: nice-to-have. Remove if the test blocks
     a desired architecture change

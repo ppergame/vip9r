@@ -16,7 +16,7 @@ M0 bootstrap, host-only correctness path. Nothing built yet.
 - [x] user: VP9 profile 0 / 8-bit spec source
 - [x] user: conformance vectors for the profile 0 / 8-bit subset
 - [x] prebuilt d8 binaries for host and ARM
-- [ ] freestanding `no_std` wasm skeleton with a minimal decode API
+- [x] freestanding `no_std` wasm skeleton with a minimal decode API
 - [ ] golden comparison loop for conformance vectors and frame-output goldens
 - [ ] implementor handoff packet for the first decode slice
 - [ ] implementation-agent sandbox and workspace plan for the first handoff
