@@ -38,10 +38,8 @@ does not support VP9 hardware decode. The app could:
     - Profile 0, 8-bit
     - "clean-ish" room from spec, test vectors, test content
     - libvpx is the correctness oracle
-    - libvpx source code is a debugging oracle
-      - frame-level result not correct? perform differential debugging block by
-        functional block
-      - no peeking otherwise
+      - frame md5sum, maybe partial frame contents
+      - no peeking at source code
       - vip9r is a "derived work" of libvpx
   - H.264 encoder
     - minih264
@@ -68,8 +66,6 @@ does not support VP9 hardware decode. The app could:
 - Unit tests: as needed to pin decisions and bug fixes. Not interested in full
   coverage
 - Integration tests
-  - Partial computation within a frame: nice-to-have. Remove if the test blocks
-    a desired architecture change
   - Frame-level correctness: mandatory
   - Clip-level correctness: mandatory
   - H.264 output quality: nice-to-have
@@ -131,3 +127,14 @@ The sandbox's purpose is context management, not security. The implementor has
 access to the common Nix store and is free to download the necessary specs. It
 can also ask the orchestrator for tools to be added to the ambient context on
 the next run.
+
+`scripts/grinder-system-prompt.md` is the implementor prompt. The user maintains
+the bulk of the prompt. Orchestrator makes suggestions and maintains the
+orchestrator block.
+
+Orchestrator writes a task file then runs
+`nix run .#grinder -- run temp/task-<slug>.md`. The script puts together an
+implementor sandbox, including system prompt, task prompt and a copy of the Rust
+code. When the agent is done, the script will print a location like
+`temp/grinder.XXXXXX`. These directories are transient and the orchestrator
+deletes any stale ones.
