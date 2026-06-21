@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import {
 	AuthStorage,
 	DefaultResourceLoader,
@@ -16,6 +16,8 @@ const RUN_ROOT = "/run";
 const WORK_DIR = `${RUN_ROOT}/rust`;
 const TASK_PATH = `${RUN_ROOT}/task.md`;
 const SYSTEM_PROMPT_PATH = `${RUN_ROOT}/system.md`;
+const TRACE_DIR = `${RUN_ROOT}/trace`;
+const SESSION_DIR = `${TRACE_DIR}/pi-sessions`;
 const AGENT_DIR = `${RUN_ROOT}/home/.pi-harness`;
 const AUTH_PATH = "/auth/auth.json";
 
@@ -24,6 +26,10 @@ type AssistantLike = {
 	stopReason?: unknown;
 	errorMessage?: unknown;
 	content?: unknown;
+};
+
+type TraceSession = {
+	sessionFile: string | undefined;
 };
 
 function readRequiredFile(path: string, label: string): string {
@@ -73,6 +79,29 @@ function finalAssistantText(messages: unknown[]): { text?: string; error?: strin
 	return text ? { text } : { error: "Assistant message contained no text" };
 }
 
+function errorText(error: unknown): string {
+	if (error instanceof Error) {
+		return error.stack ?? error.message;
+	}
+	return String(error);
+}
+
+function writeSessionTrace(session: TraceSession, error: string | undefined): void {
+	mkdirSync(TRACE_DIR, { recursive: true });
+
+	if (session.sessionFile) {
+		try {
+			copyFileSync(session.sessionFile, `${TRACE_DIR}/session.jsonl`);
+		} catch (copyError) {
+			process.stderr.write(`session.jsonl: ${errorText(copyError)}\n`);
+		}
+	}
+
+	if (error) {
+		writeFileSync(`${TRACE_DIR}/error.txt`, `${error}\n`);
+	}
+}
+
 async function main(): Promise<number> {
 	const prompt = readPrompt();
 	const systemPrompt = readRequiredFile(SYSTEM_PROMPT_PATH, "system prompt");
@@ -96,7 +125,8 @@ async function main(): Promise<number> {
 		quietStartup: true,
 	});
 
-	const sessionManager = SessionManager.inMemory(cwd);
+	mkdirSync(SESSION_DIR, { recursive: true });
+	const sessionManager = SessionManager.create(cwd, SESSION_DIR);
 
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -107,7 +137,7 @@ async function main(): Promise<number> {
 		noPromptTemplates: true,
 		noThemes: true,
 		noContextFiles: true,
-		appendSystemPrompt: [systemPrompt],
+		systemPrompt,
 	});
 	await resourceLoader.reload();
 
@@ -129,16 +159,42 @@ async function main(): Promise<number> {
 		tools: [...ALL_BUILT_IN_PI_TOOLS],
 	});
 
+	let turn = 0;
+	const unsubscribe = session.subscribe((event) => {
+		if (event.type === "turn_start") {
+			process.stderr.write(`· turn ${(turn += 1)}\n`);
+			return;
+		}
+		if (event.type === "tool_execution_start") {
+			const args = (event.args ?? {}) as Record<string, unknown>;
+			const hint = String(args.command ?? args.pattern ?? args.path ?? "")
+				.split("\n", 1)[0]
+				.slice(0, 80);
+			process.stderr.write(`  ▸ ${event.toolName}${hint ? ` ${hint}` : ""}\n`);
+		}
+	});
+
+	let agentError: string | undefined;
 	try {
 		await session.prompt(prompt);
 		const result = finalAssistantText(session.state.messages);
 		if (result.error) {
+			agentError = result.error;
 			process.stderr.write(`${result.error}\n`);
 			return 1;
 		}
 		process.stdout.write(`${result.text}\n`);
 		return 0;
+	} catch (error) {
+		agentError = errorText(error);
+		throw error;
 	} finally {
+		unsubscribe();
+		try {
+			writeSessionTrace(session, agentError);
+		} catch (error) {
+			process.stderr.write(`session trace: ${errorText(error)}\n`);
+		}
 		session.dispose();
 		await settingsManager.flush();
 	}

@@ -17,6 +17,7 @@
     curl
     diffutils
     dnsutils
+    fd
     file
     findutils
     gawk
@@ -148,7 +149,7 @@ in
       auth_dir="$temp_dir/pi-auth"
       mkdir -p "$temp_dir" "$auth_dir"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
-      mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin"
+      mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/trace"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
       git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
       ln -s "${sandboxEnv}" "$run/tools"
@@ -186,8 +187,26 @@ in
       status=0
       case "$mode" in
         run)
+          # run mode deliberately leaves "$run" intact: the orchestrator reviews
+          # and merges from "$run/rust" before reaping it. "$preserve" is the
+          # durable record that outlives "$run".
+          preserve="$temp_dir/traces/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$run")"
+          echo "trace -> $preserve" >&2
+          # Inherit stdout/stderr: the final response streams on stdout, the
+          # progress feed on stderr. The durable transcript is session.jsonl.
           podman "''${podman_args[@]}" "$rootfs_arg" node /harness/pi-harness.mjs || status=$?
-          echo "source: $run/rust" >&2
+          mkdir -p "$preserve"
+          rsync -a --exclude=/pi-sessions "$run/trace/" "$preserve/"
+          cp "$run/task.md" "$preserve/task.md"
+          cp "$run/system.md" "$preserve/system.md"
+          printf '%s\n' "$status" > "$preserve/exit-status"
+          {
+            echo
+            echo "── grinder ──"
+            echo "status: $status"
+            echo "source: $run/rust"
+            echo "trace:  $preserve"
+          } >&2
           ;;
         shell)
           trap 'rm -rf -- "$run"' EXIT
