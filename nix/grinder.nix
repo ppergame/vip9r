@@ -6,6 +6,7 @@
   inherit (pkgs) lib;
 
   bash = lib.getExe pkgs.bashInteractive;
+  caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
   sandboxPackages = with pkgs; [
@@ -72,9 +73,9 @@
       ++ podmanEnv "SHELL" "/bin/bash"
       ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
       ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
-      # TODO: decide whether grinder should provide TLS trust and related env
-      # (`SSL_CERT_FILE`, `NIX_SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`) or keep
-      # network downloads explicitly unavailable to implementor sandboxes.
+      ++ podmanEnv "SSL_CERT_FILE" caBundle
+      ++ podmanEnv "NIX_SSL_CERT_FILE" caBundle
+      ++ podmanEnv "NODE_EXTRA_CA_CERTS" caBundle
       ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
