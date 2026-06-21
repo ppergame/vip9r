@@ -7,37 +7,67 @@
 
   bash = lib.getExe pkgs.bashInteractive;
   env = lib.getExe' pkgs.coreutils "env";
-  rootfs = pkgs.runCommand "implementor-sandbox-rootfs" {} ''
-    mkdir -p $out/bin $out/usr/bin
-    ln -s ${bash} $out/bin/bash
-    ln -s ${bash} $out/bin/sh
-    ln -s ${env} $out/usr/bin/env
-  '';
+  fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
   sandboxPath = lib.makeBinPath (with pkgs; [
+    # Shell and baseline userland.
     bashInteractive
-    binaryen
+    bc
     coreutils
+    curl
+    diffutils
+    dnsutils
+    file
+    findutils
+    gawk
+    gnugrep
+    gnused
+    gnupatch
+    gnutar
+    gzip
+    jq
+    less
+    lsof
+    procps
+    psmisc
+    rsync
+    time
+    tree
+    unzip
+    util-linux
+    wget
+    which
+    xz
+    zip
+    zstd
+
+    # Build, source control, and project-specific tooling.
+    binaryen
+    clang
+    gnumake
     git
     libvpx
     nodejs
+    pkg-config
+    pnpm
     ripgrep
     rustToolchain
     wabt
     wasm-tools
+
+    # Debugging and host inspection.
+    binutils
+    strace
   ]);
   podmanEnv = name: value: ["--env" "${name}=${value}"];
   staticPodmanArgs =
     lib.escapeShellArgs
     (["run" "--rm" "-i" "--rootfs" "--userns=keep-id" "--unsetenv-all" "--workdir" "/run/rust"]
+      ++ ["--storage-opt" "overlay.mount_program=${fuseOverlayfs}"]
       ++ podmanEnv "PATH" "${sandboxPath}:/bin:/usr/bin"
       ++ podmanEnv "HOME" "/run/home"
       ++ podmanEnv "SHELL" "/bin/bash"
       ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
-      ++ podmanEnv "V8_ANDROID_ARM32" "${v8.androidArm32}"
-      ++ podmanEnv "V8_ANDROID_ARM64" "${v8.androidArm64}"
       ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
-      ++ podmanEnv "D8_ANDROID_ARM32" "${v8.androidArm32}/d8"
-      ++ podmanEnv "D8_ANDROID_ARM64" "${v8.androidArm64}/d8"
       ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
@@ -108,9 +138,10 @@ in
       auth_dir="$temp_dir/pi-auth"
       mkdir -p "$temp_dir" "$auth_dir"
       run="$(mktemp -d -p "$temp_dir" implementor.XXXXXX)"
-      mkdir -p "$run/home" "$run/rootfs"
-      cp -a --no-preserve=ownership "${rootfs}/." "$run/rootfs"
-      chmod -R u+w "$run/rootfs"
+      mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin"
+      ln -s "${bash}" "$run/rootfs/bin/bash"
+      ln -s "${bash}" "$run/rootfs/bin/sh"
+      ln -s "${env}" "$run/rootfs/usr/bin/env"
 
       cp -a --reflink=auto "$repo/rust" "$run/rust"
       cp "$system_prompt" "$run/system.md"
@@ -136,20 +167,21 @@ in
         --volume "$repo/docs/specs:/specs:ro"
         --volume "/bulk/vip9r:/media:ro"
         --volume "$harness_dir:/harness:ro"
-        "$run/rootfs:O"
       )
+      rootfs_arg="$run/rootfs:O"
 
       status=0
       case "$mode" in
         run)
-          podman "''${podman_args[@]}" node /harness/pi-harness.mjs || status=$?
+          podman "''${podman_args[@]}" "$rootfs_arg" node /harness/pi-harness.mjs || status=$?
+          echo "source: $run/rust" >&2
           ;;
         shell)
-          podman "''${podman_args[@]}" /bin/bash -i || status=$?
+          trap 'rm -rf -- "$run"' EXIT
+          podman "''${podman_args[@]}" -t "$rootfs_arg" /bin/bash -i || status=$?
           ;;
       esac
 
-      echo "source: $run/rust" >&2
       exit "$status"
     '';
   }
