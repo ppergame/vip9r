@@ -40,11 +40,11 @@
       EOF
             exit 1
     '';
-    implementorSandbox = import ./nix/implementor-sandbox.nix {
+    grinder = import ./nix/grinder.nix {
       inherit pkgs rustToolchain v8;
     };
   in {
-    packages.${system}.implementor-sandbox = implementorSandbox;
+    packages.${system}.grinder = grinder;
 
     devShells.${system}.default = pkgs.mkShell {
       V8_LINUX64 = "${v8.linux64}";
@@ -69,7 +69,7 @@
         bubblewrap
         cacert
         git
-        implementorSandbox
+        grinder
         libvpx
         nodejs
         pnpm

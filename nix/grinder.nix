@@ -71,7 +71,7 @@
       ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
-    name = "implementor-sandbox";
+    name = "grinder";
     runtimeInputs = [
       pkgs.coreutils
       pkgs.git
@@ -82,8 +82,8 @@ in
       usage() {
         cat >&2 <<'EOF'
       usage:
-        implementor-sandbox [--repo DIR] run TASK_FILE
-        implementor-sandbox [--repo DIR] shell [TASK_FILE]
+        grinder [--repo DIR] run TASK_FILE
+        grinder [--repo DIR] shell [TASK_FILE]
       EOF
       }
 
@@ -125,7 +125,7 @@ in
         exit 2
       fi
 
-      system_prompt="$repo/scripts/implementor-system-prompt.md"
+      system_prompt="$repo/scripts/grinder-system-prompt.md"
       harness_dir="$repo/js/dist/pi-harness"
       for path in "$repo/rust" "$repo/docs/specs" "$system_prompt" "$harness_dir/pi-harness.mjs"; do
         if [[ ! -e "$path" ]]; then
@@ -137,7 +137,7 @@ in
       temp_dir="$repo/temp"
       auth_dir="$temp_dir/pi-auth"
       mkdir -p "$temp_dir" "$auth_dir"
-      run="$(mktemp -d -p "$temp_dir" implementor.XXXXXX)"
+      run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
       mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin"
       ln -s "${bash}" "$run/rootfs/bin/bash"
       ln -s "${bash}" "$run/rootfs/bin/sh"
