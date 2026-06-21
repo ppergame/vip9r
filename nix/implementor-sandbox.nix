@@ -7,55 +7,45 @@
 
   bash = lib.getExe pkgs.bashInteractive;
   env = lib.getExe' pkgs.coreutils "env";
-  sandboxPath = lib.makeBinPath [
-    pkgs.bashInteractive
-    pkgs.binaryen
-    pkgs.coreutils
-    pkgs.git
-    pkgs.libvpx
-    pkgs.nodejs
-    pkgs.ripgrep
+  rootfs = pkgs.runCommand "implementor-sandbox-rootfs" {} ''
+    mkdir -p $out/bin $out/usr/bin
+    ln -s ${bash} $out/bin/bash
+    ln -s ${bash} $out/bin/sh
+    ln -s ${env} $out/usr/bin/env
+  '';
+  sandboxPath = lib.makeBinPath (with pkgs; [
+    bashInteractive
+    binaryen
+    coreutils
+    git
+    libvpx
+    nodejs
+    ripgrep
     rustToolchain
-    pkgs.wabt
-    pkgs.wasm-tools
-  ];
-  certBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
-  setenv = name: value: ["--setenv" name value];
-  symlink = source: dest: ["--symlink" source dest];
-  roBindTry = path: ["--ro-bind-try" path path];
-  staticBwrapArgs =
+    wabt
+    wasm-tools
+  ]);
+  podmanEnv = name: value: ["--env" "${name}=${value}"];
+  staticPodmanArgs =
     lib.escapeShellArgs
-    (["--die-with-parent" "--clearenv" "--chdir" "/run/rust" "--ro-bind" "/nix" "/nix"]
-      ++ setenv "PATH" "${sandboxPath}:/bin:/usr/bin"
-      ++ setenv "HOME" "/run/home"
-      ++ setenv "SHELL" "/bin/bash"
-      ++ setenv "TMPDIR" "/tmp"
-      ++ setenv "XDG_CACHE_HOME" "/run/home/.cache"
-      ++ setenv "V8_LINUX64" "${v8.linux64}"
-      ++ setenv "V8_ANDROID_ARM32" "${v8.androidArm32}"
-      ++ setenv "V8_ANDROID_ARM64" "${v8.androidArm64}"
-      ++ setenv "D8_LINUX64" "${v8.linux64}/d8"
-      ++ setenv "D8_ANDROID_ARM32" "${v8.androidArm32}/d8"
-      ++ setenv "D8_ANDROID_ARM64" "${v8.androidArm64}/d8"
-      ++ setenv "SSL_CERT_FILE" certBundle
-      ++ setenv "NIX_SSL_CERT_FILE" certBundle
-      ++ setenv "NODE_EXTRA_CA_CERTS" certBundle
-      ++ ["--tmpfs" "/tmp" "--proc" "/proc" "--dev" "/dev"]
-      ++ ["--dir" "/bin" "--dir" "/usr" "--dir" "/usr/bin" "--dir" "/etc" "--dir" "/etc/ssl"]
-      ++ symlink bash "/bin/bash"
-      ++ symlink bash "/bin/sh"
-      ++ symlink env "/usr/bin/env"
-      ++ roBindTry "/etc/resolv.conf"
-      ++ roBindTry "/etc/hosts"
-      ++ roBindTry "/etc/nsswitch.conf"
-      ++ roBindTry "/etc/ssl/certs");
+    (["run" "--rm" "-i" "--rootfs" "--userns=keep-id" "--unsetenv-all" "--workdir" "/run/rust"]
+      ++ podmanEnv "PATH" "${sandboxPath}:/bin:/usr/bin"
+      ++ podmanEnv "HOME" "/run/home"
+      ++ podmanEnv "SHELL" "/bin/bash"
+      ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
+      ++ podmanEnv "V8_ANDROID_ARM32" "${v8.androidArm32}"
+      ++ podmanEnv "V8_ANDROID_ARM64" "${v8.androidArm64}"
+      ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
+      ++ podmanEnv "D8_ANDROID_ARM32" "${v8.androidArm32}/d8"
+      ++ podmanEnv "D8_ANDROID_ARM64" "${v8.androidArm64}/d8"
+      ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
     name = "implementor-sandbox";
     runtimeInputs = [
-      pkgs.bubblewrap
       pkgs.coreutils
       pkgs.git
+      pkgs.podman
     ];
 
     text = ''
@@ -118,7 +108,9 @@ in
       auth_dir="$temp_dir/pi-auth"
       mkdir -p "$temp_dir" "$auth_dir"
       run="$(mktemp -d -p "$temp_dir" implementor.XXXXXX)"
-      mkdir -p "$run/home"
+      mkdir -p "$run/home" "$run/rootfs"
+      cp -a --no-preserve=ownership "${rootfs}/." "$run/rootfs"
+      chmod -R u+w "$run/rootfs"
 
       cp -a --reflink=auto "$repo/rust" "$run/rust"
       cp "$system_prompt" "$run/system.md"
@@ -136,21 +128,24 @@ in
         commit -q -m baseline
       git -C "$run/rust" tag orchestrator-base
 
-      bwrap_args=(
-        ${staticBwrapArgs}
-        --bind "$run" /run
-        --bind "$auth_dir" /auth
-        --ro-bind "$repo/docs/specs" /specs
-        --ro-bind "$harness_dir" /harness
+      podman_args=(
+        ${staticPodmanArgs}
+        --user "$(id -u):$(id -g)"
+        --volume "$run:/run:rw"
+        --volume "$auth_dir:/auth:rw"
+        --volume "$repo/docs/specs:/specs:ro"
+        --volume "/bulk/vip9r:/media:ro"
+        --volume "$harness_dir:/harness:ro"
+        "$run/rootfs:O"
       )
 
       status=0
       case "$mode" in
         run)
-          bwrap "''${bwrap_args[@]}" node /harness/pi-harness.mjs || status=$?
+          podman "''${podman_args[@]}" node /harness/pi-harness.mjs || status=$?
           ;;
         shell)
-          bwrap "''${bwrap_args[@]}" "${bash}" -i || status=$?
+          podman "''${podman_args[@]}" /bin/bash -i || status=$?
           ;;
       esac
 
