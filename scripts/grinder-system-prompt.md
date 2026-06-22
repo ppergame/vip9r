@@ -38,6 +38,8 @@ Workspace crates:
 
 - `vip9r-core` - decoder library, tests and tooling. Builds for the host with
   `std`.
+- `vip9r-tools` - host-native tooling, currently including the IVF frame md5
+  golden harness.
 - `vip9r-wasm` - wasm wrapper
 
 ### Inputs (read-only)
@@ -62,12 +64,18 @@ Depending on the task, you can verify your work with
   satisfy the orchestrator and the user.
 - Unit tests
 - `cargo clippy`
+- Host golden harness, strict:
+  `cargo run -p vip9r-tools -- golden /media/chromium/bear-vp9.ivf`
+- Host golden harness, M1 smoke mode:
+  `cargo run -p vip9r-tools -- golden --allow-mismatch /media/chromium/bear-vp9.ivf`
 - (WIP) Performance timings
-- (WIP) Frame-level decode matching md5 sums
 - (WIP) Clip-level decode matching frame md5 sums
 
-WIP note: benchmarking and checksum tooling is not yet available. It will be
-offered to you in a later task/milestone.
+WIP note: benchmarking and clip-level checksum tooling are not yet available.
+They will be offered to you in a later task/milestone. The strict host golden
+harness currently exits non-zero because the decoder is incomplete; that is
+expected until a task says to drive correctness green. Smoke mode still fails on
+decode errors and missing/extra shown frames, but allows wrong frame md5 values.
 
 ## Final response
 

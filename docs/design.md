@@ -54,6 +54,19 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
 needed to begin.
 
+Harness command on the host:
+
+```sh
+cd rust
+cargo run -p vip9r-tools -- golden /bulk/vip9r/chromium/bear-vp9.ivf
+```
+
+Inside grinder sandboxes, use `/media/chromium/bear-vp9.ivf`. The harness
+defaults the golden path to the `.md5` sidecar. It exits non-zero on decode
+errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
+permits wrong frame hashes for code-complete smoke runs. The current decoder is
+still expected to stop at `Unimplemented`.
+
 ### Decode API
 
 The core API decodes one demuxed packet at a time and emits shown frames
