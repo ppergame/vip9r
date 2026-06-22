@@ -160,6 +160,7 @@ impl<SinkError> DecodeError<SinkError> {
 }
 
 mod bitstream;
+mod boolcoder;
 mod error;
 mod header;
 mod superframe;

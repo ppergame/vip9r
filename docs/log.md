@@ -29,3 +29,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   dimensions, then stops at the expected tile-decode `Unimplemented` boundary.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-22 — VP9 boolean decoder primitive
+
+- rev: jj `zrsknxmt`
+- Added the internal allocation-free VP9 boolean decoder primitive for future
+  compressed-header and tile syntax parsing: init marker validation,
+  probability-coded bools, literals, renormalization underflow checks, and exit
+  padding validation.
+- The primitive is intentionally not wired into packet decode yet, so decoder
+  behavior is unchanged at the public boundary.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.
