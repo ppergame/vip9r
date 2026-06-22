@@ -72,6 +72,7 @@
       ++ podmanEnv "PATH" "/run/tools/bin:/bin:/usr/bin"
       ++ podmanEnv "HOME" "/run/home"
       ++ podmanEnv "SHELL" "/bin/bash"
+      ++ podmanEnv "CARGO_HOME" "/cargo-home"
       ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
       ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
       ++ podmanEnv "SSL_CERT_FILE" caBundle
@@ -147,7 +148,8 @@ in
 
       temp_dir="$repo/temp"
       auth_dir="$temp_dir/pi-auth"
-      mkdir -p "$temp_dir" "$auth_dir"
+      cargo_home="$temp_dir/cargo-home"
+      mkdir -p "$temp_dir" "$auth_dir" "$cargo_home"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
       mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/trace"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
@@ -178,6 +180,7 @@ in
         --user "$(id -u):$(id -g)"
         --volume "$run:/run:rw"
         --volume "$auth_dir:/auth:rw"
+        --volume "$cargo_home:/cargo-home:rw"
         --volume "$repo/docs/specs:/specs:ro"
         --volume "/bulk/vip9r:/media:ro"
         --volume "$harness_dir:/harness:ro"
