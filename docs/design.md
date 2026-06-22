@@ -54,6 +54,20 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
 needed to begin.
 
+### Decode API
+
+The core API decodes one demuxed packet at a time and emits shown frames
+synchronously through a `FrameSink`. Output frames are temporary borrows valid
+only during the sink callback. This deliberately avoids a pending-output queue:
+the decoder may reuse scratch storage or reset a GOP arena before, during, or
+after a packet decode as long as it does not invalidate a frame while the sink is
+running.
+
+Public output is compact I420 in libvpx-md5 order: visible Y, then U, then V.
+Internal plane storage may have stride; `I420Frame::write_compact` is the bridge
+for the golden harness. A future wasm API can wrap the same core as a stepwise
+`begin_packet`/`decode_next` ABI if JS needs pull-style output.
+
 ## Measurement
 
 The trusted harness answers two questions:

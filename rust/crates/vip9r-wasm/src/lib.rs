@@ -16,10 +16,13 @@ pub extern "C" fn vip9r_abi_version() -> u32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn vip9r_required_i420_len(width: u32, height: u32) -> usize {
+    vip9r_core::required_i420_len(width, height).unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn vip9r_required_yuv420_len(width: u32, height: u32) -> usize {
-    vip9r_core::DecoderConfig::new(width, height)
-        .yuv420_len()
-        .unwrap_or(0)
+    vip9r_required_i420_len(width, height)
 }
 
 #[unsafe(no_mangle)]
@@ -30,5 +33,5 @@ pub extern "C" fn vip9r_decode_frame(
     output_len: usize,
 ) -> i32 {
     let _ = (input_ptr, input_len, output_ptr, output_len);
-    vip9r_core::DecodeError::Unimplemented.code()
+    vip9r_core::DecodeError::<core::convert::Infallible>::Unimplemented.code()
 }
