@@ -21,6 +21,7 @@
       overlays = [rust-overlay.overlays.default];
     };
     v8 = import ./nix/v8.nix {inherit pkgs;};
+    codex = import ./nix/codex.nix {inherit pkgs;};
     rustToolchain =
       pkgs.rust-bin.stable.latest.default.override
       {
