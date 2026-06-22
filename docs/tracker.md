@@ -44,6 +44,9 @@ harness.
 
 - [x] packet front-end parser: superframe splitting and uncompressed header
       parsing
+- [x] tile payload layout validation
+- [x] boolean decoder primitive
+- [x] retain uncompressed-header state needed by compressed-header parsing
 - [ ] decompose the decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 

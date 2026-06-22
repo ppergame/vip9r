@@ -41,3 +41,14 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   behavior is unchanged at the public boundary.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-22 — VP9 entropy header prerequisites
+
+- rev: jj `opnyvxto`
+- Retained uncompressed-header fields needed by compressed-header parsing:
+  frame-context flags/index, high-precision MV, interpolation filter,
+  quantizer deltas, and `lossless`.
+- The parser still does not parse compressed headers or tile contents; the
+  public decode boundary remains unchanged.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.

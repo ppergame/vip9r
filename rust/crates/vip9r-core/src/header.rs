@@ -16,6 +16,24 @@ pub(crate) enum FrameType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InterpolationFilter {
+    EightTapSmooth,
+    EightTap,
+    EightTapSharp,
+    Bilinear,
+    Switchable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuantizationParams {
+    base_q_idx: u8,
+    delta_q_y_dc: i32,
+    delta_q_uv_dc: i32,
+    delta_q_uv_ac: i32,
+    lossless: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReferenceFrameInfo {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -72,13 +90,23 @@ pub(crate) struct UncompressedFrameHeader {
     pub(crate) error_resilient_mode: bool,
     pub(crate) intra_only: bool,
     pub(crate) frame_is_intra: bool,
+    pub(crate) refresh_frame_context: bool,
+    pub(crate) frame_parallel_decoding_mode: bool,
+    pub(crate) frame_context_idx: u8,
     pub(crate) refresh_frame_flags: u8,
     pub(crate) ref_frame_idx: [u8; REFS_PER_FRAME],
     pub(crate) ref_frame_sign_bias: [bool; SIGN_BIAS_FRAMES],
+    pub(crate) allow_high_precision_mv: bool,
+    pub(crate) interpolation_filter: Option<InterpolationFilter>,
     pub(crate) frame_width: u32,
     pub(crate) frame_height: u32,
     pub(crate) render_width: u32,
     pub(crate) render_height: u32,
+    pub(crate) base_q_idx: u8,
+    pub(crate) delta_q_y_dc: i32,
+    pub(crate) delta_q_uv_dc: i32,
+    pub(crate) delta_q_uv_ac: i32,
+    pub(crate) lossless: bool,
     pub(crate) tile_cols_log2: u8,
     pub(crate) tile_rows_log2: u8,
     pub(crate) header_size_in_bytes: usize,
@@ -130,13 +158,23 @@ pub(crate) fn parse_uncompressed_frame_header(
             error_resilient_mode: false,
             intra_only: false,
             frame_is_intra: false,
+            refresh_frame_context: false,
+            frame_parallel_decoding_mode: false,
+            frame_context_idx: 0,
             refresh_frame_flags: 0,
             ref_frame_idx: [0; REFS_PER_FRAME],
             ref_frame_sign_bias: [false; SIGN_BIAS_FRAMES],
+            allow_high_precision_mv: false,
+            interpolation_filter: None,
             frame_width: reference.width,
             frame_height: reference.height,
             render_width: reference.render_width,
             render_height: reference.render_height,
+            base_q_idx: 0,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             header_size_in_bytes: 0,
@@ -159,6 +197,8 @@ pub(crate) fn parse_uncompressed_frame_header(
     let refresh_frame_flags;
     let mut ref_frame_idx = [0u8; REFS_PER_FRAME];
     let mut ref_frame_sign_bias = [false; SIGN_BIAS_FRAMES];
+    let mut allow_high_precision_mv = false;
+    let mut interpolation_filter = None;
     let frame_width;
     let frame_height;
     let render_width;
@@ -223,22 +263,23 @@ pub(crate) fn parse_uncompressed_frame_header(
             render_height = size.3;
             validate_inter_frame_size(frame_width, frame_height, state, ref_frame_idx)?;
 
-            let _allow_high_precision_mv = reader.read_bool()?;
-            read_interpolation_filter(&mut reader)?;
+            allow_high_precision_mv = reader.read_bool()?;
+            interpolation_filter = Some(read_interpolation_filter(&mut reader)?);
         }
     }
 
-    if error_resilient_mode {
-        let _refresh_frame_context = false;
-        let _frame_parallel_decoding_mode = true;
+    let (refresh_frame_context, frame_parallel_decoding_mode) = if error_resilient_mode {
+        (false, true)
     } else {
-        let _refresh_frame_context = reader.read_bool()?;
-        let _frame_parallel_decoding_mode = reader.read_bool()?;
+        (reader.read_bool()?, reader.read_bool()?)
+    };
+    let mut frame_context_idx = reader.read_f(2)? as u8;
+    if frame_is_intra || error_resilient_mode {
+        frame_context_idx = 0;
     }
-    let _frame_context_idx = reader.read_f(2)?;
 
     loop_filter_params(&mut reader)?;
-    quantization_params(&mut reader)?;
+    let quantization = quantization_params(&mut reader)?;
     segmentation_params(&mut reader)?;
     let tile_info = tile_info(&mut reader, frame_width)?;
     let header_size_in_bytes =
@@ -256,13 +297,23 @@ pub(crate) fn parse_uncompressed_frame_header(
         error_resilient_mode,
         intra_only,
         frame_is_intra,
+        refresh_frame_context,
+        frame_parallel_decoding_mode,
+        frame_context_idx,
         refresh_frame_flags,
         ref_frame_idx,
         ref_frame_sign_bias,
+        allow_high_precision_mv,
+        interpolation_filter,
         frame_width,
         frame_height,
         render_width,
         render_height,
+        base_q_idx: quantization.base_q_idx,
+        delta_q_y_dc: quantization.delta_q_y_dc,
+        delta_q_uv_dc: quantization.delta_q_uv_dc,
+        delta_q_uv_ac: quantization.delta_q_uv_ac,
+        lossless: quantization.lossless,
         tile_cols_log2: tile_info.0,
         tile_rows_log2: tile_info.1,
         header_size_in_bytes,
@@ -393,12 +444,23 @@ fn validate_inter_frame_size(
     Err(ParserError::InvalidBitstream)
 }
 
-fn read_interpolation_filter(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+fn read_interpolation_filter(
+    reader: &mut FixedBitReader<'_>,
+) -> Result<InterpolationFilter, ParserError> {
+    const LITERAL_TO_TYPE: [InterpolationFilter; 4] = [
+        InterpolationFilter::EightTapSmooth,
+        InterpolationFilter::EightTap,
+        InterpolationFilter::EightTapSharp,
+        InterpolationFilter::Bilinear,
+    ];
+
     let is_filter_switchable = reader.read_bool()?;
-    if !is_filter_switchable {
-        let _raw_interpolation_filter = reader.read_f(2)?;
+    if is_filter_switchable {
+        Ok(InterpolationFilter::Switchable)
+    } else {
+        let raw_interpolation_filter = reader.read_f(2)? as usize;
+        Ok(LITERAL_TO_TYPE[raw_interpolation_filter])
     }
-    Ok(())
 }
 
 fn loop_filter_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
@@ -423,12 +485,20 @@ fn loop_filter_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError
     Ok(())
 }
 
-fn quantization_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
-    let _base_q_idx = reader.read_f(8)?;
-    let _delta_q_y_dc = read_delta_q(reader)?;
-    let _delta_q_uv_dc = read_delta_q(reader)?;
-    let _delta_q_uv_ac = read_delta_q(reader)?;
-    Ok(())
+fn quantization_params(reader: &mut FixedBitReader<'_>) -> Result<QuantizationParams, ParserError> {
+    let base_q_idx = reader.read_f(8)? as u8;
+    let delta_q_y_dc = read_delta_q(reader)?;
+    let delta_q_uv_dc = read_delta_q(reader)?;
+    let delta_q_uv_ac = read_delta_q(reader)?;
+    let lossless = base_q_idx == 0 && delta_q_y_dc == 0 && delta_q_uv_dc == 0 && delta_q_uv_ac == 0;
+
+    Ok(QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc,
+        delta_q_uv_dc,
+        delta_q_uv_ac,
+        lossless,
+    })
 }
 
 fn read_delta_q(reader: &mut FixedBitReader<'_>) -> Result<i32, ParserError> {
@@ -568,8 +638,8 @@ fn finish_uncompressed_header(
 #[cfg(test)]
 mod tests {
     use super::{
-        FrameType, HeaderParserState, ParserError, ReferenceFrameInfo,
-        parse_uncompressed_frame_header,
+        FrameType, HeaderParserState, InterpolationFilter, ParserError, ReferenceFrameInfo,
+        UncompressedFrameHeader, parse_uncompressed_frame_header,
     };
 
     #[test]
@@ -578,7 +648,7 @@ mod tests {
         builder.f(0b10, 2); // frame marker
         builder.f(0, 1); // profile low
         builder.f(0, 1); // profile high
-        builder.f(0, 1); // show existing frame
+        builder.f(0, 1); // not show existing frame
         builder.f(0, 1); // key frame
         builder.f(1, 1); // show frame
         builder.f(0, 1); // error resilient mode
@@ -592,7 +662,7 @@ mod tests {
         builder.f(0, 1); // render size matches frame size
         builder.f(1, 1); // refresh frame context
         builder.f(0, 1); // frame parallel decoding mode
-        builder.f(0, 2); // frame context idx
+        builder.f(3, 2); // frame context idx (reset to 0 for intra frames)
         builder.f(0, 6); // loop filter level
         builder.f(0, 3); // loop filter sharpness
         builder.f(0, 1); // loop filter delta enabled
@@ -614,7 +684,17 @@ mod tests {
         assert_eq!(header.frame_type, FrameType::Key);
         assert!(header.show_frame);
         assert!(header.frame_is_intra);
+        assert!(header.refresh_frame_context);
+        assert!(!header.frame_parallel_decoding_mode);
+        assert_eq!(header.frame_context_idx, 0);
         assert_eq!(header.refresh_frame_flags, 0xff);
+        assert!(!header.allow_high_precision_mv);
+        assert!(header.interpolation_filter.is_none());
+        assert_eq!(header.base_q_idx, 0);
+        assert_eq!(header.delta_q_y_dc, 0);
+        assert_eq!(header.delta_q_uv_dc, 0);
+        assert_eq!(header.delta_q_uv_ac, 0);
+        assert!(header.lossless);
         assert_eq!(header.frame_width, 320);
         assert_eq!(header.frame_height, 240);
         assert_eq!(header.render_width, 320);
@@ -623,6 +703,60 @@ mod tests {
         assert_eq!(header.tile_rows_log2, 0);
         assert_eq!(header.header_size_in_bytes, 1);
         assert_eq!(header.tile_data_offset, header.compressed_header_offset + 1);
+    }
+
+    #[test]
+    fn quantization_is_non_lossless_when_base_or_any_delta_is_nonzero() {
+        let cases = [
+            (7, [0, 0, 0]),
+            (0, [1, 0, 0]),
+            (0, [0, -2, 0]),
+            (0, [0, 0, 3]),
+        ];
+
+        for (base_q_idx, deltas) in cases {
+            let header = parse_key_frame_with_quant(base_q_idx, deltas);
+
+            assert_eq!(header.base_q_idx, base_q_idx);
+            assert_eq!(header.delta_q_y_dc, deltas[0]);
+            assert_eq!(header.delta_q_uv_dc, deltas[1]);
+            assert_eq!(header.delta_q_uv_ac, deltas[2]);
+            assert!(!header.lossless);
+        }
+    }
+
+    #[test]
+    fn show_existing_frame_retains_absent_compressed_header_state() {
+        let mut state = HeaderParserState::new();
+        state.reference_frames[2] = Some(ReferenceFrameInfo {
+            width: 320,
+            height: 240,
+            render_width: 320,
+            render_height: 240,
+        });
+
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2); // frame marker
+        builder.f(0, 1); // profile low
+        builder.f(0, 1); // profile high
+        builder.f(1, 1); // show existing frame
+        builder.f(2, 3); // frame to show map index
+        let frame = builder.finish();
+
+        let header = parse_uncompressed_frame_header(&frame, &state).unwrap();
+
+        assert!(header.show_existing_frame);
+        assert_eq!(header.frame_to_show_map_idx, Some(2));
+        assert_eq!(header.header_size_in_bytes, 0);
+        assert_eq!(header.compressed_header_offset, 1);
+        assert_eq!(header.tile_data_offset, 1);
+        assert!(!header.refresh_frame_context);
+        assert!(!header.frame_parallel_decoding_mode);
+        assert_eq!(header.frame_context_idx, 0);
+        assert!(!header.allow_high_precision_mv);
+        assert!(header.interpolation_filter.is_none());
+        assert_eq!(header.base_q_idx, 0);
+        assert!(!header.lossless);
     }
 
     #[test]
@@ -673,11 +807,11 @@ mod tests {
         }
         builder.f(1, 1); // found LAST ref size
         builder.f(0, 1); // render size matches
-        builder.f(0, 1); // allow high precision mv
+        builder.f(1, 1); // allow high precision mv
         builder.f(1, 1); // switchable interpolation filter
-        builder.f(0, 1); // refresh frame context
-        builder.f(1, 1); // frame parallel decoding mode
-        builder.f(0, 2); // frame context idx
+        builder.f(1, 1); // refresh frame context
+        builder.f(0, 1); // frame parallel decoding mode
+        builder.f(2, 2); // frame context idx
         builder.f(0, 6);
         builder.f(0, 3);
         builder.f(0, 1);
@@ -698,6 +832,32 @@ mod tests {
         assert_eq!(header.frame_height, 240);
         assert!(!header.frame_is_intra);
         assert_eq!(header.ref_frame_idx, [0, 1, 2]);
+        assert!(header.allow_high_precision_mv);
+        assert_eq!(
+            header.interpolation_filter,
+            Some(InterpolationFilter::Switchable)
+        );
+        assert!(header.refresh_frame_context);
+        assert!(!header.frame_parallel_decoding_mode);
+        assert_eq!(header.frame_context_idx, 2);
+        assert_eq!(header.base_q_idx, 0);
+        assert!(header.lossless);
+    }
+
+    #[test]
+    fn profile0_interpolation_raw_filter_mapping_follows_spec_literal_to_type() {
+        let expected = [
+            InterpolationFilter::EightTapSmooth,
+            InterpolationFilter::EightTap,
+            InterpolationFilter::EightTapSharp,
+            InterpolationFilter::Bilinear,
+        ];
+
+        for (raw_filter, expected_filter) in expected.into_iter().enumerate() {
+            let header = parse_inter_frame_with_raw_interpolation(raw_filter as u8);
+
+            assert_eq!(header.interpolation_filter, Some(expected_filter));
+        }
     }
 
     #[test]
@@ -723,6 +883,94 @@ mod tests {
         );
     }
 
+    fn parse_key_frame_with_quant(base_q_idx: u8, deltas: [i32; 3]) -> UncompressedFrameHeader {
+        let frame = key_frame_with_quant(base_q_idx, deltas);
+        parse_uncompressed_frame_header(&frame, &HeaderParserState::new()).unwrap()
+    }
+
+    fn key_frame_with_quant(base_q_idx: u8, deltas: [i32; 3]) -> [u8; 128] {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2); // frame marker
+        builder.f(0, 1); // profile low
+        builder.f(0, 1); // profile high
+        builder.f(0, 1); // not show existing frame
+        builder.f(0, 1); // key frame
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // error resilient mode
+        builder.f(0x49, 8);
+        builder.f(0x83, 8);
+        builder.f(0x42, 8);
+        builder.f(1, 3); // BT.601 color space
+        builder.f(0, 1); // studio range
+        builder.f(319, 16);
+        builder.f(239, 16);
+        builder.f(0, 1); // render size matches frame size
+        builder.f(1, 1); // refresh frame context
+        builder.f(0, 1); // frame parallel decoding mode
+        builder.f(3, 2); // frame context idx (reset to 0 for intra frames)
+        builder.f(0, 6); // loop filter level
+        builder.f(0, 3); // loop filter sharpness
+        builder.f(0, 1); // loop filter delta enabled
+        builder.quantization(base_q_idx, deltas);
+        builder.f(0, 1); // segmentation disabled
+        builder.f(0, 1); // tile rows log2
+        builder.f(1, 16); // compressed header size
+        builder.byte_align_zero();
+        builder.byte(0);
+        builder.finish()
+    }
+
+    fn parse_inter_frame_with_raw_interpolation(
+        raw_interpolation_filter: u8,
+    ) -> UncompressedFrameHeader {
+        assert!(raw_interpolation_filter < 4);
+
+        let mut state = HeaderParserState::new();
+        state.reference_frames[0] = Some(ReferenceFrameInfo {
+            width: 320,
+            height: 240,
+            render_width: 320,
+            render_height: 240,
+        });
+        state.reference_frames[1] = state.reference_frames[0];
+        state.reference_frames[2] = state.reference_frames[0];
+
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1); // not show existing
+        builder.f(1, 1); // non-key
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // not error resilient
+        builder.f(0, 2); // reset frame context
+        builder.f(0x01, 8); // refresh flags
+        for idx in 0..3 {
+            builder.f(idx, 3);
+            builder.f(0, 1);
+        }
+        builder.f(1, 1); // found LAST ref size
+        builder.f(0, 1); // render size matches
+        builder.f(0, 1); // allow high precision mv
+        builder.f(0, 1); // frame-level interpolation filter
+        builder.f(u32::from(raw_interpolation_filter), 2);
+        builder.f(0, 1); // refresh frame context
+        builder.f(1, 1); // frame parallel decoding mode
+        builder.f(1, 2); // frame context idx
+        builder.f(0, 6);
+        builder.f(0, 3);
+        builder.f(0, 1);
+        builder.quantization(0, [0, 0, 0]);
+        builder.f(0, 1);
+        builder.f(0, 1); // tile rows log2
+        builder.f(1, 16);
+        builder.byte_align_zero();
+        builder.byte(0);
+        let frame = builder.finish();
+
+        parse_uncompressed_frame_header(&frame, &state).unwrap()
+    }
+
     struct HeaderBuilder {
         data: [u8; 128],
         bit_len: usize,
@@ -744,6 +992,26 @@ mod tests {
                 self.data[byte_index] |= bit << bit_in_byte;
                 self.bit_len += 1;
             }
+        }
+
+        fn quantization(&mut self, base_q_idx: u8, deltas: [i32; 3]) {
+            self.f(u32::from(base_q_idx), 8);
+            for delta in deltas {
+                self.delta_q(delta);
+            }
+        }
+
+        fn delta_q(&mut self, value: i32) {
+            if value == 0 {
+                self.f(0, 1);
+                return;
+            }
+
+            let magnitude = value.unsigned_abs();
+            assert!(magnitude <= 15);
+            self.f(1, 1);
+            self.f(magnitude, 4);
+            self.f(u32::from(value < 0), 1);
         }
 
         fn byte_align_zero(&mut self) {
