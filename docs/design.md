@@ -121,6 +121,17 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 - Prefer grinder tasks smaller than the first packet front-end handoff. That
   bootstrapped useful structure but landed about 1k LOC; ordinary implementor
   tasks should be easier to review in isolation.
+- Good grinder packets tend to change one kind of thing: one parser primitive,
+  one syntax-table slice, one data model needed by the next slice, or one
+  measured optimization. Borderline packets mix modeling choices, semantic
+  changes, and fixture churn. Split before a task asks the implementor to both
+  invent a shape and consume it broadly.
+- Size by review risk, not lines. A few hundred lines of mechanical tables or
+  local tests may be fine; a small diff can still be too large if it commits the
+  decoder to a hard-to-unwind interpretation of the spec.
+- Parallel grinders are for disjoint write sets or independent investigations.
+  Sequential is the default when tasks share parser state, probability tables,
+  frame storage, or other files where merge conflicts would hide review issues.
 - Do not turn temporary boundaries into architecture unless they survive contact
   with implementation and measurement.
 
