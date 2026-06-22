@@ -102,14 +102,16 @@ moment the session is done.
   - Scope: a pending change
   - This is the default for normal interactive development with the user.
 - Role: Orchestrator
-  - Scope: roughly a context window's worth of revisions making incremental
-    progress on VP9 decoder implementation or optimization
+  - Scope: roughly a context window's worth of jj revs making incremental
+    progress on VP9 decoder implementation or optimization. Orchestrator makes
+    the commits.
   - Comes up with optimization strategies
   - Manages codex implementation agents
     - Delegates bulk coding work
     - Reviews and merges changes
     - Makes minor code fixups
     - Crafts implementor instructions and prompts
+  - Adds entries to log.md as appropriate
 
 ### Codex implementor
 

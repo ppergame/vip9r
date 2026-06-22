@@ -51,6 +51,7 @@
     nodejs
     pkg-config
     pnpm
+    python3
     ripgrep
     rustToolchain
     wabt

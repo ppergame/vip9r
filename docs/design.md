@@ -73,8 +73,8 @@ The core API decodes one demuxed packet at a time and emits shown frames
 synchronously through a `FrameSink`. Output frames are temporary borrows valid
 only during the sink callback. This deliberately avoids a pending-output queue:
 the decoder may reuse scratch storage or reset a GOP arena before, during, or
-after a packet decode as long as it does not invalidate a frame while the sink is
-running.
+after a packet decode as long as it does not invalidate a frame while the sink
+is running.
 
 Public output is compact I420 in libvpx-md5 order: visible Y, then U, then V.
 Internal plane storage may have stride; `I420Frame::write_compact` is the bridge
@@ -112,8 +112,15 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 - Rust implementation state lives in the self-contained Cargo workspace under
   `rust/`. Keep maintainer/orchestrator tooling outside that tree unless the
   implementor needs it for the task.
+- Grinder sandboxes make `rust/` the repo root, while the main checkout's VCS
+  root is the project root. When importing sandbox diffs manually, apply them
+  from the project root with `git apply --directory=rust` and verify `jj status`
+  or `git status` afterward. Do not trust a quiet patch command alone.
 - Keep task boundaries provisional. Split by whatever makes correctness,
   measurement, and review easiest at the time.
+- Prefer grinder tasks smaller than the first packet front-end handoff. That
+  bootstrapped useful structure but landed about 1k LOC; ordinary implementor
+  tasks should be easier to review in isolation.
 - Do not turn temporary boundaries into architecture unless they survive contact
   with implementation and measurement.
 

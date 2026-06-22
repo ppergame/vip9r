@@ -159,9 +159,18 @@ impl<SinkError> DecodeError<SinkError> {
     }
 }
 
+mod bitstream;
+mod error;
+mod header;
+mod superframe;
+
+use header::{HeaderParserState, parse_uncompressed_frame_header};
+use superframe::split_superframe;
+
 #[derive(Debug)]
 pub struct Decoder {
     options: DecoderOptions,
+    header_state: HeaderParserState,
 }
 
 impl Decoder {
@@ -173,7 +182,10 @@ impl Decoder {
             return Err(DecodeError::InvalidConfig);
         }
 
-        Ok(Self { options })
+        Ok(Self {
+            options,
+            header_state: HeaderParserState::new(),
+        })
     }
 
     pub const fn options(&self) -> DecoderOptions {
@@ -188,13 +200,43 @@ impl Decoder {
     /// after the sink callback returns.
     pub fn decode_packet<Sink: FrameSink>(
         &mut self,
-        _packet: &[u8],
+        packet: &[u8],
         _sink: &mut Sink,
     ) -> Result<PacketReport, DecodeError<Sink::Error>> {
+        let frames = split_superframe(packet).map_err(|err| err.into_decode_error())?;
+
+        if frames.as_slice().is_empty() {
+            return Err(DecodeError::InvalidBitstream);
+        }
+
+        for frame in frames.as_slice() {
+            let header = parse_uncompressed_frame_header(frame, &self.header_state)
+                .map_err(|err| err.into_decode_error())?;
+            self.validate_frame_limits(&header)?;
+            self.header_state.update_references(&header);
+        }
+
         Err(DecodeError::Unimplemented)
     }
 
-    pub fn reset(&mut self) {}
+    pub fn reset(&mut self) {
+        self.header_state = HeaderParserState::new();
+    }
+
+    fn validate_frame_limits<SinkError>(
+        &self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Result<(), DecodeError<SinkError>> {
+        if header.frame_width > self.options.limits.max_width
+            || header.frame_height > self.options.limits.max_height
+            || header.render_width == 0
+            || header.render_height == 0
+            || required_i420_len(header.frame_width, header.frame_height).is_none()
+        {
+            return Err(DecodeError::ResourceLimit);
+        }
+        Ok(())
+    }
 }
 
 pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {

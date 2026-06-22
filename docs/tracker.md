@@ -20,7 +20,7 @@ M0 — decode API and the host golden harness.
 - [x] finalize the core decode API for host harness frame output
 - [x] host golden harness: IVF demux, per-frame md5 vs the `.md5` golden, on
       `bear-vp9.ivf`
-- [ ] first implementor handoff packet
+- [x] first implementor handoff packet
 
 ## Waiting
 
@@ -42,6 +42,8 @@ Deferrable external inputs for M3 performance work.
 The whole decode path, code-complete; correctness is M2's job. Gated on the M0
 harness.
 
+- [x] packet front-end parser: superframe splitting and uncompressed header
+      parsing
 - [ ] decompose the decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 

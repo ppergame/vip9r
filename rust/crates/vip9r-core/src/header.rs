@@ -1,0 +1,766 @@
+use crate::bitstream::FixedBitReader;
+use crate::error::ParserError;
+
+const NUM_REF_FRAMES: usize = 8;
+const REFS_PER_FRAME: usize = 3;
+const SIGN_BIAS_FRAMES: usize = 4;
+const LAST_FRAME: usize = 1;
+const MAX_TILE_WIDTH_B64: u32 = 64;
+const MIN_TILE_WIDTH_B64: u32 = 4;
+const CS_RGB: u32 = 7;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrameType {
+    Key,
+    NonKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReferenceFrameInfo {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) render_width: u32,
+    pub(crate) render_height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HeaderParserState {
+    reference_frames: [Option<ReferenceFrameInfo>; NUM_REF_FRAMES],
+}
+
+impl HeaderParserState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            reference_frames: [None; NUM_REF_FRAMES],
+        }
+    }
+
+    pub(crate) fn update_references(&mut self, header: &UncompressedFrameHeader) {
+        if header.show_existing_frame {
+            return;
+        }
+
+        let reference = ReferenceFrameInfo {
+            width: header.frame_width,
+            height: header.frame_height,
+            render_width: header.render_width,
+            render_height: header.render_height,
+        };
+
+        for (index, slot) in self.reference_frames.iter_mut().enumerate() {
+            if header.refresh_frame_flags & (1u8 << index) != 0 {
+                *slot = Some(reference);
+            }
+        }
+    }
+
+    fn reference(&self, index: u8) -> Result<ReferenceFrameInfo, ParserError> {
+        self.reference_frames[usize::from(index)].ok_or(ParserError::InvalidBitstream)
+    }
+}
+
+/// Fields parsed from the uncompressed header and retained for upcoming decode stages.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UncompressedFrameHeader {
+    pub(crate) profile: u8,
+    pub(crate) bit_depth: u8,
+    pub(crate) frame_type: FrameType,
+    pub(crate) show_frame: bool,
+    pub(crate) show_existing_frame: bool,
+    pub(crate) frame_to_show_map_idx: Option<u8>,
+    pub(crate) error_resilient_mode: bool,
+    pub(crate) intra_only: bool,
+    pub(crate) frame_is_intra: bool,
+    pub(crate) refresh_frame_flags: u8,
+    pub(crate) ref_frame_idx: [u8; REFS_PER_FRAME],
+    pub(crate) ref_frame_sign_bias: [bool; SIGN_BIAS_FRAMES],
+    pub(crate) frame_width: u32,
+    pub(crate) frame_height: u32,
+    pub(crate) render_width: u32,
+    pub(crate) render_height: u32,
+    pub(crate) tile_cols_log2: u8,
+    pub(crate) tile_rows_log2: u8,
+    pub(crate) header_size_in_bytes: usize,
+    pub(crate) compressed_header_offset: usize,
+    pub(crate) tile_data_offset: usize,
+}
+
+pub(crate) fn parse_uncompressed_frame_header(
+    frame: &[u8],
+    state: &HeaderParserState,
+) -> Result<UncompressedFrameHeader, ParserError> {
+    let mut reader = FixedBitReader::new(frame);
+
+    let frame_marker = reader.read_f(2)?;
+    if frame_marker != 0b10 {
+        return Err(ParserError::InvalidBitstream);
+    }
+
+    let profile_low_bit = reader.read_f(1)? as u8;
+    let profile_high_bit = reader.read_f(1)? as u8;
+    let profile = (profile_high_bit << 1) | profile_low_bit;
+    if profile == 3 {
+        let reserved_zero = reader.read_f(1)?;
+        if reserved_zero != 0 {
+            return Err(ParserError::InvalidBitstream);
+        }
+    }
+
+    if matches!(profile, 1 | 3) {
+        return Err(ParserError::UnsupportedProfile(profile));
+    }
+
+    let show_existing_frame = reader.read_bool()?;
+    if show_existing_frame {
+        if profile == 2 {
+            return Err(ParserError::UnsupportedBitDepth(10));
+        }
+
+        let frame_to_show_map_idx = reader.read_f(3)? as u8;
+        let reference = state.reference(frame_to_show_map_idx)?;
+        let compressed_header_offset = finish_uncompressed_header(&mut reader, 0, frame.len())?.0;
+        return Ok(UncompressedFrameHeader {
+            profile,
+            bit_depth: 8,
+            frame_type: FrameType::NonKey,
+            show_frame: true,
+            show_existing_frame: true,
+            frame_to_show_map_idx: Some(frame_to_show_map_idx),
+            error_resilient_mode: false,
+            intra_only: false,
+            frame_is_intra: false,
+            refresh_frame_flags: 0,
+            ref_frame_idx: [0; REFS_PER_FRAME],
+            ref_frame_sign_bias: [false; SIGN_BIAS_FRAMES],
+            frame_width: reference.width,
+            frame_height: reference.height,
+            render_width: reference.render_width,
+            render_height: reference.render_height,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+            header_size_in_bytes: 0,
+            compressed_header_offset,
+            tile_data_offset: compressed_header_offset,
+        });
+    }
+
+    let frame_type = if reader.read_bool()? {
+        FrameType::NonKey
+    } else {
+        FrameType::Key
+    };
+    let show_frame = reader.read_bool()?;
+    let error_resilient_mode = reader.read_bool()?;
+
+    let mut bit_depth = 8u8;
+    let intra_only;
+    let frame_is_intra;
+    let refresh_frame_flags;
+    let mut ref_frame_idx = [0u8; REFS_PER_FRAME];
+    let mut ref_frame_sign_bias = [false; SIGN_BIAS_FRAMES];
+    let frame_width;
+    let frame_height;
+    let render_width;
+    let render_height;
+
+    if frame_type == FrameType::Key {
+        frame_sync_code(&mut reader)?;
+        bit_depth = color_config(&mut reader, profile)?;
+        let size = frame_size(&mut reader)?;
+        frame_width = size.0;
+        frame_height = size.1;
+        let render_size = render_size(&mut reader, frame_width, frame_height)?;
+        render_width = render_size.0;
+        render_height = render_size.1;
+        refresh_frame_flags = 0xff;
+        intra_only = false;
+        frame_is_intra = true;
+    } else {
+        intra_only = if show_frame {
+            false
+        } else {
+            reader.read_bool()?
+        };
+        frame_is_intra = intra_only;
+
+        let _reset_frame_context = if error_resilient_mode {
+            0
+        } else {
+            reader.read_f(2)?
+        };
+
+        if intra_only {
+            frame_sync_code(&mut reader)?;
+            if profile > 0 {
+                bit_depth = color_config(&mut reader, profile)?;
+            }
+            refresh_frame_flags = reader.read_f(8)? as u8;
+            let size = frame_size(&mut reader)?;
+            frame_width = size.0;
+            frame_height = size.1;
+            let render_size = render_size(&mut reader, frame_width, frame_height)?;
+            render_width = render_size.0;
+            render_height = render_size.1;
+        } else {
+            if profile == 2 {
+                return Err(ParserError::UnsupportedBitDepth(10));
+            }
+
+            refresh_frame_flags = reader.read_f(8)? as u8;
+            for (index, ref_idx) in ref_frame_idx.iter_mut().enumerate() {
+                *ref_idx = reader.read_f(3)? as u8;
+                ref_frame_sign_bias[LAST_FRAME + index] = reader.read_bool()?;
+            }
+            for &ref_idx in &ref_frame_idx {
+                state.reference(ref_idx)?;
+            }
+
+            let size = frame_size_with_refs(&mut reader, state, ref_frame_idx)?;
+            frame_width = size.0;
+            frame_height = size.1;
+            render_width = size.2;
+            render_height = size.3;
+            validate_inter_frame_size(frame_width, frame_height, state, ref_frame_idx)?;
+
+            let _allow_high_precision_mv = reader.read_bool()?;
+            read_interpolation_filter(&mut reader)?;
+        }
+    }
+
+    if error_resilient_mode {
+        let _refresh_frame_context = false;
+        let _frame_parallel_decoding_mode = true;
+    } else {
+        let _refresh_frame_context = reader.read_bool()?;
+        let _frame_parallel_decoding_mode = reader.read_bool()?;
+    }
+    let _frame_context_idx = reader.read_f(2)?;
+
+    loop_filter_params(&mut reader)?;
+    quantization_params(&mut reader)?;
+    segmentation_params(&mut reader)?;
+    let tile_info = tile_info(&mut reader, frame_width)?;
+    let header_size_in_bytes =
+        usize::try_from(reader.read_f(16)?).map_err(|_| ParserError::InvalidBitstream)?;
+    let (compressed_header_offset, tile_data_offset) =
+        finish_uncompressed_header(&mut reader, header_size_in_bytes, frame.len())?;
+
+    Ok(UncompressedFrameHeader {
+        profile,
+        bit_depth,
+        frame_type,
+        show_frame,
+        show_existing_frame: false,
+        frame_to_show_map_idx: None,
+        error_resilient_mode,
+        intra_only,
+        frame_is_intra,
+        refresh_frame_flags,
+        ref_frame_idx,
+        ref_frame_sign_bias,
+        frame_width,
+        frame_height,
+        render_width,
+        render_height,
+        tile_cols_log2: tile_info.0,
+        tile_rows_log2: tile_info.1,
+        header_size_in_bytes,
+        compressed_header_offset,
+        tile_data_offset,
+    })
+}
+
+fn frame_sync_code(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+    let sync = [reader.read_f(8)?, reader.read_f(8)?, reader.read_f(8)?];
+    if sync != [0x49, 0x83, 0x42] {
+        return Err(ParserError::InvalidBitstream);
+    }
+    Ok(())
+}
+
+fn color_config(reader: &mut FixedBitReader<'_>, profile: u8) -> Result<u8, ParserError> {
+    let bit_depth = if profile >= 2 {
+        if reader.read_bool()? { 12 } else { 10 }
+    } else {
+        8
+    };
+    if bit_depth != 8 {
+        return Err(ParserError::UnsupportedBitDepth(bit_depth));
+    }
+
+    let color_space = reader.read_f(3)?;
+    if color_space == CS_RGB && profile & 1 == 0 {
+        return Err(ParserError::InvalidBitstream);
+    }
+
+    if color_space != CS_RGB {
+        let _color_range = reader.read_bool()?;
+        if profile == 1 || profile == 3 {
+            let _subsampling_x = reader.read_bool()?;
+            let _subsampling_y = reader.read_bool()?;
+            let reserved_zero = reader.read_bool()?;
+            if reserved_zero {
+                return Err(ParserError::InvalidBitstream);
+            }
+        }
+    } else if profile == 1 || profile == 3 {
+        let reserved_zero = reader.read_bool()?;
+        if reserved_zero {
+            return Err(ParserError::InvalidBitstream);
+        }
+    }
+
+    Ok(bit_depth)
+}
+
+fn frame_size(reader: &mut FixedBitReader<'_>) -> Result<(u32, u32), ParserError> {
+    let width = reader
+        .read_f(16)?
+        .checked_add(1)
+        .ok_or(ParserError::InvalidBitstream)?;
+    let height = reader
+        .read_f(16)?
+        .checked_add(1)
+        .ok_or(ParserError::InvalidBitstream)?;
+    Ok((width, height))
+}
+
+fn render_size(
+    reader: &mut FixedBitReader<'_>,
+    frame_width: u32,
+    frame_height: u32,
+) -> Result<(u32, u32), ParserError> {
+    if reader.read_bool()? {
+        let render_width = reader
+            .read_f(16)?
+            .checked_add(1)
+            .ok_or(ParserError::InvalidBitstream)?;
+        let render_height = reader
+            .read_f(16)?
+            .checked_add(1)
+            .ok_or(ParserError::InvalidBitstream)?;
+        Ok((render_width, render_height))
+    } else {
+        Ok((frame_width, frame_height))
+    }
+}
+
+fn frame_size_with_refs(
+    reader: &mut FixedBitReader<'_>,
+    state: &HeaderParserState,
+    ref_frame_idx: [u8; REFS_PER_FRAME],
+) -> Result<(u32, u32, u32, u32), ParserError> {
+    let mut dimensions = None;
+    for ref_idx in ref_frame_idx {
+        if reader.read_bool()? {
+            let reference = state.reference(ref_idx)?;
+            dimensions = Some((reference.width, reference.height));
+            break;
+        }
+    }
+
+    let (frame_width, frame_height) = match dimensions {
+        Some(dimensions) => dimensions,
+        None => frame_size(reader)?,
+    };
+    let (render_width, render_height) = render_size(reader, frame_width, frame_height)?;
+    Ok((frame_width, frame_height, render_width, render_height))
+}
+
+fn validate_inter_frame_size(
+    frame_width: u32,
+    frame_height: u32,
+    state: &HeaderParserState,
+    ref_frame_idx: [u8; REFS_PER_FRAME],
+) -> Result<(), ParserError> {
+    let width = u64::from(frame_width);
+    let height = u64::from(frame_height);
+
+    for ref_idx in ref_frame_idx {
+        let reference = state.reference(ref_idx)?;
+        let ref_width = u64::from(reference.width);
+        let ref_height = u64::from(reference.height);
+        if 2 * width >= ref_width
+            && 2 * height >= ref_height
+            && width <= 16 * ref_width
+            && height <= 16 * ref_height
+        {
+            return Ok(());
+        }
+    }
+
+    Err(ParserError::InvalidBitstream)
+}
+
+fn read_interpolation_filter(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+    let is_filter_switchable = reader.read_bool()?;
+    if !is_filter_switchable {
+        let _raw_interpolation_filter = reader.read_f(2)?;
+    }
+    Ok(())
+}
+
+fn loop_filter_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+    let _loop_filter_level = reader.read_f(6)?;
+    let _loop_filter_sharpness = reader.read_f(3)?;
+    let loop_filter_delta_enabled = reader.read_bool()?;
+    if loop_filter_delta_enabled {
+        let loop_filter_delta_update = reader.read_bool()?;
+        if loop_filter_delta_update {
+            for _ in 0..4 {
+                if reader.read_bool()? {
+                    let _loop_filter_ref_delta = reader.read_s(6)?;
+                }
+            }
+            for _ in 0..2 {
+                if reader.read_bool()? {
+                    let _loop_filter_mode_delta = reader.read_s(6)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quantization_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+    let _base_q_idx = reader.read_f(8)?;
+    let _delta_q_y_dc = read_delta_q(reader)?;
+    let _delta_q_uv_dc = read_delta_q(reader)?;
+    let _delta_q_uv_ac = read_delta_q(reader)?;
+    Ok(())
+}
+
+fn read_delta_q(reader: &mut FixedBitReader<'_>) -> Result<i32, ParserError> {
+    if reader.read_bool()? {
+        reader.read_s(4)
+    } else {
+        Ok(0)
+    }
+}
+
+fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+    let segmentation_enabled = reader.read_bool()?;
+    if !segmentation_enabled {
+        return Ok(());
+    }
+
+    let segmentation_update_map = reader.read_bool()?;
+    if segmentation_update_map {
+        for _ in 0..7 {
+            read_prob(reader)?;
+        }
+        let segmentation_temporal_update = reader.read_bool()?;
+        if segmentation_temporal_update {
+            for _ in 0..3 {
+                read_prob(reader)?;
+            }
+        }
+    }
+
+    let segmentation_update_data = reader.read_bool()?;
+    if segmentation_update_data {
+        let segmentation_abs_or_delta_update = reader.read_bool()?;
+        for _segment in 0..8 {
+            for feature in 0..4 {
+                let feature_enabled = reader.read_bool()?;
+                if feature_enabled {
+                    let bits_to_read = segmentation_feature_bits(feature);
+                    let _feature_value = if bits_to_read > 0 {
+                        reader.read_f(bits_to_read)?
+                    } else {
+                        0
+                    };
+                    if segmentation_feature_signed(feature) {
+                        let feature_sign = reader.read_bool()?;
+                        if segmentation_abs_or_delta_update && feature_sign {
+                            return Err(ParserError::InvalidBitstream);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_prob(reader: &mut FixedBitReader<'_>) -> Result<u8, ParserError> {
+    if reader.read_bool()? {
+        Ok(reader.read_f(8)? as u8)
+    } else {
+        Ok(255)
+    }
+}
+
+fn segmentation_feature_bits(feature: usize) -> u8 {
+    [8, 6, 2, 0][feature]
+}
+
+fn segmentation_feature_signed(feature: usize) -> bool {
+    [true, true, false, false][feature]
+}
+
+fn tile_info(reader: &mut FixedBitReader<'_>, frame_width: u32) -> Result<(u8, u8), ParserError> {
+    let mi_cols = frame_width.div_ceil(8);
+    let sb64_cols = mi_cols.div_ceil(8);
+
+    let min_log2_tile_cols = calc_min_log2_tile_cols(sb64_cols);
+    let max_log2_tile_cols = calc_max_log2_tile_cols(sb64_cols);
+    let mut tile_cols_log2 = min_log2_tile_cols;
+    while tile_cols_log2 < max_log2_tile_cols {
+        if reader.read_bool()? {
+            tile_cols_log2 += 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut tile_rows_log2 = if reader.read_bool()? { 1 } else { 0 };
+    if tile_rows_log2 == 1 && reader.read_bool()? {
+        tile_rows_log2 += 1;
+    }
+
+    if tile_cols_log2 > 6 {
+        return Err(ParserError::InvalidBitstream);
+    }
+
+    Ok((tile_cols_log2, tile_rows_log2))
+}
+
+fn calc_min_log2_tile_cols(sb64_cols: u32) -> u8 {
+    let mut min_log2 = 0u8;
+    while (MAX_TILE_WIDTH_B64 << min_log2) < sb64_cols {
+        min_log2 += 1;
+    }
+    min_log2
+}
+
+fn calc_max_log2_tile_cols(sb64_cols: u32) -> u8 {
+    let mut max_log2 = 1u8;
+    while (sb64_cols >> max_log2) >= MIN_TILE_WIDTH_B64 {
+        max_log2 += 1;
+    }
+    max_log2 - 1
+}
+
+fn finish_uncompressed_header(
+    reader: &mut FixedBitReader<'_>,
+    header_size_in_bytes: usize,
+    frame_len: usize,
+) -> Result<(usize, usize), ParserError> {
+    while reader.bit_position() & 7 != 0 {
+        if reader.read_bool()? {
+            return Err(ParserError::InvalidBitstream);
+        }
+    }
+
+    let compressed_header_offset = reader.bit_position() / 8;
+    let tile_data_offset = compressed_header_offset
+        .checked_add(header_size_in_bytes)
+        .ok_or(ParserError::InvalidBitstream)?;
+    if tile_data_offset > frame_len {
+        return Err(ParserError::InvalidBitstream);
+    }
+    Ok((compressed_header_offset, tile_data_offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FrameType, HeaderParserState, ParserError, ReferenceFrameInfo,
+        parse_uncompressed_frame_header,
+    };
+
+    #[test]
+    fn parses_minimal_profile0_key_frame_header() {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2); // frame marker
+        builder.f(0, 1); // profile low
+        builder.f(0, 1); // profile high
+        builder.f(0, 1); // show existing frame
+        builder.f(0, 1); // key frame
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // error resilient mode
+        builder.f(0x49, 8);
+        builder.f(0x83, 8);
+        builder.f(0x42, 8);
+        builder.f(1, 3); // BT.601 color space
+        builder.f(0, 1); // studio range
+        builder.f(319, 16);
+        builder.f(239, 16);
+        builder.f(0, 1); // render size matches frame size
+        builder.f(1, 1); // refresh frame context
+        builder.f(0, 1); // frame parallel decoding mode
+        builder.f(0, 2); // frame context idx
+        builder.f(0, 6); // loop filter level
+        builder.f(0, 3); // loop filter sharpness
+        builder.f(0, 1); // loop filter delta enabled
+        builder.f(0, 8); // base q idx
+        builder.f(0, 1); // y dc delta absent
+        builder.f(0, 1); // uv dc delta absent
+        builder.f(0, 1); // uv ac delta absent
+        builder.f(0, 1); // segmentation disabled
+        builder.f(0, 1); // tile rows log2
+        builder.f(1, 16); // compressed header size
+        builder.byte_align_zero();
+        builder.byte(0); // one compressed-header byte so offsets are in range
+        let frame = builder.finish();
+
+        let header = parse_uncompressed_frame_header(&frame, &HeaderParserState::new()).unwrap();
+
+        assert_eq!(header.profile, 0);
+        assert_eq!(header.bit_depth, 8);
+        assert_eq!(header.frame_type, FrameType::Key);
+        assert!(header.show_frame);
+        assert!(header.frame_is_intra);
+        assert_eq!(header.refresh_frame_flags, 0xff);
+        assert_eq!(header.frame_width, 320);
+        assert_eq!(header.frame_height, 240);
+        assert_eq!(header.render_width, 320);
+        assert_eq!(header.render_height, 240);
+        assert_eq!(header.tile_cols_log2, 0);
+        assert_eq!(header.tile_rows_log2, 0);
+        assert_eq!(header.header_size_in_bytes, 1);
+        assert_eq!(header.tile_data_offset, header.compressed_header_offset + 1);
+    }
+
+    #[test]
+    fn rejects_bad_key_frame_sync_code() {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(1, 1);
+        builder.f(0, 1);
+        builder.f(0x49, 8);
+        builder.f(0x83, 8);
+        builder.f(0x43, 8);
+
+        assert_eq!(
+            parse_uncompressed_frame_header(&builder.finish(), &HeaderParserState::new()),
+            Err(ParserError::InvalidBitstream)
+        );
+    }
+
+    #[test]
+    fn inter_frame_uses_reference_size_when_signalled() {
+        let mut state = HeaderParserState::new();
+        state.reference_frames[0] = Some(ReferenceFrameInfo {
+            width: 320,
+            height: 240,
+            render_width: 320,
+            render_height: 240,
+        });
+        state.reference_frames[1] = state.reference_frames[0];
+        state.reference_frames[2] = state.reference_frames[0];
+
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1); // not show existing
+        builder.f(1, 1); // non-key
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // not error resilient
+        builder.f(0, 2); // reset frame context
+        builder.f(0x01, 8); // refresh flags
+        for idx in 0..3 {
+            builder.f(idx, 3);
+            builder.f(0, 1);
+        }
+        builder.f(1, 1); // found LAST ref size
+        builder.f(0, 1); // render size matches
+        builder.f(0, 1); // allow high precision mv
+        builder.f(1, 1); // switchable interpolation filter
+        builder.f(0, 1); // refresh frame context
+        builder.f(1, 1); // frame parallel decoding mode
+        builder.f(0, 2); // frame context idx
+        builder.f(0, 6);
+        builder.f(0, 3);
+        builder.f(0, 1);
+        builder.f(0, 8);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1); // tile rows log2
+        builder.f(1, 16);
+        builder.byte_align_zero();
+        builder.byte(0);
+        let frame = builder.finish();
+
+        let header = parse_uncompressed_frame_header(&frame, &state).unwrap();
+
+        assert_eq!(header.frame_width, 320);
+        assert_eq!(header.frame_height, 240);
+        assert!(!header.frame_is_intra);
+        assert_eq!(header.ref_frame_idx, [0, 1, 2]);
+    }
+
+    #[test]
+    fn inter_frame_rejects_missing_reference_dimensions() {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(0, 1);
+        builder.f(1, 1);
+        builder.f(1, 1);
+        builder.f(0, 1);
+        builder.f(0, 2);
+        builder.f(0, 8);
+        for _ in 0..3 {
+            builder.f(0, 3);
+            builder.f(0, 1);
+        }
+
+        assert_eq!(
+            parse_uncompressed_frame_header(&builder.finish(), &HeaderParserState::new()),
+            Err(ParserError::InvalidBitstream)
+        );
+    }
+
+    struct HeaderBuilder {
+        data: [u8; 128],
+        bit_len: usize,
+    }
+
+    impl HeaderBuilder {
+        fn new() -> Self {
+            Self {
+                data: [0; 128],
+                bit_len: 0,
+            }
+        }
+
+        fn f(&mut self, value: u32, bits: u8) {
+            for bit_index in (0..bits).rev() {
+                let bit = ((value >> bit_index) & 1) as u8;
+                let byte_index = self.bit_len / 8;
+                let bit_in_byte = 7 - (self.bit_len & 7);
+                self.data[byte_index] |= bit << bit_in_byte;
+                self.bit_len += 1;
+            }
+        }
+
+        fn byte_align_zero(&mut self) {
+            while self.bit_len & 7 != 0 {
+                self.f(0, 1);
+            }
+        }
+
+        fn byte(&mut self, value: u8) {
+            self.byte_align_zero();
+            let byte_index = self.bit_len / 8;
+            self.data[byte_index] = value;
+            self.bit_len += 8;
+        }
+
+        fn finish(self) -> [u8; 128] {
+            self.data
+        }
+    }
+}
