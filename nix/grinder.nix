@@ -86,6 +86,7 @@ in
     runtimeInputs = [
       pkgs.coreutils
       pkgs.git
+      pkgs.nodejs
       pkgs.podman
       pkgs.rsync
     ];
@@ -96,6 +97,7 @@ in
       usage:
         grinder run TASK_FILE
         grinder shell [COMMAND...]
+        grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]
       EOF
       }
 
@@ -103,7 +105,7 @@ in
 
       mode="''${1:-}"
       case "$mode" in
-        run|shell) shift || true ;;
+        run|shell|inspect) shift || true ;;
         -h|--help)
           usage
           exit 0
@@ -113,6 +115,16 @@ in
           exit 2
           ;;
       esac
+
+      if [[ "$mode" == inspect ]]; then
+        inspector="$repo/js/dist/pi-harness/grinder-inspect.mjs"
+        if [[ ! -e "$inspector" ]]; then
+          echo "missing required path: $inspector" >&2
+          echo "run: cd js && pnpm build:pi-harness" >&2
+          exit 1
+        fi
+        exec node "$inspector" --repo "$repo" "$@"
+      fi
 
       task_file=""
       command=()

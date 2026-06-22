@@ -12,9 +12,12 @@ export default defineConfig({
     outDir: "dist/pi-harness",
     emptyOutDir: true,
     lib: {
-      entry: "src/pi-harness/main.ts",
+      entry: {
+        "pi-harness": "src/pi-harness/main.ts",
+        "grinder-inspect": "src/pi-harness/inspect.ts",
+      },
       formats: ["es"],
-      fileName: () => "pi-harness.mjs",
+      fileName: (_format, entryName) => `${entryName}.mjs`,
     },
     rollupOptions: {
       external: (id) => nodeBuiltins.has(id),
@@ -24,7 +27,6 @@ export default defineConfig({
           'import { createRequire as __vip9rCreateRequire } from "node:module";',
           "const require = __vip9rCreateRequire(import.meta.url);",
         ].join("\n"),
-        codeSplitting: false,
       },
     },
   },
