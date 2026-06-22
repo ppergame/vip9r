@@ -17,3 +17,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   `Unimplemented` boundary.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-22 — VP9 tile payload layout
+
+- rev: jj `wzkluspu`
+- Added allocation-free tile payload layout validation after uncompressed header
+  parsing: MI bounds, raster tile descriptors, and non-final little-endian tile
+  size prefixes.
+- `Decoder::decode_packet` now validates all coded-frame headers and tile byte
+  ranges against scratch parser state before committing persistent reference
+  dimensions, then stops at the expected tile-decode `Unimplemented` boundary.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.

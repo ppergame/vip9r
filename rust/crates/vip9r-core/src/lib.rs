@@ -163,9 +163,11 @@ mod bitstream;
 mod error;
 mod header;
 mod superframe;
+mod tile;
 
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use superframe::split_superframe;
+use tile::parse_tile_layout;
 
 #[derive(Debug)]
 pub struct Decoder {
@@ -209,12 +211,24 @@ impl Decoder {
             return Err(DecodeError::InvalidBitstream);
         }
 
+        let mut header_state = self.header_state;
         for frame in frames.as_slice() {
-            let header = parse_uncompressed_frame_header(frame, &self.header_state)
+            let header = parse_uncompressed_frame_header(frame, &header_state)
                 .map_err(|err| err.into_decode_error())?;
             self.validate_frame_limits(&header)?;
-            self.header_state.update_references(&header);
+
+            if !header.show_existing_frame && header.header_size_in_bytes != 0 {
+                let _compressed_header = frame
+                    .get(header.compressed_header_offset..header.tile_data_offset)
+                    .ok_or(DecodeError::InvalidBitstream)?;
+                let tile_layout =
+                    parse_tile_layout(frame, &header).map_err(|err| err.into_decode_error())?;
+                let _tiles = tile_layout.as_slice();
+            }
+
+            header_state.update_references(&header);
         }
+        self.header_state = header_state;
 
         Err(DecodeError::Unimplemented)
     }
