@@ -32,22 +32,22 @@
 in {
   linux64 = patchLinuxD8 (fetchV8 {
     artifact = "v8-linux64-rel";
-    version = "15.1.158";
-    generation = "1781886252619364";
-    hash = "sha256-CaEY/v7j9uyAC8Q/zI4AnpXVFCR/BEB33Ht6RobygTw=";
+    version = "15.1.159";
+    generation = "1782060411010946";
+    hash = "sha256-bBQvffIseJ4gE8gicvoFxe40dRRHK0JYraUSPRh9eXI=";
   });
 
   androidArm32 = fetchV8 {
     artifact = "v8-android-arm32-rel";
-    version = "14.1.63";
-    generation = "1755083075015458";
-    hash = "sha256-3wz9GMovbOS2MBCbzHK6grl/aApu8xZU1K1XfJl/6SU=";
+    version = "15.1.159";
+    generation = "1782060443449205";
+    hash = "sha256-5kpcZKF9h7XemUk7Cnf+mEg4R8Ghx4P0HLlrd5uvtyw=";
   };
 
   androidArm64 = fetchV8 {
     artifact = "v8-android-arm64-rel";
-    version = "14.1.63";
-    generation = "1755083039326956";
-    hash = "sha256-P4erFsvQ8//3wj/SD8mNrJjn5NLRNmxmH254/5bVcH4=";
+    version = "15.1.159";
+    generation = "1782060481347578";
+    hash = "sha256-kgFkrVYr/z7tQ/hUiFhLiZBKipJ0xkSfvIqXK2QPSNQ=";
   };
 }
