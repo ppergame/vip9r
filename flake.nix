@@ -42,7 +42,7 @@
             exit 1
     '';
     grinder = import ./nix/grinder.nix {
-      inherit pkgs rustToolchain v8;
+      inherit pkgs rustToolchain v8 codex;
     };
   in {
     packages.${system}.grinder = grinder;

@@ -2,6 +2,7 @@
   pkgs,
   rustToolchain,
   v8,
+  codex,
 }: let
   inherit (pkgs) lib;
 
@@ -9,7 +10,7 @@
   caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
-  sandboxPackages = with pkgs; [
+  sandboxPackages = (with pkgs; [
     # Shell and baseline userland.
     bashInteractive
     bc
@@ -59,7 +60,8 @@
 
     # Debugging and host inspection.
     strace
-  ];
+  ])
+  ++ [codex];
   sandboxEnv = pkgs.buildEnv {
     name = "vip9r-grinder-env";
     paths = sandboxPackages;
@@ -76,6 +78,7 @@
       ++ podmanEnv "CARGO_HOME" "/cargo-home"
       ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
       ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
+      ++ podmanEnv "CODEX_HOME" "/codex-home"
       ++ podmanEnv "SSL_CERT_FILE" caBundle
       ++ podmanEnv "NIX_SSL_CERT_FILE" caBundle
       ++ podmanEnv "NODE_EXTRA_CA_CERTS" caBundle
@@ -105,7 +108,7 @@ in
 
       mode="''${1:-}"
       case "$mode" in
-        run|shell|inspect) shift || true ;;
+        run|shell|inspect) shift ;;
         -h|--help)
           usage
           exit 0
@@ -135,7 +138,7 @@ in
             usage
             exit 2
           fi
-          shift || true
+          shift
           if [[ $# -gt 0 ]]; then
             usage
             exit 2
@@ -151,20 +154,15 @@ in
       fi
 
       system_prompt="$repo/scripts/grinder-system-prompt.md"
-      harness_dir="$repo/js/dist/pi-harness"
-      for path in "$repo/rust" "$repo/docs/specs" "$system_prompt" "$harness_dir/pi-harness.mjs"; do
-        if [[ ! -e "$path" ]]; then
-          echo "missing required path: $path" >&2
-          exit 1
-        fi
-      done
+      codex_config="$repo/scripts/grinder-codex-config.toml"
 
       temp_dir="$repo/temp"
-      auth_dir="$temp_dir/pi-auth"
+      codex_home="$temp_dir/codex-home"
       cargo_home="$temp_dir/cargo-home"
-      mkdir -p "$temp_dir" "$auth_dir" "$cargo_home"
+      mkdir -p "$temp_dir" "$codex_home" "$cargo_home"
+      [[ -e "$codex_home/config.toml" ]] || touch "$codex_home/config.toml"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
-      mkdir -p "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/trace"
+      mkdir -p "$run/codex-state" "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/trace"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
       git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
       ln -s "${sandboxEnv}" "$run/tools"
@@ -192,11 +190,11 @@ in
         ${staticPodmanArgs}
         --user "$(id -u):$(id -g)"
         --volume "$run:/run:rw"
-        --volume "$auth_dir:/auth:rw"
+        --volume "$codex_home:/codex-home:rw"
+        --volume "$codex_config:/codex-home/config.toml:ro"
         --volume "$cargo_home:/cargo-home:rw"
         --volume "$repo/docs/specs:/specs:ro"
         --volume "/bulk/vip9r:/media:ro"
-        --volume "$harness_dir:/harness:ro"
       )
       rootfs_arg="$run/rootfs:O"
 
@@ -208,11 +206,19 @@ in
           # durable record that outlives "$run".
           preserve="$temp_dir/traces/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$run")"
           echo "trace -> $preserve" >&2
-          # Inherit stdout/stderr: the final response streams on stdout, the
-          # progress feed on stderr. The durable transcript is session.jsonl.
-          podman "''${podman_args[@]}" "$rootfs_arg" node /harness/pi-harness.mjs || status=$?
+          podman "''${podman_args[@]}" "$rootfs_arg" \
+            /run/tools/bin/codex exec \
+              --ephemeral \
+              --json \
+              -o /run/trace/final.md \
+              - \
+              < "$run/task.md" \
+              > "$run/trace/codex.jsonl" || status=$?
+          if [[ -f "$run/trace/final.md" ]]; then
+            cat "$run/trace/final.md"
+          fi
           mkdir -p "$preserve"
-          rsync -a --exclude=/pi-sessions "$run/trace/" "$preserve/"
+          rsync -a "$run/trace/" "$preserve/"
           cp "$run/task.md" "$preserve/task.md"
           cp "$run/system.md" "$preserve/system.md"
           printf '%s\n' "$status" > "$preserve/exit-status"

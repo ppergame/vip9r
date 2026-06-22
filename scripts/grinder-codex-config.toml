@@ -1,0 +1,18 @@
+model = "gpt-5.5"
+model_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+web_search = "disabled"
+model_instructions_file = "/run/system.md"
+sqlite_home = "/run/codex-state"
+check_for_update_on_startup = false
+
+[features]
+apps = false
+plugins = false
+memories = false
+goals = false
+shell_snapshot = false
+
+[skills.bundled]
+enabled = false
