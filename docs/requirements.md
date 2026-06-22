@@ -111,6 +111,9 @@ moment the session is done.
     - Reviews and merges changes
     - Makes minor code fixups
     - Crafts implementor instructions and prompts
+  - It is possible to run multiple implementors at the same time. Whether to do
+    so is an orchestrator judgement call. Stick to sequential execution unless
+    the tasks are independent and won't create nontrivial merge conflicts.
   - Adds entries to log.md as appropriate
 
 ### Codex implementor
