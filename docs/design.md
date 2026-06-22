@@ -1,8 +1,8 @@
 # vip9r — design
 
-Working notes on constraints and mechanics. AGENTS.md holds the project framing
-and durable decisions; this file should stay small enough to guide the next
-session without pretending the decoder architecture is settled.
+Working notes on constraints and mechanics. requirements.md holds the project
+framing, roles, and durable decisions; this file should stay small enough to
+guide the next session without pretending the decoder architecture is settled.
 
 ## Stable constraints
 
@@ -18,14 +18,41 @@ session without pretending the decoder architecture is settled.
 
 ## Correctness
 
-The first correctness bar is simple: VP9 profile 0 / 8-bit conformance vectors
-and selected corpus clips must decode bit-exactly at frame output.
+Bit-exact per-frame output against libvpx md5 is the eventual bar, reached in
+two phases rather than gated incrementally:
+
+- **Code-complete first (M1).** Build the whole profile 0 / 8-bit decode path
+  from the spec. Almost nothing produces a correct full frame until the entire
+  pipeline (entropy → dequant → inverse transform → prediction → reconstruction
+  → loop filter) exists, so per-frame goldens cannot gate early work. M1
+  verification is builds, `clippy`, targeted unit tests, engineering judgment,
+  and the golden harness running end to end with output allowed to be wrong.
+- **Bring-up second (M2).** Drive the golden harness green. The first frame
+  whose md5 matches is the first-bit-exact milestone; from there it is
+  debugging.
 
 libvpx-generated outputs are useful when the spec or test vectors are not
 enough. Intermediate checks may be added when they make failures easier to
 localize, but the tap points and granularity should follow the implementation we
 actually have. Do not commit the project to libvpx component boundaries just
 because they are available to instrument.
+
+### Golden harness
+
+A host-side harness decodes a vector frame by frame and compares per-frame md5
+against the `.md5` golden. The libvpx md5 protocol has sharp edges:
+
+- The hash is over the raw I420 frame: Y (visible `d_w`×`d_h`), then U, then V
+  at chroma dims (`⌈w/2⌉`×`⌈h/2⌉`), visible dimensions only — no stride padding.
+- Only _shown_ frames produce a line, in display order. A superframe packs
+  several coded frames into one IVF packet but usually shows one;
+  `show_existing_frame` re-emits a stored frame and gets its own line. So output
+  frame count ≤ coded frame count.
+- Golden format is one line per shown frame: `<md5hex>  <name>.i420`. Compare
+  positionally.
+
+Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
+needed to begin.
 
 ## Measurement
 
@@ -34,11 +61,12 @@ The trusted harness answers two questions:
 - does this revision decode correctly?
 - is this revision faster on the target path?
 
-Host d8 is the cheap correctness and smoke-performance loop. Device d8 is the
-ground truth for performance and should run A/B interleaved against the current
-baseline with enough repetition to report a credible delta. Targeted
-microbenchmarks are allowed when a full-decode result points at a hotspot; their
-wins only count after reconfirming full-decode wall time.
+Correctness runs natively against the core's host `std` build — the cheapest
+loop. d8 covers the wasm build: host d8 for cheap parity and smoke, device d8 as
+the performance ground truth, run A/B interleaved against the current baseline
+with enough repetition to report a credible delta. Targeted microbenchmarks are
+allowed when a full-decode result points at a hotspot; their wins only count
+after reconfirming full-decode wall time.
 
 Only rev-built runs — built by the trusted harness from a VCS revision — are
 citable in `docs/log.md`. Ad-hoc blobs are for exploration.
@@ -73,14 +101,18 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 
 ## Corpus
 
-- **Correctness:** VP9 profile 0 / 8-bit conformance vectors.
-- **Performance:** a small set of 720p clips with distinct character
-  (high-motion, film grain, screen content, talking head). Keep at least one
-  held out for review.
+Test media is mapped at `/bulk/vip9r` on the host (`/media` inside the grinder
+sandbox). Each vector has a `.md5` golden.
+
+- **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset) plus
+  `chromium/bear-vp9.ivf` as the IVF bring-up target.
+- **Performance:** `realworld/` 720p clips with distinct character (high-motion,
+  film grain, screen content, talking head). Keep at least one held out for
+  review.
 
 ## Open design questions
 
-- Minimal wasm/JS API needed for the first decode-correct loop.
+- Minimal wasm export surface and JS bindings for the d8 parity check and the
+  demo.
 - Which intermediate checks, if any, are worth adding after the first failures.
 - Device-time and token budget per optimization pass.
-- Exact generated implementor handoff mechanics under jj.

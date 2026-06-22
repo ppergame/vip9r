@@ -56,20 +56,18 @@ Workspace crates:
 
 ## Verification
 
-Depending on task, you can verify your work with
+Depending on the task, you can verify your work with
 
-- Engineering judgement. Self-review the change and decide whether satisfies the
-  orchestrator and the user.
+- Engineering judgement. Self-review the change and decide whether it would
+  satisfy the orchestrator and the user.
 - Unit tests
 - `cargo clippy`
 - (WIP) Performance timings
 - (WIP) Frame-level decode matching md5 sums
 - (WIP) Clip-level decode matching frame md5 sums
 
-WIP note: benchmarking and checksum tooling is not ready yet. Do not work on it.
-The next project milestone is a code-complete codec implementation. If the
-project is in this state, refuse the task and escalate to the orchestrator and
-the user.
+WIP note: benchmarking and checksum tooling is not yet available. It will be
+offered to you in a later task/milestone.
 
 ## Final response
 

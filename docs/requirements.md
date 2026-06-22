@@ -91,8 +91,8 @@ agent.
 
 The user maintains this file which contains important decisions. You may suggest
 additions or other changes. The user and you co-maintain the milestone and task
-tracker `docs/tracker.md`. You maintain `docs/design.md` and any other documents
-you need. The user doesn't generally look at them unless there is a
+tracker `docs/tracker.md`. You actively maintain `docs/design.md` and any other
+documents you need. The user doesn't generally look at them unless there is a
 misunderstanding or process breakdown. Do keep in mind a principle of generative
 minimalism: the docs should have enough information for a new session to deduce
 what it needs. They are not summaries or narratives that becomes stale the
@@ -137,4 +137,4 @@ Orchestrator writes a task file then runs
 implementor sandbox, including system prompt, task prompt and a copy of the Rust
 code. When the agent is done, the script will print a location like
 `temp/grinder.XXXXXX`. These directories are transient and the orchestrator
-deletes any stale ones.
+deletes any stale ones. Preserve `temp/traces/` for auditing.
