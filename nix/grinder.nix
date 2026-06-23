@@ -120,13 +120,7 @@ in
       esac
 
       if [[ "$mode" == inspect ]]; then
-        inspector="$repo/js/dist/pi-harness/grinder-inspect.mjs"
-        if [[ ! -e "$inspector" ]]; then
-          echo "missing required path: $inspector" >&2
-          echo "run: cd js && pnpm build:pi-harness" >&2
-          exit 1
-        fi
-        exec node "$inspector" --repo "$repo" "$@"
+        exec node "$repo/scripts/grinder-codex-events.mjs" inspect --repo "$repo" "$@"
       fi
 
       task_file=""
@@ -155,6 +149,7 @@ in
 
       system_prompt="$repo/scripts/grinder-system-prompt.md"
       codex_config="$repo/scripts/grinder-codex-config.toml"
+      codex_events="$repo/scripts/grinder-codex-events.mjs"
 
       temp_dir="$repo/temp"
       codex_home="$temp_dir/codex-home"
@@ -206,14 +201,37 @@ in
           # durable record that outlives "$run".
           preserve="$temp_dir/traces/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$run")"
           echo "trace -> $preserve" >&2
+          set +e
           podman "''${podman_args[@]}" "$rootfs_arg" \
             /run/tools/bin/codex exec \
-              --ephemeral \
               --json \
               -o /run/trace/final.md \
               - \
               < "$run/task.md" \
-              > "$run/trace/codex.jsonl" || status=$?
+            | node "$codex_events" stream "$run/trace/codex.jsonl"
+          pipeline_status=("''${PIPESTATUS[@]}")
+          status="''${pipeline_status[0]}"
+          renderer_status="''${pipeline_status[1]:-0}"
+          set -e
+          if [[ "$status" -eq 0 && "$renderer_status" -ne 0 ]]; then
+            status="$renderer_status"
+          fi
+          thread_id=""
+          if [[ -s "$run/trace/codex.jsonl" ]]; then
+            thread_id="$(sed -n 's/^{"type":"thread.started","thread_id":"\([^"]*\)".*/\1/p' "$run/trace/codex.jsonl" | head -n 1)"
+          fi
+          if [[ -n "$thread_id" ]]; then
+            shopt -s nullglob
+            rollout_matches=("$codex_home"/sessions/*/*/*/rollout-*-"$thread_id".jsonl)
+            shopt -u nullglob
+            if [[ ''${#rollout_matches[@]} -eq 1 ]]; then
+              cp "''${rollout_matches[0]}" "$run/trace/rollout.jsonl" || echo "rollout: copy failed for $thread_id" >&2
+            else
+              echo "rollout: expected 1 match for $thread_id, found ''${#rollout_matches[@]}" >&2
+            fi
+          else
+            echo "rollout: missing thread id in codex.jsonl" >&2
+          fi
           if [[ -f "$run/trace/final.md" ]]; then
             cat "$run/trace/final.md"
           fi
