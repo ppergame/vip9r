@@ -4,9 +4,8 @@
   "type": "module",
   "packageManager": "pnpm@11.4.0",
   "scripts": {
-    "build": "pnpm typecheck && pnpm build:d8 && pnpm build:web && pnpm build:pi-harness",
+    "build": "pnpm typecheck && pnpm build:d8 && pnpm build:web",
     "build:d8": "vite build --config vite.d8.config.ts",
-    "build:pi-harness": "vite build --config vite.pi-harness.config.ts",
     "build:web": "vite build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json"
@@ -16,8 +15,5 @@
     "typescript": "^6.0.3",
     "vite": "^8.0.16",
     "vitest": "^4.1.8"
-  },
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.3"
   }
 }

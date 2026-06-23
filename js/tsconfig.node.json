@@ -6,8 +6,6 @@
   },
   "include": [
     "vite.config.ts",
-    "vite.d8.config.ts",
-    "vite.pi-harness.config.ts",
-    "src/pi-harness"
+    "vite.d8.config.ts"
   ]
 }
