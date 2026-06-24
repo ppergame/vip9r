@@ -80,3 +80,17 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   silently misparsed.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-24 — VP9 intra residual tokens
+
+- rev: jj `nsvwpklx`
+- Added parse-only residual traversal for segmentation-disabled key/intra
+  frames: UV transform sizing, plane block sizing, scan selection, coefficient
+  token parsing, extra coefficient bits, sign-bit consumption, and above/left
+  nonzero contexts.
+- `parse_intra_tiles` now consumes the full tile bool stream for the first
+  `bear-vp9.ivf` key frame and returns to the packet-level
+  `Unimplemented` boundary. Prediction, inverse transform, reconstruction, loop
+  filter, reference storage, and output frames remain unimplemented.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.

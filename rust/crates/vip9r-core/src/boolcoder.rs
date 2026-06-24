@@ -68,6 +68,11 @@ impl<'a> BoolDecoder<'a> {
         Ok(value)
     }
 
+    #[cfg(test)]
+    pub(crate) const fn bit_offset(&self) -> usize {
+        self.bit_offset
+    }
+
     pub(crate) fn read_tree(
         &mut self,
         tree: &[i8],

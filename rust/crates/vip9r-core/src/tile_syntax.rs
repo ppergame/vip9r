@@ -6,15 +6,25 @@ use crate::header::UncompressedFrameHeader;
 use crate::probability::{FrameContext, TX_SIZE_CONTEXTS};
 use crate::tile::{TileDescriptor, TileLayout};
 
+#[path = "tile_syntax_tables.rs"]
+mod tile_syntax_tables;
+use tile_syntax_tables::*;
+
 const MAX_MIS: usize = 8192;
+const MAX_4X4S: usize = MAX_MIS * 2;
 const MI_SIZE_PIXELS: u32 = 8;
 const MI_BLOCK_64: usize = 8;
+const PLANES: usize = 3;
 const PARTITION_CONTEXTS: usize = 16;
 const PARTITION_PROBS: usize = 3;
 const INTRA_MODES: usize = 10;
 const INTRA_MODE_PROBS: usize = INTRA_MODES - 1;
 const BLOCK_SIZES: usize = 13;
 const PARTITION_TYPES: usize = 4;
+const SUBSAMPLING_X: usize = 1;
+const SUBSAMPLING_Y: usize = 1;
+const MAX_TX_COEFFS: usize = 1024;
+const TOKEN_TREE_NODES: usize = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TileSyntaxError {
@@ -65,10 +75,10 @@ pub(crate) fn parse_intra_tiles(
             frame,
             tile,
             compressed_header.tx_mode,
+            header.lossless,
             probabilities,
             &mut contexts,
-            mi_rows,
-            mi_cols,
+            (mi_rows, mi_cols),
         )?;
     }
 
@@ -79,11 +89,12 @@ fn parse_intra_tile(
     frame: &[u8],
     tile: &TileDescriptor,
     tx_mode: TxMode,
+    lossless: bool,
     probabilities: &FrameContext,
     contexts: &mut TileModeContexts,
-    mi_rows: usize,
-    mi_cols: usize,
+    frame_mis: (usize, usize),
 ) -> Result<(), TileSyntaxError> {
+    let (mi_rows, mi_cols) = frame_mis;
     let payload = frame
         .get(tile.payload_start..tile.payload_end)
         .ok_or(TileSyntaxError::InvalidBitstream)?;
@@ -110,6 +121,7 @@ fn parse_intra_tile(
         probabilities,
         contexts,
         tx_mode,
+        lossless,
         mi_rows,
         mi_cols,
         tile_col_start,
@@ -143,6 +155,7 @@ struct TileParser<'a, 'b> {
     probabilities: &'b FrameContext,
     contexts: &'b mut TileModeContexts,
     tx_mode: TxMode,
+    lossless: bool,
     mi_rows: usize,
     mi_cols: usize,
     tile_col_start: usize,
@@ -242,13 +255,10 @@ impl TileParser<'_, '_> {
         let avail_l = col > self.tile_col_start;
         let block = self.intra_frame_mode_info(row, col, block_size, avail_u, avail_l)?;
 
-        // The current implementation intentionally stops at the residual
-        // handoff. For intra blocks, residual parsing does not alter the mode,
-        // skip or transform-size values needed by following mode-info contexts,
-        // so keep those contexts coherent before returning the boundary error.
+        self.decode_residual(row, col, block_size, block)?;
         self.contexts
             .update_mode_context(self.left_row_base, row, col, block_size, block)?;
-        Err(TileSyntaxError::Unimplemented)
+        Ok(())
     }
 
     fn intra_frame_mode_info(
@@ -263,12 +273,13 @@ impl TileParser<'_, '_> {
         let skip = self.read_skip(row, col, avail_u, avail_l)?;
         let tx_size = self.read_tx_size(row, col, block_size, avail_u, avail_l)?;
         let (y_mode, sub_modes) = self.read_intra_modes(row, col, block_size, avail_u, avail_l)?;
-        let _uv_mode = self.read_default_uv_mode(y_mode)?;
+        let uv_mode = self.read_default_uv_mode(y_mode)?;
 
         Ok(DecodedBlockInfo {
             skip,
             tx_size,
             y_mode,
+            uv_mode,
             sub_modes,
             segment_id,
         })
@@ -401,6 +412,243 @@ impl TileParser<'_, '_> {
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
         IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
     }
+
+    fn decode_residual(
+        &mut self,
+        row: usize,
+        col: usize,
+        mi_size: BlockSize,
+        block: DecodedBlockInfo,
+    ) -> Result<(), TileSyntaxError> {
+        let bsize = if mi_size < BlockSize::Block8x8 {
+            BlockSize::Block8x8
+        } else {
+            mi_size
+        };
+
+        for plane in 0..PLANES {
+            let tx_size = if plane > 0 {
+                get_uv_tx_size(mi_size, block.tx_size)?
+            } else {
+                block.tx_size
+            };
+            let step = 1usize << tx_size.index();
+            let plane_size = get_plane_block_size(bsize, plane)?;
+            let num4x4w = usize::from(plane_size.num_4x4_wide());
+            let num4x4h = usize::from(plane_size.num_4x4_high());
+            let sub_x = subsampling_x(plane);
+            let sub_y = subsampling_y(plane);
+            let base_x = col
+                .checked_mul(8)
+                .map(|value| value >> sub_x)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let base_y = row
+                .checked_mul(8)
+                .map(|value| value >> sub_y)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let max_x = self
+                .mi_cols
+                .checked_mul(8)
+                .map(|value| value >> sub_x)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let max_y = self
+                .mi_rows
+                .checked_mul(8)
+                .map(|value| value >> sub_y)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+            let mut block_idx = 0usize;
+            let mut y = 0usize;
+            while y < num4x4h {
+                let mut x = 0usize;
+                while x < num4x4w {
+                    let start_x = base_x
+                        .checked_add(x.checked_mul(4).ok_or(TileSyntaxError::InvalidBitstream)?)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                    let start_y = base_y
+                        .checked_add(y.checked_mul(4).ok_or(TileSyntaxError::InvalidBitstream)?)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                    let mut nonzero = false;
+                    if start_x < max_x && start_y < max_y && !block.skip {
+                        nonzero = self.tokens(
+                            plane,
+                            (start_x, start_y),
+                            tx_size,
+                            block_idx,
+                            mi_size,
+                            block,
+                        )?;
+                    }
+
+                    self.contexts.update_nonzero_context(
+                        self.left_row_base,
+                        plane,
+                        start_x,
+                        start_y,
+                        step,
+                        nonzero,
+                    )?;
+                    block_idx = block_idx
+                        .checked_add(1)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                    x = x
+                        .checked_add(step)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                }
+                y = y
+                    .checked_add(step)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn tokens(
+        &mut self,
+        plane: usize,
+        start: (usize, usize),
+        tx_size: TxSize,
+        block_idx: usize,
+        mi_size: BlockSize,
+        block: DecodedBlockInfo,
+    ) -> Result<bool, TileSyntaxError> {
+        let seg_eob = 16usize << (tx_size.index() << 1);
+        let tx_type = self.get_tx_type(plane, tx_size, block_idx, mi_size, block)?;
+        let mut token_cache = [0u8; MAX_TX_COEFFS];
+        let mut check_eob = true;
+        let mut c = 0usize;
+
+        while c < seg_eob {
+            let pos = scan_pos(tx_size, tx_type, c)?;
+            let band = coef_band(tx_size, c);
+            let ctx = if c == 0 {
+                self.contexts.coef_context(
+                    self.left_row_base,
+                    plane,
+                    start,
+                    tx_size,
+                    (self.mi_rows, self.mi_cols),
+                )?
+            } else {
+                coefficient_token_context(pos, tx_size, tx_type, &token_cache)?
+            };
+
+            if check_eob && !self.read_more_coefs(tx_size, plane, band, ctx)? {
+                break;
+            }
+
+            let token = self.read_token(tx_size, plane, band, ctx)?;
+            token_cache[pos] = ENERGY_CLASS[token.index()];
+            if token == CoefToken::Zero {
+                check_eob = false;
+            } else {
+                let _coef = self.read_coef(token)?;
+                let _sign_bit = self.decoder.read_literal(1)?;
+                check_eob = true;
+            }
+
+            c = c.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?;
+        }
+
+        Ok(c > 0)
+    }
+
+    fn get_tx_type(
+        &self,
+        plane: usize,
+        tx_size: TxSize,
+        block_idx: usize,
+        mi_size: BlockSize,
+        block: DecodedBlockInfo,
+    ) -> Result<TxType, TileSyntaxError> {
+        if plane > 0 || tx_size == TxSize::Tx32x32 || self.lossless {
+            return Ok(TxType::DctDct);
+        }
+
+        let mode = if tx_size == TxSize::Tx4x4 && mi_size < BlockSize::Block8x8 {
+            *block
+                .sub_modes
+                .get(block_idx)
+                .ok_or(TileSyntaxError::InvalidBitstream)?
+        } else {
+            block.y_mode
+        };
+        Ok(MODE_TO_TXFM_MAP[mode.index()])
+    }
+
+    fn read_more_coefs(
+        &mut self,
+        tx_size: TxSize,
+        plane: usize,
+        band: usize,
+        ctx: usize,
+    ) -> Result<bool, TileSyntaxError> {
+        let prob =
+            self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)][0][band][ctx][0];
+        Ok(self.decoder.read_bool(prob)?)
+    }
+
+    fn read_token(
+        &mut self,
+        tx_size: TxSize,
+        plane: usize,
+        band: usize,
+        ctx: usize,
+    ) -> Result<CoefToken, TileSyntaxError> {
+        let mut index = 0usize;
+        loop {
+            let node = index >> 1;
+            let probability = self.token_probability(tx_size, plane, band, ctx, node)?;
+            let bit = usize::from(self.decoder.read_bool(probability)?);
+            let next = *TOKEN_TREE
+                .get(
+                    index
+                        .checked_add(bit)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                )
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if next <= 0 {
+                let raw = u8::try_from(-next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+                return CoefToken::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream);
+            }
+            index = usize::try_from(next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        }
+    }
+
+    fn token_probability(
+        &self,
+        tx_size: TxSize,
+        plane: usize,
+        band: usize,
+        ctx: usize,
+        node: usize,
+    ) -> Result<u8, TileSyntaxError> {
+        if node >= TOKEN_TREE_NODES {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let prob_index = core::cmp::min(2, 1usize.saturating_add(node));
+        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)][0][band]
+            [ctx][prob_index];
+        pareto(node, prob)
+    }
+
+    fn read_coef(&mut self, token: CoefToken) -> Result<u32, TileSyntaxError> {
+        let [cat, num_extra, base] = EXTRA_BITS[token.index()];
+        let mut coef = u32::from(base);
+
+        for e in 0..num_extra {
+            let probability = CAT_PROBS
+                .get(usize::from(cat))
+                .and_then(|probs| probs.get(usize::from(e)))
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let bit = u32::from(self.decoder.read_bool(probability)?);
+            coef += bit << (u32::from(num_extra) - 1 - u32::from(e));
+        }
+
+        Ok(coef)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,6 +656,7 @@ struct DecodedBlockInfo {
     skip: bool,
     tx_size: TxSize,
     y_mode: IntraMode,
+    uv_mode: IntraMode,
     sub_modes: [IntraMode; 4],
     segment_id: u8,
 }
@@ -431,8 +680,10 @@ impl NeighborModeInfo {
 struct TileModeContexts {
     above_partition: [u8; MAX_MIS],
     above_mode: [NeighborModeInfo; MAX_MIS],
+    above_nonzero: [[u8; MAX_4X4S]; PLANES],
     left_partition: [u8; MI_BLOCK_64],
     left_mode: [NeighborModeInfo; MI_BLOCK_64],
+    left_nonzero: [[u8; MI_BLOCK_64 * 2]; PLANES],
     mi_cols: usize,
     partition_cols: usize,
 }
@@ -450,8 +701,10 @@ impl TileModeContexts {
         Ok(Self {
             above_partition: [0; MAX_MIS],
             above_mode: [NeighborModeInfo::DEFAULT; MAX_MIS],
+            above_nonzero: [[0; MAX_4X4S]; PLANES],
             left_partition: [0; MI_BLOCK_64],
             left_mode: [NeighborModeInfo::DEFAULT; MI_BLOCK_64],
+            left_nonzero: [[0; MI_BLOCK_64 * 2]; PLANES],
             mi_cols,
             partition_cols,
         })
@@ -460,6 +713,7 @@ impl TileModeContexts {
     fn clear_left_context(&mut self) {
         self.left_partition = [0; MI_BLOCK_64];
         self.left_mode = [NeighborModeInfo::DEFAULT; MI_BLOCK_64];
+        self.left_nonzero = [[0; MI_BLOCK_64 * 2]; PLANES];
     }
 
     fn partition_context(
@@ -590,6 +844,89 @@ impl TileModeContexts {
         Ok(ctx)
     }
 
+    fn coef_context(
+        &self,
+        left_row_base: usize,
+        plane: usize,
+        start: (usize, usize),
+        tx_size: TxSize,
+        frame_mis: (usize, usize),
+    ) -> Result<usize, TileSyntaxError> {
+        let (start_x, start_y) = start;
+        let (mi_rows, mi_cols) = frame_mis;
+        let sx = subsampling_x(plane);
+        let sy = subsampling_y(plane);
+        let max_x = mi_cols
+            .checked_mul(2)
+            .map(|value| value >> sx)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let max_y = mi_rows
+            .checked_mul(2)
+            .map(|value| value >> sy)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let numpts = 1usize << tx_size.index();
+        let x4 = start_x >> 2;
+        let y4 = start_y >> 2;
+        let mut above = 0u8;
+        let mut left = 0u8;
+
+        for i in 0..numpts {
+            let above_index = x4.checked_add(i).ok_or(TileSyntaxError::InvalidBitstream)?;
+            if above_index < max_x {
+                above |= *self
+                    .above_nonzero
+                    .get(plane)
+                    .and_then(|plane_context| plane_context.get(above_index))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+
+            let y_index = y4.checked_add(i).ok_or(TileSyntaxError::InvalidBitstream)?;
+            if y_index < max_y {
+                let left_index = local_4x4_index(left_row_base, plane, y_index)?;
+                left |= *self
+                    .left_nonzero
+                    .get(plane)
+                    .and_then(|plane_context| plane_context.get(left_index))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+        }
+
+        Ok(usize::from(above != 0) + usize::from(left != 0))
+    }
+
+    fn update_nonzero_context(
+        &mut self,
+        left_row_base: usize,
+        plane: usize,
+        start_x: usize,
+        start_y: usize,
+        step: usize,
+        nonzero: bool,
+    ) -> Result<(), TileSyntaxError> {
+        let value = u8::from(nonzero);
+        let x4 = start_x >> 2;
+        let y4 = start_y >> 2;
+
+        for i in 0..step {
+            let above_index = x4.checked_add(i).ok_or(TileSyntaxError::InvalidBitstream)?;
+            *self
+                .above_nonzero
+                .get_mut(plane)
+                .and_then(|plane_context| plane_context.get_mut(above_index))
+                .ok_or(TileSyntaxError::InvalidBitstream)? = value;
+
+            let y_index = y4.checked_add(i).ok_or(TileSyntaxError::InvalidBitstream)?;
+            let left_index = local_4x4_index(left_row_base, plane, y_index)?;
+            *self
+                .left_nonzero
+                .get_mut(plane)
+                .and_then(|plane_context| plane_context.get_mut(left_index))
+                .ok_or(TileSyntaxError::InvalidBitstream)? = value;
+        }
+
+        Ok(())
+    }
+
     fn update_mode_context(
         &mut self,
         left_row_base: usize,
@@ -599,6 +936,7 @@ impl TileModeContexts {
         block: DecodedBlockInfo,
     ) -> Result<(), TileSyntaxError> {
         let _ = block.y_mode;
+        let _ = block.uv_mode;
         let _ = block.segment_id;
         let mode_info = NeighborModeInfo {
             skip: block.skip,
@@ -809,6 +1147,54 @@ impl TxSize {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum TxType {
+    DctDct = 0,
+    AdstDct = 1,
+    DctAdst = 2,
+    AdstAdst = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CoefToken {
+    Zero = 0,
+    One = 1,
+    Two = 2,
+    Three = 3,
+    Four = 4,
+    DctValCategory1 = 5,
+    DctValCategory2 = 6,
+    DctValCategory3 = 7,
+    DctValCategory4 = 8,
+    DctValCategory5 = 9,
+    DctValCategory6 = 10,
+}
+
+impl CoefToken {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Zero),
+            1 => Some(Self::One),
+            2 => Some(Self::Two),
+            3 => Some(Self::Three),
+            4 => Some(Self::Four),
+            5 => Some(Self::DctValCategory1),
+            6 => Some(Self::DctValCategory2),
+            7 => Some(Self::DctValCategory3),
+            8 => Some(Self::DctValCategory4),
+            9 => Some(Self::DctValCategory5),
+            10 => Some(Self::DctValCategory6),
+            _ => None,
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 fn mi_size(pixels: u32) -> Result<usize, TileSyntaxError> {
     let mis = pixels
         .checked_add(MI_SIZE_PIXELS - 1)
@@ -821,6 +1207,242 @@ fn row_offset(left_row_base: usize, row: usize) -> Result<usize, TileSyntaxError
     row.checked_sub(left_row_base)
         .ok_or(TileSyntaxError::InvalidBitstream)
 }
+
+fn local_4x4_index(
+    left_row_base: usize,
+    plane: usize,
+    y4: usize,
+) -> Result<usize, TileSyntaxError> {
+    let sy = subsampling_y(plane);
+    let base_y4 = left_row_base
+        .checked_mul(2)
+        .map(|value| value >> sy)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    y4.checked_sub(base_y4)
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+const fn subsampling_x(plane: usize) -> usize {
+    if plane > 0 { SUBSAMPLING_X } else { 0 }
+}
+
+const fn subsampling_y(plane: usize) -> usize {
+    if plane > 0 { SUBSAMPLING_Y } else { 0 }
+}
+
+fn get_uv_tx_size(mi_size: BlockSize, tx_size: TxSize) -> Result<TxSize, TileSyntaxError> {
+    if mi_size < BlockSize::Block8x8 {
+        return Ok(TxSize::Tx4x4);
+    }
+    let plane_size = get_plane_block_size(mi_size, 1)?;
+    Ok(TxSize::from_index(core::cmp::min(
+        tx_size.index(),
+        plane_size.max_tx_size().index(),
+    )))
+}
+
+fn get_plane_block_size(subsize: BlockSize, plane: usize) -> Result<BlockSize, TileSyntaxError> {
+    let sub_x = subsampling_x(plane);
+    let sub_y = subsampling_y(plane);
+    SS_SIZE_LOOKUP
+        .get(subsize.index())
+        .and_then(|by_x| by_x.get(sub_x))
+        .and_then(|by_y| by_y.get(sub_y))
+        .copied()
+        .flatten()
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+fn scan_pos(tx_size: TxSize, tx_type: TxType, c: usize) -> Result<usize, TileSyntaxError> {
+    let scan: &[u16] = match tx_size {
+        TxSize::Tx4x4 => match tx_type {
+            TxType::AdstDct => &ROW_SCAN_4X4,
+            TxType::DctAdst => &COL_SCAN_4X4,
+            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_4X4,
+        },
+        TxSize::Tx8x8 => match tx_type {
+            TxType::AdstDct => &ROW_SCAN_8X8,
+            TxType::DctAdst => &COL_SCAN_8X8,
+            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_8X8,
+        },
+        TxSize::Tx16x16 => match tx_type {
+            TxType::AdstDct => &ROW_SCAN_16X16,
+            TxType::DctAdst => &COL_SCAN_16X16,
+            TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_16X16,
+        },
+        TxSize::Tx32x32 => &DEFAULT_SCAN_32X32,
+    };
+    scan.get(c)
+        .copied()
+        .map(usize::from)
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+const fn coef_band(tx_size: TxSize, c: usize) -> usize {
+    if matches!(tx_size, TxSize::Tx4x4) {
+        COEFBAND_4X4[c]
+    } else if c < 10 {
+        COEFBAND_8X8PLUS_FIRST[c]
+    } else if c < 21 {
+        4
+    } else {
+        5
+    }
+}
+
+fn coefficient_token_context(
+    pos: usize,
+    tx_size: TxSize,
+    tx_type: TxType,
+    token_cache: &[u8; MAX_TX_COEFFS],
+) -> Result<usize, TileSyntaxError> {
+    let n = 4usize << tx_size.index();
+    let i = pos / n;
+    let j = pos % n;
+    let (nb0, nb1) = if i > 0 && j > 0 {
+        let a = (i - 1)
+            .checked_mul(n)
+            .and_then(|value| value.checked_add(j))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let a2 = i
+            .checked_mul(n)
+            .and_then(|value| value.checked_add(j - 1))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        match tx_type {
+            TxType::DctAdst => (a, a),
+            TxType::AdstDct => (a2, a2),
+            TxType::DctDct | TxType::AdstAdst => (a, a2),
+        }
+    } else if i > 0 {
+        let a = (i - 1)
+            .checked_mul(n)
+            .and_then(|value| value.checked_add(j))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        (a, a)
+    } else {
+        let jm1 = j.checked_sub(1).ok_or(TileSyntaxError::InvalidBitstream)?;
+        let a = i
+            .checked_mul(n)
+            .and_then(|value| value.checked_add(jm1))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        (a, a)
+    };
+
+    let cache0 = usize::from(
+        *token_cache
+            .get(nb0)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+    );
+    let cache1 = usize::from(
+        *token_cache
+            .get(nb1)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+    );
+    Ok((1 + cache0 + cache1) >> 1)
+}
+
+fn pareto(node: usize, prob: u8) -> Result<u8, TileSyntaxError> {
+    if node < 2 {
+        return Ok(prob);
+    }
+    if prob == 0 {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    let table_index = node
+        .checked_sub(2)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let x = usize::from((prob - 1) / 2);
+    if prob & 1 != 0 {
+        PARETO_TABLE
+            .get(x)
+            .and_then(|row| row.get(table_index))
+            .copied()
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    } else {
+        let a = u16::from(
+            PARETO_TABLE
+                .get(x)
+                .and_then(|row| row.get(table_index))
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        );
+        let b = u16::from(
+            PARETO_TABLE
+                .get(x.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?)
+                .and_then(|row| row.get(table_index))
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        );
+        u8::try_from((a + b) >> 1).map_err(|_| TileSyntaxError::InvalidBitstream)
+    }
+}
+
+const COEFBAND_4X4: [usize; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+const COEFBAND_8X8PLUS_FIRST: [usize; 10] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+
+const ENERGY_CLASS: [u8; 11] = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5];
+
+const MODE_TO_TXFM_MAP: [TxType; INTRA_MODES] = [
+    TxType::DctDct,
+    TxType::AdstDct,
+    TxType::DctAdst,
+    TxType::DctDct,
+    TxType::AdstAdst,
+    TxType::AdstDct,
+    TxType::DctAdst,
+    TxType::DctAdst,
+    TxType::AdstDct,
+    TxType::AdstAdst,
+];
+
+const TOKEN_TREE: [i8; 20] = [
+    -(CoefToken::Zero as i8),
+    2,
+    -(CoefToken::One as i8),
+    4,
+    6,
+    10,
+    -(CoefToken::Two as i8),
+    8,
+    -(CoefToken::Three as i8),
+    -(CoefToken::Four as i8),
+    12,
+    14,
+    -(CoefToken::DctValCategory1 as i8),
+    -(CoefToken::DctValCategory2 as i8),
+    16,
+    18,
+    -(CoefToken::DctValCategory3 as i8),
+    -(CoefToken::DctValCategory4 as i8),
+    -(CoefToken::DctValCategory5 as i8),
+    -(CoefToken::DctValCategory6 as i8),
+];
+
+const EXTRA_BITS: [[u8; 3]; 11] = [
+    [0, 0, 0],
+    [0, 0, 1],
+    [0, 0, 2],
+    [0, 0, 3],
+    [0, 0, 4],
+    [1, 1, 5],
+    [2, 2, 7],
+    [3, 3, 11],
+    [4, 4, 19],
+    [5, 5, 35],
+    [6, 14, 67],
+];
+
+const CAT_PROBS: [[u8; 14]; 7] = [
+    [0; 14],
+    [159, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [165, 145, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [173, 148, 140, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [176, 155, 140, 135, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [180, 157, 141, 134, 130, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [
+        254, 254, 254, 252, 249, 243, 230, 196, 177, 153, 140, 133, 130, 129,
+    ],
+];
 
 const PARTITION_TREE: [i8; 6] = [
     0,
@@ -948,6 +1570,58 @@ const SUBSIZE_LOOKUP: [[Option<BlockSize>; BLOCK_SIZES]; PARTITION_TYPES] = [
         None,
         None,
         Some(BlockSize::Block32x32),
+    ],
+];
+
+const SS_SIZE_LOOKUP: [[[Option<BlockSize>; 2]; 2]; BLOCK_SIZES] = [
+    [[Some(BlockSize::Block4x4), None], [None, None]],
+    [
+        [Some(BlockSize::Block4x8), Some(BlockSize::Block4x4)],
+        [None, None],
+    ],
+    [
+        [Some(BlockSize::Block8x4), None],
+        [Some(BlockSize::Block4x4), None],
+    ],
+    [
+        [Some(BlockSize::Block8x8), Some(BlockSize::Block8x4)],
+        [Some(BlockSize::Block4x8), Some(BlockSize::Block4x4)],
+    ],
+    [
+        [Some(BlockSize::Block8x16), Some(BlockSize::Block8x8)],
+        [None, Some(BlockSize::Block4x8)],
+    ],
+    [
+        [Some(BlockSize::Block16x8), None],
+        [Some(BlockSize::Block8x8), Some(BlockSize::Block8x4)],
+    ],
+    [
+        [Some(BlockSize::Block16x16), Some(BlockSize::Block16x8)],
+        [Some(BlockSize::Block8x16), Some(BlockSize::Block8x8)],
+    ],
+    [
+        [Some(BlockSize::Block16x32), Some(BlockSize::Block16x16)],
+        [None, Some(BlockSize::Block8x16)],
+    ],
+    [
+        [Some(BlockSize::Block32x16), None],
+        [Some(BlockSize::Block16x16), Some(BlockSize::Block16x8)],
+    ],
+    [
+        [Some(BlockSize::Block32x32), Some(BlockSize::Block32x16)],
+        [Some(BlockSize::Block16x32), Some(BlockSize::Block16x16)],
+    ],
+    [
+        [Some(BlockSize::Block32x64), Some(BlockSize::Block32x32)],
+        [None, Some(BlockSize::Block16x32)],
+    ],
+    [
+        [Some(BlockSize::Block64x32), None],
+        [Some(BlockSize::Block32x32), Some(BlockSize::Block32x16)],
+    ],
+    [
+        [Some(BlockSize::Block64x64), Some(BlockSize::Block64x32)],
+        [Some(BlockSize::Block32x64), Some(BlockSize::Block32x32)],
     ],
 ];
 
@@ -1111,14 +1785,18 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 
 #[cfg(test)]
 mod tests {
-    use super::{TileSyntaxError, parse_intra_tiles};
+    use super::{
+        BlockSize, CoefToken, DecodedBlockInfo, IntraMode, TileModeContexts, TileParser,
+        TileSyntaxError, TxSize, parse_intra_tiles,
+    };
+    use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, TxMode};
     use crate::header::{FrameType, UncompressedFrameHeader};
     use crate::probability::FrameContext;
     use crate::tile::parse_tile_layout;
 
     #[test]
-    fn minimal_intra_tile_reaches_residual_handoff() {
+    fn minimal_intra_tile_parses_residual_syntax() {
         let frame = [0u8; 32];
         let header = test_header(false);
         let layout = parse_tile_layout(&frame, &header).unwrap();
@@ -1134,8 +1812,113 @@ mod tests {
                 &FrameContext::DEFAULT,
                 &layout
             ),
-            Err(TileSyntaxError::Unimplemented)
+            Ok(())
         );
+    }
+
+    #[test]
+    fn skipped_residual_updates_nonzero_contexts_without_consuming_token_bits() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        contexts.above_nonzero[0][0] = 1;
+        contexts.above_nonzero[0][1] = 1;
+        contexts.left_nonzero[0][0] = 1;
+        contexts.left_nonzero[0][1] = 1;
+
+        {
+            let decoder = BoolDecoder::new(&[0x00, 0x00]).unwrap();
+            let bit_offset = decoder.bit_offset();
+            let mut parser = TileParser {
+                decoder,
+                probabilities: &probabilities,
+                contexts: &mut contexts,
+                tx_mode: TxMode::Only4x4,
+                lossless: true,
+                mi_rows: 1,
+                mi_cols: 1,
+                tile_col_start: 0,
+                left_row_base: 0,
+            };
+
+            parser
+                .decode_residual(0, 0, BlockSize::Block8x8, test_block(true))
+                .unwrap();
+            assert_eq!(parser.decoder.bit_offset(), bit_offset);
+        }
+
+        assert_eq!(contexts.above_nonzero[0][0], 0);
+        assert_eq!(contexts.above_nonzero[0][1], 0);
+        assert_eq!(contexts.left_nonzero[0][0], 0);
+        assert_eq!(contexts.left_nonzero[0][1], 0);
+    }
+
+    #[test]
+    fn all_zero_token_block_takes_immediate_more_coefs_zero_path() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut parser = TileParser {
+            decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
+            probabilities: &probabilities,
+            contexts: &mut contexts,
+            tx_mode: TxMode::Only4x4,
+            lossless: true,
+            mi_rows: 1,
+            mi_cols: 1,
+            tile_col_start: 0,
+            left_row_base: 0,
+        };
+
+        let nonzero = parser
+            .tokens(
+                0,
+                (0, 0),
+                TxSize::Tx4x4,
+                0,
+                BlockSize::Block8x8,
+                test_block(false),
+            )
+            .unwrap();
+
+        assert!(!nonzero);
+        assert_eq!(parser.decoder.bit_offset(), 1);
+        assert_eq!(parser.decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn category_token_extra_bits_are_parsed() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut parser = TileParser {
+            decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
+            probabilities: &probabilities,
+            contexts: &mut contexts,
+            tx_mode: TxMode::Only4x4,
+            lossless: true,
+            mi_rows: 1,
+            mi_cols: 1,
+            tile_col_start: 0,
+            left_row_base: 0,
+        };
+
+        assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(5));
+        assert_eq!(parser.decoder.bit_offset(), 1);
+        assert_eq!(parser.decoder.finish(), Ok(()));
+
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut parser = TileParser {
+            decoder: BoolDecoder::new(&[0x50, 0x00]).unwrap(),
+            probabilities: &probabilities,
+            contexts: &mut contexts,
+            tx_mode: TxMode::Only4x4,
+            lossless: true,
+            mi_rows: 1,
+            mi_cols: 1,
+            tile_col_start: 0,
+            left_row_base: 0,
+        };
+
+        assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(6));
+        assert_eq!(parser.decoder.finish(), Ok(()));
     }
 
     #[test]
@@ -1196,6 +1979,17 @@ mod tests {
             header_size_in_bytes: 1,
             compressed_header_offset: 0,
             tile_data_offset: 1,
+        }
+    }
+
+    fn test_block(skip: bool) -> DecodedBlockInfo {
+        DecodedBlockInfo {
+            skip,
+            tx_size: TxSize::Tx4x4,
+            y_mode: IntraMode::Dc,
+            uv_mode: IntraMode::Dc,
+            sub_modes: [IntraMode::Dc; 4],
+            segment_id: 0,
         }
     }
 }

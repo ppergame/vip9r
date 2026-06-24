@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_packet_reaches_unimplemented_tile_boundary_after_valid_intra_compressed_header() {
+    fn decode_packet_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
         let frame = minimal_lossless_key_frame();
         let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(16, 16))).unwrap();
         let mut sink = NullSink;
