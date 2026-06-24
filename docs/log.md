@@ -94,3 +94,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   filter, reference storage, and output frames remain unimplemented.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-24 — VP9 inter compressed headers
+
+- rev: jj `rtoszqvl`
+- Added inter-frame compressed-header parsing through non-coef probability
+  updates: inter mode, switchable interpolation filter, intra/inter, reference
+  mode/reference probabilities, Y mode, partition, and MV probabilities.
+- Extended frame probability state with the spec 10.5 default inter/non-coef/MV
+  tables and wired `Decoder::decode_packet` to parse inter compressed headers
+  before the still-unimplemented inter tile syntax boundary.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.

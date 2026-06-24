@@ -50,6 +50,7 @@ harness.
 - [x] intra compressed-header parser and default tx/skip/coef probability state
 - [x] key/intra tile partition and mode-info syntax through residual handoff
 - [x] key/intra residual traversal and coefficient token syntax parse-only
+- [x] inter compressed-header parser and default non-coef/MV probability state
 - [ ] decompose the decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 

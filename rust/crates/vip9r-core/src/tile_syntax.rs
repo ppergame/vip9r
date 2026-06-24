@@ -1800,9 +1800,7 @@ mod tests {
         let frame = [0u8; 32];
         let header = test_header(false);
         let layout = parse_tile_layout(&frame, &header).unwrap();
-        let compressed_header = CompressedHeader {
-            tx_mode: TxMode::Only4x4,
-        };
+        let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
 
         assert_eq!(
             parse_intra_tiles(
@@ -1926,9 +1924,7 @@ mod tests {
         let frame = [0u8; 32];
         let header = test_header(true);
         let layout = parse_tile_layout(&frame, &header).unwrap();
-        let compressed_header = CompressedHeader {
-            tx_mode: TxMode::Only4x4,
-        };
+        let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
 
         assert_eq!(
             parse_intra_tiles(

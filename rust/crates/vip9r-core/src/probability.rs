@@ -9,16 +9,76 @@ pub(crate) const REF_TYPES: usize = 2;
 pub(crate) const COEF_BANDS: usize = 6;
 pub(crate) const PREV_COEF_CONTEXTS: usize = 6;
 pub(crate) const UNCONSTRAINED_NODES: usize = 3;
+pub(crate) const INTER_MODE_CONTEXTS: usize = 7;
+pub(crate) const INTER_MODES: usize = 4;
+pub(crate) const INTERP_FILTER_CONTEXTS: usize = 4;
+pub(crate) const SWITCHABLE_FILTERS: usize = 3;
+pub(crate) const IS_INTER_CONTEXTS: usize = 4;
+pub(crate) const COMP_MODE_CONTEXTS: usize = 5;
+pub(crate) const REF_CONTEXTS: usize = 5;
+pub(crate) const BLOCK_SIZE_GROUPS: usize = 4;
+pub(crate) const INTRA_MODES: usize = 10;
+pub(crate) const PARTITION_CONTEXTS: usize = 16;
+pub(crate) const PARTITION_TYPES: usize = 4;
+pub(crate) const MV_JOINTS: usize = 4;
+pub(crate) const MV_CLASSES: usize = 11;
+pub(crate) const CLASS0_SIZE: usize = 2;
+pub(crate) const MV_OFFSET_BITS: usize = 10;
+pub(crate) const MV_FR_SIZE: usize = 4;
 
 pub(crate) type TxProbs = [[[u8; TX_SIZES - 1]; TX_SIZE_CONTEXTS]; TX_SIZES];
 pub(crate) type CoefProbs = [[[[[[u8; UNCONSTRAINED_NODES]; PREV_COEF_CONTEXTS]; COEF_BANDS];
     REF_TYPES]; BLOCK_TYPES]; TX_SIZES];
+pub(crate) type InterModeProbs = [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS];
+pub(crate) type InterpFilterProbs = [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS];
+pub(crate) type IsInterProb = [u8; IS_INTER_CONTEXTS];
+pub(crate) type CompModeProb = [u8; COMP_MODE_CONTEXTS];
+pub(crate) type SingleRefProb = [[u8; 2]; REF_CONTEXTS];
+pub(crate) type CompRefProb = [u8; REF_CONTEXTS];
+pub(crate) type YModeProbs = [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS];
+pub(crate) type PartitionProbs = [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MvProbs {
+    pub(crate) joint: [u8; MV_JOINTS - 1],
+    pub(crate) sign: [u8; 2],
+    pub(crate) class: [[u8; MV_CLASSES - 1]; 2],
+    pub(crate) class0_bit: [u8; 2],
+    pub(crate) bits: [[u8; MV_OFFSET_BITS]; 2],
+    pub(crate) class0_fr: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2],
+    pub(crate) fr: [[u8; MV_FR_SIZE - 1]; 2],
+    pub(crate) class0_hp: [u8; 2],
+    pub(crate) hp: [u8; 2],
+}
+
+impl MvProbs {
+    const DEFAULT: Self = Self {
+        joint: DEFAULT_MV_JOINT_PROBS,
+        sign: DEFAULT_MV_SIGN_PROB,
+        class: DEFAULT_MV_CLASS_PROBS,
+        class0_bit: DEFAULT_MV_CLASS0_BIT_PROB,
+        bits: DEFAULT_MV_BITS_PROB,
+        class0_fr: DEFAULT_MV_CLASS0_FR_PROBS,
+        fr: DEFAULT_MV_FR_PROBS,
+        class0_hp: DEFAULT_MV_CLASS0_HP_PROB,
+        hp: DEFAULT_MV_HP_PROB,
+    };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FrameContext {
     pub(crate) tx_probs: TxProbs,
     pub(crate) coef_probs: CoefProbs,
     pub(crate) skip_prob: [u8; SKIP_CONTEXTS],
+    pub(crate) inter_mode_probs: InterModeProbs,
+    pub(crate) interp_filter_probs: InterpFilterProbs,
+    pub(crate) is_inter_prob: IsInterProb,
+    pub(crate) comp_mode_prob: CompModeProb,
+    pub(crate) single_ref_prob: SingleRefProb,
+    pub(crate) comp_ref_prob: CompRefProb,
+    pub(crate) y_mode_probs: YModeProbs,
+    pub(crate) partition_probs: PartitionProbs,
+    pub(crate) mv_probs: MvProbs,
 }
 
 impl FrameContext {
@@ -26,6 +86,15 @@ impl FrameContext {
         tx_probs: DEFAULT_TX_PROBS,
         coef_probs: DEFAULT_COEF_PROBS,
         skip_prob: DEFAULT_SKIP_PROB,
+        inter_mode_probs: DEFAULT_INTER_MODE_PROBS,
+        interp_filter_probs: DEFAULT_INTERP_FILTER_PROBS,
+        is_inter_prob: DEFAULT_IS_INTER_PROB,
+        comp_mode_prob: DEFAULT_COMP_MODE_PROB,
+        single_ref_prob: DEFAULT_SINGLE_REF_PROB,
+        comp_ref_prob: DEFAULT_COMP_REF_PROB,
+        y_mode_probs: DEFAULT_Y_MODE_PROBS,
+        partition_probs: DEFAULT_PARTITION_PROBS,
+        mv_probs: MvProbs::DEFAULT,
     };
 }
 
@@ -58,6 +127,15 @@ impl ProbabilityState {
     pub(crate) fn load_probs(&mut self, ctx: u8) -> Result<(), ParserError> {
         let context = self.context(ctx)?;
         self.current.coef_probs = context.coef_probs;
+        self.current.inter_mode_probs = context.inter_mode_probs;
+        self.current.interp_filter_probs = context.interp_filter_probs;
+        self.current.is_inter_prob = context.is_inter_prob;
+        self.current.comp_mode_prob = context.comp_mode_prob;
+        self.current.single_ref_prob = context.single_ref_prob;
+        self.current.comp_ref_prob = context.comp_ref_prob;
+        self.current.y_mode_probs = context.y_mode_probs;
+        self.current.partition_probs = context.partition_probs;
+        self.current.mv_probs = context.mv_probs;
         Ok(())
     }
 
@@ -98,6 +176,80 @@ impl ProbabilityState {
 }
 
 const DEFAULT_SKIP_PROB: [u8; SKIP_CONTEXTS] = [192, 128, 64];
+
+const DEFAULT_IS_INTER_PROB: IsInterProb = [9, 102, 187, 225];
+
+const DEFAULT_COMP_MODE_PROB: CompModeProb = [239, 183, 119, 96, 41];
+
+const DEFAULT_COMP_REF_PROB: CompRefProb = [50, 126, 123, 221, 226];
+
+const DEFAULT_SINGLE_REF_PROB: SingleRefProb =
+    [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]];
+
+const DEFAULT_INTER_MODE_PROBS: InterModeProbs = [
+    [2, 173, 34],
+    [7, 145, 85],
+    [7, 166, 63],
+    [7, 94, 66],
+    [8, 64, 46],
+    [17, 81, 31],
+    [25, 29, 30],
+];
+
+const DEFAULT_INTERP_FILTER_PROBS: InterpFilterProbs = [[235, 162], [36, 255], [34, 3], [149, 144]];
+
+const DEFAULT_Y_MODE_PROBS: YModeProbs = [
+    [65, 32, 18, 144, 162, 194, 41, 51, 98],
+    [132, 68, 18, 165, 217, 196, 45, 40, 78],
+    [173, 80, 19, 176, 240, 193, 64, 35, 46],
+    [221, 135, 38, 194, 248, 121, 96, 85, 29],
+];
+
+const DEFAULT_PARTITION_PROBS: PartitionProbs = [
+    [199, 122, 141],
+    [147, 63, 159],
+    [148, 133, 118],
+    [121, 104, 114],
+    [174, 73, 87],
+    [92, 41, 83],
+    [82, 99, 50],
+    [53, 39, 39],
+    [177, 58, 59],
+    [68, 26, 63],
+    [52, 79, 25],
+    [17, 14, 12],
+    [222, 34, 30],
+    [72, 16, 44],
+    [58, 32, 12],
+    [10, 7, 6],
+];
+
+const DEFAULT_MV_JOINT_PROBS: [u8; MV_JOINTS - 1] = [32, 64, 96];
+
+const DEFAULT_MV_SIGN_PROB: [u8; 2] = [128, 128];
+
+const DEFAULT_MV_CLASS_PROBS: [[u8; MV_CLASSES - 1]; 2] = [
+    [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
+    [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
+];
+
+const DEFAULT_MV_CLASS0_BIT_PROB: [u8; 2] = [216, 208];
+
+const DEFAULT_MV_BITS_PROB: [[u8; MV_OFFSET_BITS]; 2] = [
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+];
+
+const DEFAULT_MV_CLASS0_FR_PROBS: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2] = [
+    [[128, 128, 64], [96, 112, 64]],
+    [[128, 128, 64], [96, 112, 64]],
+];
+
+const DEFAULT_MV_FR_PROBS: [[u8; MV_FR_SIZE - 1]; 2] = [[64, 96, 64], [64, 96, 64]];
+
+const DEFAULT_MV_CLASS0_HP_PROB: [u8; 2] = [160, 160];
+
+const DEFAULT_MV_HP_PROB: [u8; 2] = [128, 128];
 
 const DEFAULT_TX_PROBS: TxProbs = [
     [[0, 0, 0], [0, 0, 0]],

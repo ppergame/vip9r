@@ -169,7 +169,7 @@ mod superframe;
 mod tile;
 mod tile_syntax;
 
-use compressed_header::parse_intra_compressed_header;
+use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::ProbabilityState;
 use superframe::split_superframe;
@@ -228,37 +228,41 @@ impl Decoder {
             self.setup_frame_probability_state(&header)?;
 
             if !header.show_existing_frame && header.header_size_in_bytes != 0 {
-                let mut compressed_header = None;
-                if header.frame_is_intra {
-                    let compressed_header_data = frame
-                        .get(header.compressed_header_offset..header.tile_data_offset)
-                        .ok_or(DecodeError::InvalidBitstream)?;
-                    self.probability_state
-                        .load_probs(header.frame_context_idx)
-                        .map_err(|err| err.into_decode_error())?;
-                    self.probability_state
-                        .load_probs2(header.frame_context_idx)
-                        .map_err(|err| err.into_decode_error())?;
+                let compressed_header_data = frame
+                    .get(header.compressed_header_offset..header.tile_data_offset)
+                    .ok_or(DecodeError::InvalidBitstream)?;
+                self.probability_state
+                    .load_probs(header.frame_context_idx)
+                    .map_err(|err| err.into_decode_error())?;
+                self.probability_state
+                    .load_probs2(header.frame_context_idx)
+                    .map_err(|err| err.into_decode_error())?;
 
-                    let parsed_compressed_header = parse_intra_compressed_header(
+                let compressed_header = if header.frame_is_intra {
+                    parse_intra_compressed_header(
                         compressed_header_data,
                         &header,
                         self.probability_state.current_mut(),
                     )
-                    .map_err(|err| err.into_decode_error())?;
-                    compressed_header = Some(parsed_compressed_header);
-                    if header.refresh_frame_context {
-                        self.probability_state
-                            .save_probs(header.frame_context_idx)
-                            .map_err(|err| err.into_decode_error())?;
-                    }
+                    .map_err(|err| err.into_decode_error())?
+                } else {
+                    parse_inter_compressed_header(
+                        compressed_header_data,
+                        &header,
+                        self.probability_state.current_mut(),
+                    )
+                    .map_err(|err| err.into_decode_error())?
+                };
+
+                if header.refresh_frame_context {
+                    self.probability_state
+                        .save_probs(header.frame_context_idx)
+                        .map_err(|err| err.into_decode_error())?;
                 }
 
                 let tile_layout =
                     parse_tile_layout(frame, &header).map_err(|err| err.into_decode_error())?;
                 if header.frame_is_intra {
-                    let compressed_header =
-                        compressed_header.ok_or(DecodeError::InvalidBitstream)?;
                     parse_intra_tiles(
                         frame,
                         &header,
@@ -517,6 +521,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decode_packet_parses_inter_compressed_header_before_unimplemented_boundary() {
+        let key_frame = minimal_lossless_key_frame();
+        let inter_frame = minimal_lossless_inter_frame();
+        let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(16, 16))).unwrap();
+        let mut sink = NullSink;
+
+        assert_eq!(
+            decoder.decode_packet(&key_frame, &mut sink),
+            Err(DecodeError::Unimplemented)
+        );
+        assert_eq!(
+            decoder.decode_packet(&inter_frame, &mut sink),
+            Err(DecodeError::Unimplemented)
+        );
+    }
+
     struct NullSink;
 
     impl FrameSink for NullSink {
@@ -561,6 +582,47 @@ mod tests {
         builder.byte(0x00); // compressed header initial BoolValue
         builder.byte(0x00); // compressed header zero padding
         builder.byte(0x00); // one tile payload byte; tile decode is still unimplemented
+        builder.finish()
+    }
+
+    fn minimal_lossless_inter_frame() -> [u8; 128] {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2); // frame marker
+        builder.f(0, 1); // profile low
+        builder.f(0, 1); // profile high
+        builder.f(0, 1); // not show existing frame
+        builder.f(1, 1); // non-key frame
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // not error resilient
+        builder.f(0, 2); // reset frame context
+        builder.f(1, 8); // refresh reference slot 0
+        for ref_idx in 0..3 {
+            builder.f(ref_idx, 3); // reference frame index
+            builder.f(0, 1); // sign bias
+        }
+        builder.f(1, 1); // use first reference size
+        builder.f(0, 1); // render size matches frame size
+        builder.f(0, 1); // quarter-pel motion vectors
+        builder.f(0, 1); // raw interpolation filter follows
+        builder.f(0, 2); // EIGHTTAP_SMOOTH
+        builder.f(1, 1); // refresh frame context
+        builder.f(0, 1); // frame parallel decoding mode
+        builder.f(0, 2); // frame context idx
+        builder.f(0, 6); // loop filter level
+        builder.f(0, 3); // loop filter sharpness
+        builder.f(0, 1); // loop filter delta disabled
+        builder.f(0, 8); // base q idx
+        builder.f(0, 1); // y dc delta absent
+        builder.f(0, 1); // uv dc delta absent
+        builder.f(0, 1); // uv ac delta absent
+        builder.f(0, 1); // segmentation disabled
+        builder.f(0, 1); // tile rows log2
+        builder.f(64, 16); // compressed header size
+        builder.byte_align_zero();
+        for _ in 0..64 {
+            builder.byte(0x00);
+        }
+        builder.byte(0x00); // one tile payload byte; inter tile syntax is not parsed yet
         builder.finish()
     }
 
