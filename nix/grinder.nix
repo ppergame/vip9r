@@ -232,6 +232,10 @@ in
           else
             echo "rollout: missing thread id in codex.jsonl" >&2
           fi
+          context_summary=""
+          if [[ -s "$run/trace/rollout.jsonl" ]]; then
+            context_summary="$(node "$codex_events" context "$run/trace/rollout.jsonl" || true)"
+          fi
           if [[ -f "$run/trace/final.md" ]]; then
             cat "$run/trace/final.md"
           fi
@@ -244,6 +248,9 @@ in
             echo
             echo "── grinder ──"
             echo "status: $status"
+            if [[ -n "$context_summary" ]]; then
+              echo "context: $context_summary"
+            fi
             echo "source: $run/rust"
             echo "trace:  $preserve"
           } >&2

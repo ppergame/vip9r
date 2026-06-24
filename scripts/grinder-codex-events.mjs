@@ -22,6 +22,7 @@ function usage(exitCode = 2) {
 	const out = exitCode === 0 ? process.stdout : process.stderr;
 	out.write(`usage:
   grinder-codex-events stream CODEX_JSONL
+  grinder-codex-events context ROLLOUT_JSONL
   grinder-codex-events inspect [options] [CODEX_JSONL_OR_TRACE_DIR]
 
 Options:
@@ -48,6 +49,12 @@ function compactNumber(value) {
 	if (typeof value !== "number" || !Number.isFinite(value)) return "?";
 	if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(1)}k`;
 	return String(value);
+}
+
+function compactPercent(ratio) {
+	if (typeof ratio !== "number" || !Number.isFinite(ratio)) return "?";
+	if (ratio > 0 && ratio < 0.01) return "<1%";
+	return `${Math.round(ratio * 100)}%`;
 }
 
 function relativeSandboxPath(value) {
@@ -78,6 +85,10 @@ class CompactRenderer {
 
 	flushAgent() {
 		if (!this.pendingAgent) return;
+		if (this.suppressFinalAgent) {
+			this.discardAgent();
+			return;
+		}
 		if (this.verbose) this.writeBlock("agent", this.pendingAgent);
 		else this.write(`  agent: ${firstLine(this.pendingAgent)}`);
 		this.pendingAgent = undefined;
@@ -390,19 +401,58 @@ function statusFor(jsonlPath) {
 	return readOptional(join(dirname(jsonlPath), "exit-status"));
 }
 
+function tokenCountSample(event) {
+	const payload = isObject(event) ? event.payload : undefined;
+	if (!isObject(payload) || payload.type !== "token_count") return undefined;
+	const info = payload.info;
+	if (!isObject(info)) return undefined;
+	const usage = info.last_token_usage;
+	if (!isObject(usage)) return undefined;
+	const tokens = usage.total_tokens;
+	const window = info.model_context_window;
+	if (
+		typeof tokens !== "number" ||
+		typeof window !== "number" ||
+		!Number.isFinite(tokens) ||
+		!Number.isFinite(window) ||
+		tokens <= 0 ||
+		window <= 0
+	) {
+		return undefined;
+	}
+	return { tokens, window };
+}
+
+function contextSummaryForEvents(events) {
+	let peak;
+	for (const event of events) {
+		const sample = tokenCountSample(event);
+		if (!sample) continue;
+		const ratio = sample.tokens / sample.window;
+		if (!peak || ratio > peak.tokens / peak.window) peak = sample;
+	}
+	if (!peak) return undefined;
+	return `peak ${compactPercent(peak.tokens / peak.window)} (${compactNumber(peak.tokens)}/${compactNumber(peak.window)})`;
+}
+
+function contextSummaryForFile(path) {
+	if (!fileExists(path)) return undefined;
+	const { events } = readJsonl(path);
+	return contextSummaryForEvents(events);
+}
+
+function contextSummaryForTrace(jsonlPath) {
+	return contextSummaryForFile(join(dirname(jsonlPath), "rollout.jsonl"));
+}
+
 function inspectJsonl(jsonlPath, options) {
 	const { events, malformed } = readJsonl(jsonlPath);
 	const finalText = finalTextFor(jsonlPath);
 	process.stdout.write("# grinder trace\n\n");
-	process.stdout.write(`- file: ${jsonlPath}\n`);
 	const status = statusFor(jsonlPath);
-	if (status) process.stdout.write(`- status: ${status}\n`);
-	else if (!events.some(isTerminalEvent)) process.stdout.write("- state: incomplete\n");
+	const state = !status && !events.some(isTerminalEvent) ? "incomplete" : undefined;
 	const threadId = threadIdFor(events);
-	if (threadId) process.stdout.write(`- thread: ${threadId}\n`);
-	if (finalText) process.stdout.write(`- final: ${firstLine(finalText, 180)}\n`);
-	if (malformed > 0) process.stdout.write(`- malformed lines skipped: ${malformed}\n`);
-	process.stdout.write("\n");
+	const contextSummary = contextSummaryForTrace(jsonlPath);
 
 	const renderer = new CompactRenderer({
 		out: process.stdout,
@@ -412,6 +462,15 @@ function inspectJsonl(jsonlPath, options) {
 	for (const event of events) renderer.renderEvent(event);
 	if (finalText && !options.verbose) renderer.discardAgent();
 	else renderer.flushAgent();
+
+	process.stdout.write("\n── grinder ──\n");
+	if (status) process.stdout.write(`status: ${status}\n`);
+	if (state) process.stdout.write(`state: ${state}\n`);
+	if (contextSummary) process.stdout.write(`context: ${contextSummary}\n`);
+	process.stdout.write(`file: ${jsonlPath}\n`);
+	if (threadId) process.stdout.write(`thread: ${threadId}\n`);
+	if (finalText) process.stdout.write(`final: ${firstLine(finalText, 180)}\n`);
+	if (malformed > 0) process.stdout.write(`malformed lines skipped: ${malformed}\n`);
 }
 
 function parseInspectArgs(argv) {
@@ -557,10 +616,20 @@ function inspect(argv) {
 	inspectJsonl(jsonlPath, options);
 }
 
+function context(argv) {
+	if (argv.length !== 1) usage();
+	const summary = contextSummaryForFile(resolve(argv[0]));
+	if (summary) process.stdout.write(`${summary}\n`);
+}
+
 async function main() {
 	const [mode, ...args] = process.argv.slice(2);
 	if (mode === "stream") {
 		await streamJsonl(args[0]);
+		return;
+	}
+	if (mode === "context") {
+		context(args);
 		return;
 	}
 	if (mode === "inspect") {
