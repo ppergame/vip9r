@@ -90,8 +90,10 @@ pub(crate) struct UncompressedFrameHeader {
     pub(crate) error_resilient_mode: bool,
     pub(crate) intra_only: bool,
     pub(crate) frame_is_intra: bool,
+    pub(crate) reset_frame_context: u8,
     pub(crate) refresh_frame_context: bool,
     pub(crate) frame_parallel_decoding_mode: bool,
+    pub(crate) raw_frame_context_idx: u8,
     pub(crate) frame_context_idx: u8,
     pub(crate) refresh_frame_flags: u8,
     pub(crate) ref_frame_idx: [u8; REFS_PER_FRAME],
@@ -158,8 +160,10 @@ pub(crate) fn parse_uncompressed_frame_header(
             error_resilient_mode: false,
             intra_only: false,
             frame_is_intra: false,
+            reset_frame_context: 0,
             refresh_frame_context: false,
             frame_parallel_decoding_mode: false,
+            raw_frame_context_idx: 0,
             frame_context_idx: 0,
             refresh_frame_flags: 0,
             ref_frame_idx: [0; REFS_PER_FRAME],
@@ -199,6 +203,7 @@ pub(crate) fn parse_uncompressed_frame_header(
     let mut ref_frame_sign_bias = [false; SIGN_BIAS_FRAMES];
     let mut allow_high_precision_mv = false;
     let mut interpolation_filter = None;
+    let reset_frame_context;
     let frame_width;
     let frame_height;
     let render_width;
@@ -216,6 +221,7 @@ pub(crate) fn parse_uncompressed_frame_header(
         refresh_frame_flags = 0xff;
         intra_only = false;
         frame_is_intra = true;
+        reset_frame_context = 0;
     } else {
         intra_only = if show_frame {
             false
@@ -224,10 +230,10 @@ pub(crate) fn parse_uncompressed_frame_header(
         };
         frame_is_intra = intra_only;
 
-        let _reset_frame_context = if error_resilient_mode {
+        reset_frame_context = if error_resilient_mode {
             0
         } else {
-            reader.read_f(2)?
+            reader.read_f(2)? as u8
         };
 
         if intra_only {
@@ -273,7 +279,8 @@ pub(crate) fn parse_uncompressed_frame_header(
     } else {
         (reader.read_bool()?, reader.read_bool()?)
     };
-    let mut frame_context_idx = reader.read_f(2)? as u8;
+    let raw_frame_context_idx = reader.read_f(2)? as u8;
+    let mut frame_context_idx = raw_frame_context_idx;
     if frame_is_intra || error_resilient_mode {
         frame_context_idx = 0;
     }
@@ -297,8 +304,10 @@ pub(crate) fn parse_uncompressed_frame_header(
         error_resilient_mode,
         intra_only,
         frame_is_intra,
+        reset_frame_context,
         refresh_frame_context,
         frame_parallel_decoding_mode,
+        raw_frame_context_idx,
         frame_context_idx,
         refresh_frame_flags,
         ref_frame_idx,

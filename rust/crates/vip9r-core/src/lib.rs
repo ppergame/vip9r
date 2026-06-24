@@ -161,12 +161,16 @@ impl<SinkError> DecodeError<SinkError> {
 
 mod bitstream;
 mod boolcoder;
+mod compressed_header;
 mod error;
 mod header;
+mod probability;
 mod superframe;
 mod tile;
 
+use compressed_header::parse_intra_compressed_header;
 use header::{HeaderParserState, parse_uncompressed_frame_header};
+use probability::ProbabilityState;
 use superframe::split_superframe;
 use tile::parse_tile_layout;
 
@@ -174,6 +178,7 @@ use tile::parse_tile_layout;
 pub struct Decoder {
     options: DecoderOptions,
     header_state: HeaderParserState,
+    probability_state: ProbabilityState,
 }
 
 impl Decoder {
@@ -188,6 +193,7 @@ impl Decoder {
         Ok(Self {
             options,
             header_state: HeaderParserState::new(),
+            probability_state: ProbabilityState::new(),
         })
     }
 
@@ -217,11 +223,34 @@ impl Decoder {
             let header = parse_uncompressed_frame_header(frame, &header_state)
                 .map_err(|err| err.into_decode_error())?;
             self.validate_frame_limits(&header)?;
+            self.setup_frame_probability_state(&header)?;
 
             if !header.show_existing_frame && header.header_size_in_bytes != 0 {
-                let _compressed_header = frame
-                    .get(header.compressed_header_offset..header.tile_data_offset)
-                    .ok_or(DecodeError::InvalidBitstream)?;
+                if header.frame_is_intra {
+                    let compressed_header_data = frame
+                        .get(header.compressed_header_offset..header.tile_data_offset)
+                        .ok_or(DecodeError::InvalidBitstream)?;
+                    self.probability_state
+                        .load_probs(header.frame_context_idx)
+                        .map_err(|err| err.into_decode_error())?;
+                    self.probability_state
+                        .load_probs2(header.frame_context_idx)
+                        .map_err(|err| err.into_decode_error())?;
+
+                    let compressed_header = parse_intra_compressed_header(
+                        compressed_header_data,
+                        &header,
+                        self.probability_state.current_mut(),
+                    )
+                    .map_err(|err| err.into_decode_error())?;
+                    let _tx_mode = compressed_header.tx_mode;
+                    if header.refresh_frame_context {
+                        self.probability_state
+                            .save_probs(header.frame_context_idx)
+                            .map_err(|err| err.into_decode_error())?;
+                    }
+                }
+
                 let tile_layout =
                     parse_tile_layout(frame, &header).map_err(|err| err.into_decode_error())?;
                 let _tiles = tile_layout.as_slice();
@@ -236,6 +265,7 @@ impl Decoder {
 
     pub fn reset(&mut self) {
         self.header_state = HeaderParserState::new();
+        self.probability_state.reset();
     }
 
     fn validate_frame_limits<SinkError>(
@@ -249,6 +279,28 @@ impl Decoder {
             || required_i420_len(header.frame_width, header.frame_height).is_none()
         {
             return Err(DecodeError::ResourceLimit);
+        }
+        Ok(())
+    }
+
+    fn setup_frame_probability_state<SinkError>(
+        &mut self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Result<(), DecodeError<SinkError>> {
+        if !header.frame_is_intra && !header.error_resilient_mode {
+            return Ok(());
+        }
+
+        self.probability_state.setup_past_independence();
+        if header.frame_type == header::FrameType::Key
+            || header.error_resilient_mode
+            || header.reset_frame_context == 3
+        {
+            self.probability_state.reset_all_contexts();
+        } else if header.reset_frame_context == 2 {
+            self.probability_state
+                .save_probs(header.raw_frame_context_idx)
+                .map_err(|err| err.into_decode_error())?;
         }
         Ok(())
     }
@@ -315,8 +367,11 @@ fn copy_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, FrameCopyErr
 
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
+
     use super::{
-        Decoder, DecoderLimits, DecoderOptions, FrameInfo, I420Frame, Plane, required_i420_len,
+        DecodeError, Decoder, DecoderLimits, DecoderOptions, FrameInfo, FrameSink, I420Frame,
+        Plane, required_i420_len,
     };
 
     #[test]
@@ -433,6 +488,106 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+        }
+    }
+
+    #[test]
+    fn decode_packet_reaches_unimplemented_tile_boundary_after_valid_intra_compressed_header() {
+        let frame = minimal_lossless_key_frame();
+        let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(16, 16))).unwrap();
+        let mut sink = NullSink;
+
+        assert_eq!(
+            decoder.decode_packet(&frame, &mut sink),
+            Err(DecodeError::Unimplemented)
+        );
+    }
+
+    struct NullSink;
+
+    impl FrameSink for NullSink {
+        type Error = Infallible;
+
+        fn frame(&mut self, _frame: I420Frame<'_>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn minimal_lossless_key_frame() -> [u8; 128] {
+        let mut builder = HeaderBuilder::new();
+        builder.f(0b10, 2); // frame marker
+        builder.f(0, 1); // profile low
+        builder.f(0, 1); // profile high
+        builder.f(0, 1); // not show existing frame
+        builder.f(0, 1); // key frame
+        builder.f(1, 1); // show frame
+        builder.f(0, 1); // not error resilient
+        builder.f(0x49, 8);
+        builder.f(0x83, 8);
+        builder.f(0x42, 8);
+        builder.f(1, 3); // BT.601 color space
+        builder.f(0, 1); // studio range
+        builder.f(15, 16); // width - 1
+        builder.f(15, 16); // height - 1
+        builder.f(0, 1); // render size matches frame size
+        builder.f(1, 1); // refresh frame context
+        builder.f(0, 1); // frame parallel decoding mode
+        builder.f(0, 2); // frame context idx (reset to 0 for intra frames)
+        builder.f(0, 6); // loop filter level
+        builder.f(0, 3); // loop filter sharpness
+        builder.f(0, 1); // loop filter delta disabled
+        builder.f(0, 8); // base q idx
+        builder.f(0, 1); // y dc delta absent
+        builder.f(0, 1); // uv dc delta absent
+        builder.f(0, 1); // uv ac delta absent
+        builder.f(0, 1); // segmentation disabled
+        builder.f(0, 1); // tile rows log2
+        builder.f(2, 16); // compressed header size
+        builder.byte_align_zero();
+        builder.byte(0x00); // compressed header initial BoolValue
+        builder.byte(0x00); // compressed header zero padding
+        builder.byte(0x00); // one tile payload byte; tile decode is still unimplemented
+        builder.finish()
+    }
+
+    struct HeaderBuilder {
+        data: [u8; 128],
+        bit_len: usize,
+    }
+
+    impl HeaderBuilder {
+        fn new() -> Self {
+            Self {
+                data: [0; 128],
+                bit_len: 0,
+            }
+        }
+
+        fn f(&mut self, value: u32, bits: u8) {
+            for bit_index in (0..bits).rev() {
+                let bit = ((value >> bit_index) & 1) as u8;
+                let byte_index = self.bit_len / 8;
+                let bit_in_byte = 7 - (self.bit_len & 7);
+                self.data[byte_index] |= bit << bit_in_byte;
+                self.bit_len += 1;
+            }
+        }
+
+        fn byte_align_zero(&mut self) {
+            while self.bit_len & 7 != 0 {
+                self.f(0, 1);
+            }
+        }
+
+        fn byte(&mut self, value: u8) {
+            self.byte_align_zero();
+            let byte_index = self.bit_len / 8;
+            self.data[byte_index] = value;
+            self.bit_len += 8;
+        }
+
+        fn finish(self) -> [u8; 128] {
+            self.data
         }
     }
 }

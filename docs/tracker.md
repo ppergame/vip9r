@@ -47,6 +47,7 @@ harness.
 - [x] tile payload layout validation
 - [x] boolean decoder primitive
 - [x] retain uncompressed-header state needed by compressed-header parsing
+- [x] intra compressed-header parser and default tx/skip/coef probability state
 - [ ] decompose the decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 
