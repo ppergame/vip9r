@@ -34,6 +34,12 @@ struct QuantizationParams {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentationParams {
+    enabled: bool,
+    update_map: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReferenceFrameInfo {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -109,6 +115,8 @@ pub(crate) struct UncompressedFrameHeader {
     pub(crate) delta_q_uv_dc: i32,
     pub(crate) delta_q_uv_ac: i32,
     pub(crate) lossless: bool,
+    pub(crate) segmentation_enabled: bool,
+    pub(crate) segmentation_update_map: bool,
     pub(crate) tile_cols_log2: u8,
     pub(crate) tile_rows_log2: u8,
     pub(crate) header_size_in_bytes: usize,
@@ -179,6 +187,8 @@ pub(crate) fn parse_uncompressed_frame_header(
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless: false,
+            segmentation_enabled: false,
+            segmentation_update_map: false,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             header_size_in_bytes: 0,
@@ -287,7 +297,7 @@ pub(crate) fn parse_uncompressed_frame_header(
 
     loop_filter_params(&mut reader)?;
     let quantization = quantization_params(&mut reader)?;
-    segmentation_params(&mut reader)?;
+    let segmentation = segmentation_params(&mut reader)?;
     let tile_info = tile_info(&mut reader, frame_width)?;
     let header_size_in_bytes =
         usize::try_from(reader.read_f(16)?).map_err(|_| ParserError::InvalidBitstream)?;
@@ -323,6 +333,8 @@ pub(crate) fn parse_uncompressed_frame_header(
         delta_q_uv_dc: quantization.delta_q_uv_dc,
         delta_q_uv_ac: quantization.delta_q_uv_ac,
         lossless: quantization.lossless,
+        segmentation_enabled: segmentation.enabled,
+        segmentation_update_map: segmentation.update_map,
         tile_cols_log2: tile_info.0,
         tile_rows_log2: tile_info.1,
         header_size_in_bytes,
@@ -518,10 +530,13 @@ fn read_delta_q(reader: &mut FixedBitReader<'_>) -> Result<i32, ParserError> {
     }
 }
 
-fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
+fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<SegmentationParams, ParserError> {
     let segmentation_enabled = reader.read_bool()?;
     if !segmentation_enabled {
-        return Ok(());
+        return Ok(SegmentationParams {
+            enabled: false,
+            update_map: false,
+        });
     }
 
     let segmentation_update_map = reader.read_bool()?;
@@ -561,7 +576,10 @@ fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserErro
         }
     }
 
-    Ok(())
+    Ok(SegmentationParams {
+        enabled: true,
+        update_map: segmentation_update_map,
+    })
 }
 
 fn read_prob(reader: &mut FixedBitReader<'_>) -> Result<u8, ParserError> {

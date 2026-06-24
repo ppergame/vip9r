@@ -30,7 +30,7 @@ impl TxMode {
         }
     }
 
-    fn biggest_tx_size(self) -> usize {
+    pub(crate) fn biggest_tx_size(self) -> usize {
         match self {
             Self::Only4x4 => 0,
             Self::Allow8x8 => 1,
@@ -305,6 +305,8 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless,
+            segmentation_enabled: false,
+            segmentation_update_map: false,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             header_size_in_bytes: 2,

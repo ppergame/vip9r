@@ -304,6 +304,8 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless: true,
+            segmentation_enabled: false,
+            segmentation_update_map: false,
             tile_cols_log2,
             tile_rows_log2,
             header_size_in_bytes: tile_data_offset,

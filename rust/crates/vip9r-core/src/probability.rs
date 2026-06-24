@@ -79,6 +79,10 @@ impl ProbabilityState {
         &mut self.current
     }
 
+    pub(crate) fn current(&self) -> &FrameContext {
+        &self.current
+    }
+
     fn context(&self, ctx: u8) -> Result<FrameContext, ParserError> {
         self.contexts
             .get(usize::from(ctx))

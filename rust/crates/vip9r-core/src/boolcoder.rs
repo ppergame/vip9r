@@ -68,6 +68,32 @@ impl<'a> BoolDecoder<'a> {
         Ok(value)
     }
 
+    pub(crate) fn read_tree(
+        &mut self,
+        tree: &[i8],
+        probabilities: &[u8],
+    ) -> Result<u8, ParserError> {
+        let mut index = 0usize;
+        loop {
+            let probability = probabilities
+                .get(index >> 1)
+                .copied()
+                .ok_or(ParserError::InvalidBitstream)?;
+            let bit = usize::from(self.read_bool(probability)?);
+            let next = *tree
+                .get(
+                    index
+                        .checked_add(bit)
+                        .ok_or(ParserError::InvalidBitstream)?,
+                )
+                .ok_or(ParserError::InvalidBitstream)?;
+            if next <= 0 {
+                return u8::try_from(-next).map_err(|_| ParserError::InvalidBitstream);
+            }
+            index = usize::try_from(next).map_err(|_| ParserError::InvalidBitstream)?;
+        }
+    }
+
     pub(crate) fn finish(mut self) -> Result<(), ParserError> {
         while self.has_input_bit()? {
             if self.read_input_bit()? != 0 {
@@ -192,5 +218,17 @@ mod tests {
         let mut full_probability = BoolDecoder::new(&[0x7f, 0x00]).unwrap();
         assert_eq!(full_probability.read_bool(255), Ok(true));
         assert_eq!(full_probability.finish(), Ok(()));
+    }
+
+    #[test]
+    fn read_tree_decodes_zero_valued_leaf_and_internal_nodes() {
+        const TREE: [i8; 4] = [0, 2, -1, -2];
+        const PROBS: [u8; 2] = [128, 128];
+
+        let mut zero_leaf = BoolDecoder::new(&[0x00, 0x00]).unwrap();
+        assert_eq!(zero_leaf.read_tree(&TREE, &PROBS), Ok(0));
+
+        let mut one_leaf = BoolDecoder::new(&[0x40, 0x00]).unwrap();
+        assert_eq!(one_leaf.read_tree(&TREE, &PROBS), Ok(1));
     }
 }

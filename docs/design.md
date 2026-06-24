@@ -37,6 +37,11 @@ localize, but the tap points and granularity should follow the implementation we
 actually have. Do not commit the project to libvpx component boundaries just
 because they are available to instrument.
 
+Spec note: the local VP9 v0.7 draft's partition probability prose appears to
+reverse the `FrameIsIntra` condition. The decoder uses the fixed
+`kf_partition_probs` table for key/intra frame partition syntax, matching the
+table naming and key-frame syntax context.
+
 ### Golden harness
 
 A host-side harness decodes a vector frame by frame and compares per-frame md5

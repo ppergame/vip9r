@@ -167,12 +167,14 @@ mod header;
 mod probability;
 mod superframe;
 mod tile;
+mod tile_syntax;
 
 use compressed_header::parse_intra_compressed_header;
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::ProbabilityState;
 use superframe::split_superframe;
 use tile::parse_tile_layout;
+use tile_syntax::parse_intra_tiles;
 
 #[derive(Debug)]
 pub struct Decoder {
@@ -226,6 +228,7 @@ impl Decoder {
             self.setup_frame_probability_state(&header)?;
 
             if !header.show_existing_frame && header.header_size_in_bytes != 0 {
+                let mut compressed_header = None;
                 if header.frame_is_intra {
                     let compressed_header_data = frame
                         .get(header.compressed_header_offset..header.tile_data_offset)
@@ -237,13 +240,13 @@ impl Decoder {
                         .load_probs2(header.frame_context_idx)
                         .map_err(|err| err.into_decode_error())?;
 
-                    let compressed_header = parse_intra_compressed_header(
+                    let parsed_compressed_header = parse_intra_compressed_header(
                         compressed_header_data,
                         &header,
                         self.probability_state.current_mut(),
                     )
                     .map_err(|err| err.into_decode_error())?;
-                    let _tx_mode = compressed_header.tx_mode;
+                    compressed_header = Some(parsed_compressed_header);
                     if header.refresh_frame_context {
                         self.probability_state
                             .save_probs(header.frame_context_idx)
@@ -253,7 +256,18 @@ impl Decoder {
 
                 let tile_layout =
                     parse_tile_layout(frame, &header).map_err(|err| err.into_decode_error())?;
-                let _tiles = tile_layout.as_slice();
+                if header.frame_is_intra {
+                    let compressed_header =
+                        compressed_header.ok_or(DecodeError::InvalidBitstream)?;
+                    parse_intra_tiles(
+                        frame,
+                        &header,
+                        &compressed_header,
+                        self.probability_state.current(),
+                        &tile_layout,
+                    )
+                    .map_err(|err| err.into_decode_error())?;
+                }
             }
 
             header_state.update_references(&header);

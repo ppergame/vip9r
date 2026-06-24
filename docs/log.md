@@ -66,3 +66,17 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   preserved.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-24 — VP9 intra tile mode info
+
+- rev: jj `kmtukkoy`
+- Added key/intra tile boolean syntax through the residual handoff: partition
+  tree decoding, fixed key-frame partition/Y/UV probability tables, above/left
+  partition and mode contexts, skip and transform-size parsing, and
+  segmentation-disabled intra mode-info parsing.
+- `Decoder::decode_packet` now enters key/intra tile payloads after tile-layout
+  validation and stops at the expected residual `Unimplemented` boundary.
+  Segmentation-enabled intra tile syntax is explicitly unimplemented rather than
+  silently misparsed.
+- Golden smoke on `bear-vp9.ivf` still stops at
+  `decode packet 0 timestamp 0: Unimplemented`.
