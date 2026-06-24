@@ -36,8 +36,7 @@ before reviewing.
 
 Workspace crates:
 
-- `vip9r-core` - decoder library, tests and tooling. Builds for the host with
-  `std`.
+- `vip9r-core` - decoder library and tests. Builds for the host with `std`.
 - `vip9r-tools` - host-native tooling, currently including the IVF frame md5
   golden harness.
 - `vip9r-wasm` - wasm wrapper
