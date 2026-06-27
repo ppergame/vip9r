@@ -57,7 +57,7 @@ harness.
       `InvalidBitstream` after probability refresh
 - [x] resolve `bear-vp9.ivf` packet 25 inter tile syntax
       `InvalidBitstream` after previous-frame MV candidates
-- [ ] move previous-frame MV mode-history storage from the std-only host parser
+- [x] move previous-frame MV mode-history storage from the std-only host parser
       path into workspace/no-std state before relying on wasm parity
 - [ ] decompose the remaining decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete

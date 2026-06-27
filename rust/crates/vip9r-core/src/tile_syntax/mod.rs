@@ -13,8 +13,11 @@ use crate::tile::{TileDescriptor, TileLayout};
 mod tables;
 use tables::*;
 
-const MAX_MIS: usize = 8192;
-const MAX_4X4S: usize = MAX_MIS * 2;
+// Above contexts are column-indexed, not frame-MI indexed. 512 MI columns covers
+// 4096px-wide frames, comfortably above the current 720p target and 1080p
+// stretch, while keeping no-std/wasm stack use bounded.
+const MAX_MI_COLS: usize = 512;
+const MAX_4X4_COLS: usize = MAX_MI_COLS * 2;
 const MI_SIZE_PIXELS: u32 = 8;
 const MI_BLOCK_64: usize = 8;
 const PLANES: usize = 3;
@@ -78,7 +81,7 @@ pub(crate) fn parse_intra_tiles(
     probabilities: &FrameContext,
     counts: &mut SyntaxCounts,
     layout: &TileLayout,
-    current_frame_modes: Option<&mut [StoredModeInfo]>,
+    mut mode_buffers: FrameModeBuffers<'_>,
 ) -> Result<(), TileSyntaxError> {
     if !header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -91,7 +94,6 @@ pub(crate) fn parse_intra_tiles(
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
     let mut contexts = TileModeContexts::new(mi_cols)?;
-    let mut mode_buffers = FrameModeBuffers::current(current_frame_modes);
 
     for tile in layout.as_slice() {
         let config = TileParserConfig {
@@ -281,8 +283,8 @@ struct TileParser<'a, 'b> {
     tile_col_start: usize,
     tile_col_end: usize,
     left_row_base: usize,
-    prev_frame_modes: Option<&'b [StoredModeInfo]>,
-    current_frame_modes: Option<&'b mut [StoredModeInfo]>,
+    prev_frame_modes: Option<ModeInfoView<'b>>,
+    current_frame_modes: Option<ModeInfoViewMut<'b>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -520,7 +522,7 @@ impl TileParser<'_, '_> {
         block_size: BlockSize,
         block: DecodedBlockInfo,
     ) -> Result<(), TileSyntaxError> {
-        let Some(current_frame_modes) = self.current_frame_modes.as_deref_mut() else {
+        let Some(current_frame_modes) = self.current_frame_modes.as_mut() else {
             return Ok(());
         };
 
@@ -555,10 +557,7 @@ impl TileParser<'_, '_> {
                     .checked_mul(self.mi_cols)
                     .and_then(|value| value.checked_add(mode_col))
                     .ok_or(TileSyntaxError::InvalidBitstream)?;
-                let slot = current_frame_modes
-                    .get_mut(index)
-                    .ok_or(TileSyntaxError::InvalidBitstream)?;
-                *slot = stored;
+                current_frame_modes.set(index, stored)?;
             }
         }
         Ok(())
@@ -1331,15 +1330,12 @@ impl TileParser<'_, '_> {
         // current block.  The 1-D above/left probability contexts only describe
         // immediate neighbours, so use the exact decoded mode grid when it is
         // available.
-        if let Some(current_frame_modes) = self.current_frame_modes.as_deref() {
+        if let Some(current_frame_modes) = self.current_frame_modes.as_ref() {
             let index = candidate_r
                 .checked_mul(self.mi_cols)
                 .and_then(|value| value.checked_add(candidate_c))
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let info = current_frame_modes
-                .get(index)
-                .copied()
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let info = current_frame_modes.get(index)?;
             return Ok(info.valid.then_some(CandidateModeInfo::from(info)));
         }
         if candidate_r < self.left_row_base {
@@ -1381,10 +1377,7 @@ impl TileParser<'_, '_> {
             .checked_mul(self.mi_cols)
             .and_then(|value| value.checked_add(col))
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let info = prev_frame_modes
-            .get(index)
-            .copied()
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let info = prev_frame_modes.get(index)?;
         Ok(info.valid.then_some(info))
     }
 
@@ -1776,34 +1769,96 @@ pub(crate) struct StoredModeInfo {
     sub_mvs: [[MotionVector; SUB_BLOCKS]; REF_LISTS],
 }
 
-impl StoredModeInfo {
-    #[cfg(feature = "std")]
-    pub(crate) const DEFAULT: Self = Self {
-        valid: false,
-        y_mode: IntraMode::Dc as u8,
-        ref_frames: [INTRA_FRAME, NONE_FRAME],
-        mvs: [MotionVector::ZERO; REF_LISTS],
-        sub_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
-    };
+const STORED_MODE_INFO_VALID_OFFSET: usize = 0;
+const STORED_MODE_INFO_Y_MODE_OFFSET: usize = 1;
+const STORED_MODE_INFO_REF_FRAMES_OFFSET: usize = 2;
+const STORED_MODE_INFO_MVS_OFFSET: usize = 4;
+const STORED_MODE_INFO_SUB_MVS_OFFSET: usize = 12;
+
+pub(crate) const STORED_MODE_INFO_BYTES: usize = 44;
+
+pub(crate) fn mode_info_byte_len(mi_count: usize) -> Option<usize> {
+    mi_count.checked_mul(STORED_MODE_INFO_BYTES)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModeInfoView<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> ModeInfoView<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Result<Self, DecodeError> {
+        if !data.len().is_multiple_of(STORED_MODE_INFO_BYTES) {
+            return Err(DecodeError::InvalidConfig);
+        }
+        Ok(Self { data })
+    }
+
+    fn get(self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
+        let start = mode_info_offset(index)?;
+        let end = start
+            .checked_add(STORED_MODE_INFO_BYTES)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let entry = self
+            .data
+            .get(start..end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        decode_stored_mode_info(entry)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ModeInfoViewMut<'a> {
+    data: &'a mut [u8],
+}
+
+impl<'a> ModeInfoViewMut<'a> {
+    pub(crate) fn new(data: &'a mut [u8]) -> Result<Self, DecodeError> {
+        if !data.len().is_multiple_of(STORED_MODE_INFO_BYTES) {
+            return Err(DecodeError::InvalidConfig);
+        }
+        Ok(Self { data })
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.data.fill(0);
+    }
+
+    fn as_view(&self) -> ModeInfoView<'_> {
+        ModeInfoView { data: self.data }
+    }
+
+    fn reborrow(&mut self) -> ModeInfoViewMut<'_> {
+        ModeInfoViewMut { data: self.data }
+    }
+
+    fn get(&self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
+        self.as_view().get(index)
+    }
+
+    fn set(&mut self, index: usize, info: StoredModeInfo) -> Result<(), TileSyntaxError> {
+        let start = mode_info_offset(index)?;
+        let end = start
+            .checked_add(STORED_MODE_INFO_BYTES)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let entry = self
+            .data
+            .get_mut(start..end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        encode_stored_mode_info(info, entry);
+        Ok(())
+    }
 }
 
 pub(crate) struct FrameModeBuffers<'a> {
     use_prev_frame_mvs: bool,
-    prev_frame_modes: Option<&'a [StoredModeInfo]>,
-    current_frame_modes: Option<&'a mut [StoredModeInfo]>,
+    prev_frame_modes: Option<ModeInfoView<'a>>,
+    current_frame_modes: Option<ModeInfoViewMut<'a>>,
 }
 
 impl<'a> FrameModeBuffers<'a> {
-    #[cfg(not(feature = "std"))]
-    pub(crate) const fn none() -> Self {
-        Self {
-            use_prev_frame_mvs: false,
-            prev_frame_modes: None,
-            current_frame_modes: None,
-        }
-    }
-
-    pub(crate) const fn current(current_frame_modes: Option<&'a mut [StoredModeInfo]>) -> Self {
+    #[cfg(test)]
+    pub(crate) const fn current(current_frame_modes: Option<ModeInfoViewMut<'a>>) -> Self {
         Self {
             use_prev_frame_mvs: false,
             prev_frame_modes: None,
@@ -1811,11 +1866,10 @@ impl<'a> FrameModeBuffers<'a> {
         }
     }
 
-    #[cfg(feature = "std")]
     pub(crate) const fn new(
         use_prev_frame_mvs: bool,
-        prev_frame_modes: Option<&'a [StoredModeInfo]>,
-        current_frame_modes: Option<&'a mut [StoredModeInfo]>,
+        prev_frame_modes: Option<ModeInfoView<'a>>,
+        current_frame_modes: Option<ModeInfoViewMut<'a>>,
     ) -> Self {
         Self {
             use_prev_frame_mvs,
@@ -1828,9 +1882,108 @@ impl<'a> FrameModeBuffers<'a> {
         FrameModeBuffers {
             use_prev_frame_mvs: self.use_prev_frame_mvs,
             prev_frame_modes: self.prev_frame_modes,
-            current_frame_modes: self.current_frame_modes.as_deref_mut(),
+            current_frame_modes: self
+                .current_frame_modes
+                .as_mut()
+                .map(ModeInfoViewMut::reborrow),
         }
     }
+}
+
+fn mode_info_offset(index: usize) -> Result<usize, TileSyntaxError> {
+    index
+        .checked_mul(STORED_MODE_INFO_BYTES)
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+fn decode_stored_mode_info(bytes: &[u8]) -> Result<StoredModeInfo, TileSyntaxError> {
+    if bytes.len() != STORED_MODE_INFO_BYTES {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let valid = bytes[STORED_MODE_INFO_VALID_OFFSET] != 0;
+    let y_mode = bytes[STORED_MODE_INFO_Y_MODE_OFFSET];
+    let ref_frames = [
+        bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET],
+        bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1],
+    ];
+
+    let mut mvs = [MotionVector::ZERO; REF_LISTS];
+    let mut offset = STORED_MODE_INFO_MVS_OFFSET;
+    for mv in &mut mvs {
+        *mv = decode_motion_vector(bytes, offset)?;
+        offset += 4;
+    }
+
+    let mut sub_mvs = [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS];
+    offset = STORED_MODE_INFO_SUB_MVS_OFFSET;
+    for ref_mvs in &mut sub_mvs {
+        for mv in ref_mvs {
+            *mv = decode_motion_vector(bytes, offset)?;
+            offset += 4;
+        }
+    }
+
+    Ok(StoredModeInfo {
+        valid,
+        y_mode,
+        ref_frames,
+        mvs,
+        sub_mvs,
+    })
+}
+
+fn encode_stored_mode_info(info: StoredModeInfo, bytes: &mut [u8]) {
+    debug_assert_eq!(bytes.len(), STORED_MODE_INFO_BYTES);
+    bytes.fill(0);
+    bytes[STORED_MODE_INFO_VALID_OFFSET] = u8::from(info.valid);
+    bytes[STORED_MODE_INFO_Y_MODE_OFFSET] = info.y_mode;
+    bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET] = info.ref_frames[0];
+    bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1] = info.ref_frames[1];
+
+    let mut offset = STORED_MODE_INFO_MVS_OFFSET;
+    for mv in info.mvs {
+        encode_motion_vector(mv, bytes, offset);
+        offset += 4;
+    }
+
+    offset = STORED_MODE_INFO_SUB_MVS_OFFSET;
+    for ref_mvs in info.sub_mvs {
+        for mv in ref_mvs {
+            encode_motion_vector(mv, bytes, offset);
+            offset += 4;
+        }
+    }
+}
+
+fn decode_motion_vector(bytes: &[u8], offset: usize) -> Result<MotionVector, TileSyntaxError> {
+    let row = read_i16_le(bytes, offset)?;
+    let col_offset = offset
+        .checked_add(2)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let col = read_i16_le(bytes, col_offset)?;
+    Ok(MotionVector { row, col })
+}
+
+fn encode_motion_vector(mv: MotionVector, bytes: &mut [u8], offset: usize) {
+    write_i16_le(mv.row, bytes, offset);
+    write_i16_le(mv.col, bytes, offset + 2);
+}
+
+fn read_i16_le(bytes: &[u8], offset: usize) -> Result<i16, TileSyntaxError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let raw = bytes
+        .get(offset..end)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    Ok(i16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn write_i16_le(value: i16, bytes: &mut [u8], offset: usize) {
+    let raw = value.to_le_bytes();
+    bytes[offset] = raw[0];
+    bytes[offset + 1] = raw[1];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1895,9 +2048,9 @@ impl MvRefState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TileModeContexts {
-    above_partition: [u8; MAX_MIS],
-    above_mode: [NeighborModeInfo; MAX_MIS],
-    above_nonzero: [[u8; MAX_4X4S]; PLANES],
+    above_partition: [u8; MAX_MI_COLS],
+    above_mode: [NeighborModeInfo; MAX_MI_COLS],
+    above_nonzero: [[u8; MAX_4X4_COLS]; PLANES],
     left_partition: [u8; MI_BLOCK_64],
     left_mode: [NeighborModeInfo; MI_BLOCK_64],
     left_nonzero: [[u8; MI_BLOCK_64 * 2]; PLANES],
@@ -1911,14 +2064,14 @@ impl TileModeContexts {
             .checked_add(MI_BLOCK_64 - 1)
             .map(|cols| (cols / MI_BLOCK_64) * MI_BLOCK_64)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        if mi_cols == 0 || mi_cols > MAX_MIS || partition_cols > MAX_MIS {
+        if mi_cols == 0 || mi_cols > MAX_MI_COLS || partition_cols > MAX_MI_COLS {
             return Err(TileSyntaxError::InvalidBitstream);
         }
 
         Ok(Self {
-            above_partition: [0; MAX_MIS],
-            above_mode: [NeighborModeInfo::DEFAULT; MAX_MIS],
-            above_nonzero: [[0; MAX_4X4S]; PLANES],
+            above_partition: [0; MAX_MI_COLS],
+            above_mode: [NeighborModeInfo::DEFAULT; MAX_MI_COLS],
+            above_nonzero: [[0; MAX_4X4_COLS]; PLANES],
             left_partition: [0; MI_BLOCK_64],
             left_mode: [NeighborModeInfo::DEFAULT; MI_BLOCK_64],
             left_nonzero: [[0; MI_BLOCK_64 * 2]; PLANES],
@@ -3667,9 +3820,10 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockSize, CoefToken, DecodedBlockInfo, INTRA_FRAME, IntraMode, LAST_FRAME, MotionVector,
-        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL,
-        StoredModeInfo, TileModeContexts, TileParser, TileSyntaxError, TxSize, ZEROMV,
+        BlockSize, CoefToken, DecodedBlockInfo, FrameModeBuffers, INTRA_FRAME, IntraMode,
+        LAST_FRAME, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
+        NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, StoredModeInfo,
+        TileModeContexts, TileParser, TileSyntaxError, TxSize, ZEROMV, mode_info_byte_len,
         parse_intra_tiles,
     };
     use crate::boolcoder::BoolDecoder;
@@ -3694,7 +3848,7 @@ mod tests {
                 &FrameContext::DEFAULT,
                 &mut counts,
                 &layout,
-                None
+                FrameModeBuffers::current(None)
             ),
             Ok(())
         );
@@ -3856,6 +4010,40 @@ mod tests {
     }
 
     #[test]
+    fn packed_mode_info_round_trips_motion_vectors() {
+        let info = StoredModeInfo {
+            valid: true,
+            y_mode: NEARESTMV,
+            ref_frames: [LAST_FRAME, NONE_FRAME],
+            mvs: [
+                MotionVector { row: -123, col: 45 },
+                MotionVector { row: 67, col: -89 },
+            ],
+            sub_mvs: [
+                [
+                    MotionVector { row: 1, col: 2 },
+                    MotionVector { row: 3, col: 4 },
+                    MotionVector { row: 5, col: 6 },
+                    MotionVector { row: 7, col: 8 },
+                ],
+                [
+                    MotionVector { row: -1, col: -2 },
+                    MotionVector { row: -3, col: -4 },
+                    MotionVector { row: -5, col: -6 },
+                    MotionVector { row: -7, col: -8 },
+                ],
+            ],
+        };
+        let mut bytes = vec![0; mode_info_byte_len(2).unwrap()];
+        let mut view = ModeInfoViewMut::new(&mut bytes).unwrap();
+
+        view.set(1, info).unwrap();
+
+        assert!(!ModeInfoView::new(&bytes).unwrap().get(0).unwrap().valid);
+        assert_eq!(ModeInfoView::new(&bytes).unwrap().get(1), Ok(info));
+    }
+
+    #[test]
     fn mv_ref_candidate_uses_exact_current_frame_history_for_deep_offsets() {
         let probabilities = FrameContext::DEFAULT;
         let mut contexts = TileModeContexts::new(8).unwrap();
@@ -3874,14 +4062,20 @@ mod tests {
             MotionVector { row: 5, col: 6 },
             MotionVector { row: 7, col: 8 },
         ];
-        let mut current_modes = [StoredModeInfo::DEFAULT; 64];
-        current_modes[8 + 4] = StoredModeInfo {
-            valid: true,
-            y_mode: NEARESTMV,
-            ref_frames: [LAST_FRAME, NONE_FRAME],
-            mvs: [exact_mv, MotionVector::ZERO],
-            sub_mvs: [exact_sub_mvs, [MotionVector::ZERO; SUB_BLOCKS]],
-        };
+        let mut current_mode_bytes = vec![0; mode_info_byte_len(64).unwrap()];
+        let mut current_modes = ModeInfoViewMut::new(&mut current_mode_bytes).unwrap();
+        current_modes
+            .set(
+                8 + 4,
+                StoredModeInfo {
+                    valid: true,
+                    y_mode: NEARESTMV,
+                    ref_frames: [LAST_FRAME, NONE_FRAME],
+                    mvs: [exact_mv, MotionVector::ZERO],
+                    sub_mvs: [exact_sub_mvs, [MotionVector::ZERO; SUB_BLOCKS]],
+                },
+            )
+            .unwrap();
 
         let mut counts = SyntaxCounts::default();
         let parser = TileParser {
@@ -3904,7 +4098,7 @@ mod tests {
             tile_col_end: 8,
             left_row_base: 0,
             prev_frame_modes: None,
-            current_frame_modes: Some(&mut current_modes),
+            current_frame_modes: Some(current_modes),
         };
 
         let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();
@@ -3930,7 +4124,7 @@ mod tests {
                 &FrameContext::DEFAULT,
                 &mut counts,
                 &layout,
-                None
+                FrameModeBuffers::current(None)
             ),
             Err(TileSyntaxError::Unimplemented)
         );

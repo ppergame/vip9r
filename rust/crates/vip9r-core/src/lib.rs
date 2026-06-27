@@ -17,14 +17,16 @@ use compressed_header::{
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
-#[cfg(feature = "std")]
-use tile_syntax::StoredModeInfo;
-use tile_syntax::{FrameModeBuffers, parse_inter_tiles, parse_intra_tiles};
+use tile_syntax::{
+    FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len, parse_inter_tiles,
+    parse_intra_tiles,
+};
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
 
 const REFERENCE_FRAME_SLOTS: usize = 8;
 const FRAME_POOL_SLOTS: usize = 1 + REFERENCE_FRAME_SLOTS;
+const MODE_HISTORY_SLOTS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodedFrameRange {
@@ -73,17 +75,22 @@ pub struct WorkspaceLayout {
     max_width: u32,
     max_height: u32,
     frame_pool: FramePoolLayout,
+    mode_history: ModeHistoryLayout,
 }
 
 impl WorkspaceLayout {
     pub fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
         validate_limits(max_width, max_height)?;
         let frame_pool = FramePoolLayout::new(FrameLayout::new(max_width, max_height)?)?;
+        let max_mi_count =
+            frame_mi_count(max_width, max_height).map_err(|_| DecodeError::InvalidConfig)?;
+        let mode_history = ModeHistoryLayout::new(frame_pool.total_bytes(), max_mi_count)?;
 
         Ok(Self {
             max_width,
             max_height,
             frame_pool,
+            mode_history,
         })
     }
 
@@ -96,7 +103,7 @@ impl WorkspaceLayout {
     }
 
     pub fn total_bytes(self) -> usize {
-        self.frame_pool.total_bytes()
+        self.mode_history.total_bytes()
     }
 }
 
@@ -131,6 +138,49 @@ impl FramePoolLayout {
         self.references[REFERENCE_FRAME_SLOTS - 1]
             .end()
             .expect("frame-pool layout was checked at construction")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModeHistoryLayout {
+    slots: [ByteRange; MODE_HISTORY_SLOTS],
+}
+
+impl ModeHistoryLayout {
+    fn new(start: usize, max_mi_count: usize) -> Result<Self, DecodeError> {
+        let slot_bytes = mode_info_byte_len(max_mi_count).ok_or(DecodeError::InvalidConfig)?;
+        let mut slots = [ByteRange::empty(); MODE_HISTORY_SLOTS];
+        let mut next_start = start;
+        for slot in &mut slots {
+            *slot = ByteRange::new(next_start, slot_bytes)?;
+            next_start = slot.end()?;
+        }
+        Ok(Self { slots })
+    }
+
+    fn total_bytes(self) -> usize {
+        self.slots[MODE_HISTORY_SLOTS - 1]
+            .end()
+            .expect("mode-history layout was checked at construction")
+    }
+
+    fn slot_len(self) -> usize {
+        self.slots[0].len
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModeHistorySlot {
+    Slot0,
+    Slot1,
+}
+
+impl ModeHistorySlot {
+    const fn other(self) -> Self {
+        match self {
+            Self::Slot0 => Self::Slot1,
+            Self::Slot1 => Self::Slot0,
+        }
     }
 }
 
@@ -220,7 +270,7 @@ impl PlaneLayout {
 #[derive(Debug)]
 pub struct DecodeWorkspace<'a> {
     layout: WorkspaceLayout,
-    _memory: &'a mut [u8],
+    memory: &'a mut [u8],
 }
 
 impl<'a> DecodeWorkspace<'a> {
@@ -231,7 +281,7 @@ impl<'a> DecodeWorkspace<'a> {
         }
         Ok(Self {
             layout,
-            _memory: &mut memory[..total_bytes],
+            memory: &mut memory[..total_bytes],
         })
     }
 
@@ -240,6 +290,75 @@ impl<'a> DecodeWorkspace<'a> {
             return Err(DecodeError::InvalidConfig);
         }
         Ok(())
+    }
+
+    fn mode_history_buffers(
+        &mut self,
+        use_prev_frame_mvs: bool,
+        previous_slot: Option<ModeHistorySlot>,
+        current_slot: ModeHistorySlot,
+        mi_count: usize,
+    ) -> Result<FrameModeBuffers<'_>, DecodeError> {
+        let previous_slot = if use_prev_frame_mvs {
+            previous_slot
+        } else {
+            None
+        };
+        let (previous, mut current) =
+            self.mode_history_views(previous_slot, current_slot, mi_count)?;
+        current.clear();
+        Ok(FrameModeBuffers::new(
+            use_prev_frame_mvs && previous.is_some(),
+            previous,
+            Some(current),
+        ))
+    }
+
+    fn mode_history_views(
+        &mut self,
+        previous_slot: Option<ModeHistorySlot>,
+        current_slot: ModeHistorySlot,
+        mi_count: usize,
+    ) -> Result<(Option<ModeInfoView<'_>>, ModeInfoViewMut<'_>), DecodeError> {
+        if previous_slot == Some(current_slot) {
+            return Err(DecodeError::InvalidConfig);
+        }
+
+        let frame_bytes = mode_info_byte_len(mi_count).ok_or(DecodeError::InvalidBitstream)?;
+        let slot_len = self.layout.mode_history.slot_len();
+        if frame_bytes > slot_len {
+            return Err(DecodeError::ResourceLimit);
+        }
+
+        let first = self.layout.mode_history.slots[0];
+        let second = self.layout.mode_history.slots[1];
+        debug_assert_eq!(first.len, second.len);
+        debug_assert_eq!(first.end().ok(), Some(second.start));
+
+        let history_end = second.end()?;
+        if history_end > self.memory.len() {
+            return Err(DecodeError::InvalidConfig);
+        }
+
+        let (_, history_and_after) = self.memory.split_at_mut(first.start);
+        let (first_full, history_after_first) = history_and_after.split_at_mut(first.len);
+        let (second_full, _) = history_after_first.split_at_mut(second.len);
+        let first_frame = &mut first_full[..frame_bytes];
+        let second_frame = &mut second_full[..frame_bytes];
+
+        match (previous_slot, current_slot) {
+            (None, ModeHistorySlot::Slot0) => Ok((None, ModeInfoViewMut::new(first_frame)?)),
+            (None, ModeHistorySlot::Slot1) => Ok((None, ModeInfoViewMut::new(second_frame)?)),
+            (Some(ModeHistorySlot::Slot0), ModeHistorySlot::Slot1) => Ok((
+                Some(ModeInfoView::new(first_frame)?),
+                ModeInfoViewMut::new(second_frame)?,
+            )),
+            (Some(ModeHistorySlot::Slot1), ModeHistorySlot::Slot0) => Ok((
+                Some(ModeInfoView::new(second_frame)?),
+                ModeInfoViewMut::new(first_frame)?,
+            )),
+            (Some(_), _) => Err(DecodeError::InvalidConfig),
+        }
     }
 }
 
@@ -372,10 +491,6 @@ pub struct Decoder {
     syntax_counts: SyntaxCounts,
     last_frame_type: header::FrameType,
     previous_frame_for_mvs: Option<PreviousFrameForMvs>,
-    #[cfg(feature = "std")]
-    prev_mode_info: Vec<StoredModeInfo>,
-    #[cfg(feature = "std")]
-    curr_mode_info: Vec<StoredModeInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -383,6 +498,7 @@ struct PreviousFrameForMvs {
     width: u32,
     height: u32,
     show_frame: bool,
+    mode_history_slot: ModeHistorySlot,
 }
 
 impl Decoder {
@@ -394,10 +510,6 @@ impl Decoder {
             syntax_counts: SyntaxCounts::default(),
             last_frame_type: header::FrameType::Key,
             previous_frame_for_mvs: None,
-            #[cfg(feature = "std")]
-            prev_mode_info: Vec::new(),
-            #[cfg(feature = "std")]
-            curr_mode_info: Vec::new(),
         }
     }
 
@@ -412,6 +524,7 @@ impl Decoder {
         self.validate_frame_limits(&header)?;
         self.setup_frame_probability_state(&header)?;
 
+        let mut decoded_mode_history_slot = None;
         if !header.show_existing_frame && header.header_size_in_bytes != 0 {
             let compressed_header_data = coded_frame
                 .get(header.compressed_header_offset..header.tile_data_offset)
@@ -441,56 +554,19 @@ impl Decoder {
             let tile_layout =
                 parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
             self.syntax_counts.clear();
-            #[cfg(feature = "std")]
-            let use_prev_frame_mvs = self.use_prev_frame_mvs(&header);
+            let mi_count = frame_mi_count(header.frame_width, header.frame_height)?;
+            let previous_slot = self.use_prev_frame_mvs(&header);
+            let current_slot = self
+                .previous_frame_for_mvs
+                .map(|previous| previous.mode_history_slot.other())
+                .unwrap_or(ModeHistorySlot::Slot0);
+            let mode_buffers = workspace.mode_history_buffers(
+                previous_slot.is_some(),
+                previous_slot,
+                current_slot,
+                mi_count,
+            )?;
 
-            #[cfg(feature = "std")]
-            let tile_parse_result = {
-                let mi_count = frame_mi_count(header.frame_width, header.frame_height)?;
-                let mut prev_mode_info = core::mem::take(&mut self.prev_mode_info);
-                let mut curr_mode_info = core::mem::take(&mut self.curr_mode_info);
-                curr_mode_info.resize(mi_count, StoredModeInfo::DEFAULT);
-                curr_mode_info.fill(StoredModeInfo::DEFAULT);
-                let prev_frame_modes = if use_prev_frame_mvs && prev_mode_info.len() == mi_count {
-                    Some(prev_mode_info.as_slice())
-                } else {
-                    None
-                };
-                let result = if header.frame_is_intra {
-                    parse_intra_tiles(
-                        coded_frame,
-                        &header,
-                        &compressed_header,
-                        self.probability_state.current(),
-                        &mut self.syntax_counts,
-                        &tile_layout,
-                        Some(curr_mode_info.as_mut_slice()),
-                    )
-                } else {
-                    let use_prev_frame_mvs = use_prev_frame_mvs && prev_frame_modes.is_some();
-                    parse_inter_tiles(
-                        coded_frame,
-                        &header,
-                        &compressed_header,
-                        self.probability_state.current(),
-                        &mut self.syntax_counts,
-                        &tile_layout,
-                        FrameModeBuffers::new(
-                            use_prev_frame_mvs,
-                            prev_frame_modes,
-                            Some(curr_mode_info.as_mut_slice()),
-                        ),
-                    )
-                };
-                if result.is_ok() {
-                    core::mem::swap(&mut prev_mode_info, &mut curr_mode_info);
-                }
-                self.prev_mode_info = prev_mode_info;
-                self.curr_mode_info = curr_mode_info;
-                result
-            };
-
-            #[cfg(not(feature = "std"))]
             let tile_parse_result = if header.frame_is_intra {
                 parse_intra_tiles(
                     coded_frame,
@@ -499,7 +575,7 @@ impl Decoder {
                     self.probability_state.current(),
                     &mut self.syntax_counts,
                     &tile_layout,
-                    None,
+                    mode_buffers,
                 )
             } else {
                 parse_inter_tiles(
@@ -509,11 +585,12 @@ impl Decoder {
                     self.probability_state.current(),
                     &mut self.syntax_counts,
                     &tile_layout,
-                    FrameModeBuffers::none(),
+                    mode_buffers,
                 )
             };
 
             tile_parse_result.map_err(|err| err.into_decode_error())?;
+            decoded_mode_history_slot = Some(current_slot);
 
             self.refresh_probability_state(&header, &compressed_header)?;
         }
@@ -521,11 +598,13 @@ impl Decoder {
         self.header_state.update_references(&header);
         if !header.show_existing_frame {
             self.last_frame_type = header.frame_type;
-            self.previous_frame_for_mvs = Some(PreviousFrameForMvs {
-                width: header.frame_width,
-                height: header.frame_height,
-                show_frame: header.show_frame,
-            });
+            self.previous_frame_for_mvs =
+                decoded_mode_history_slot.map(|mode_history_slot| PreviousFrameForMvs {
+                    width: header.frame_width,
+                    height: header.frame_height,
+                    show_frame: header.show_frame,
+                    mode_history_slot,
+                });
         }
         Ok(DecodeOutcome::NoOutput)
     }
@@ -545,17 +624,18 @@ impl Decoder {
         Ok(())
     }
 
-    #[cfg(feature = "std")]
-    fn use_prev_frame_mvs(&self, header: &header::UncompressedFrameHeader) -> bool {
+    fn use_prev_frame_mvs(
+        &self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Option<ModeHistorySlot> {
         if header.error_resilient_mode || header.frame_is_intra || header.show_existing_frame {
-            return false;
+            return None;
         }
-        let Some(previous) = self.previous_frame_for_mvs else {
-            return false;
-        };
-        previous.width == header.frame_width
+        let previous = self.previous_frame_for_mvs?;
+        (previous.width == header.frame_width
             && previous.height == header.frame_height
-            && previous.show_frame
+            && previous.show_frame)
+            .then_some(previous.mode_history_slot)
     }
 
     fn setup_frame_probability_state(
@@ -639,7 +719,6 @@ pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {
     luma.checked_add(chroma_plane.checked_mul(2)?)
 }
 
-#[cfg(feature = "std")]
 fn frame_mi_count(width: u32, height: u32) -> Result<usize, DecodeError> {
     let mi_cols = width.checked_add(7).ok_or(DecodeError::InvalidBitstream)? >> 3;
     let mi_rows = height.checked_add(7).ok_or(DecodeError::InvalidBitstream)? >> 3;
@@ -688,17 +767,33 @@ mod tests {
     }
 
     #[test]
-    fn workspace_layout_is_current_plus_eight_i420_frame_slots() {
+    fn workspace_layout_is_frame_pool_plus_two_mode_history_slots() {
         let layout = WorkspaceLayout::new(16, 16).unwrap();
+        let frame_pool_bytes = 16 * 16 * 3 / 2 * 9;
+        let mode_history_slot_bytes = 4 * super::tile_syntax::STORED_MODE_INFO_BYTES;
 
         assert_eq!(layout.max_width(), 16);
         assert_eq!(layout.max_height(), 16);
-        assert_eq!(layout.total_bytes(), 16 * 16 * 3 / 2 * 9);
+        assert_eq!(
+            layout.total_bytes(),
+            frame_pool_bytes + 2 * mode_history_slot_bytes
+        );
         assert_eq!(layout.frame_pool.current.start, 0);
         assert_eq!(layout.frame_pool.current.len, 16 * 16 * 3 / 2);
         assert_eq!(layout.frame_pool.references[0].start, 16 * 16 * 3 / 2);
         assert_eq!(
             layout.frame_pool.references[7].end().unwrap(),
+            frame_pool_bytes
+        );
+        assert_eq!(layout.mode_history.slots[0].start, frame_pool_bytes);
+        assert_eq!(layout.mode_history.slots[0].len, mode_history_slot_bytes);
+        assert_eq!(
+            layout.mode_history.slots[1].start,
+            frame_pool_bytes + mode_history_slot_bytes
+        );
+        assert_eq!(layout.mode_history.slots[1].len, mode_history_slot_bytes);
+        assert_eq!(
+            layout.mode_history.slots[1].end().unwrap(),
             layout.total_bytes()
         );
         assert_eq!(layout.frame_pool.frame.y.offset, 0);

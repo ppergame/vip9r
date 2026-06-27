@@ -155,3 +155,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   at the next expected M1 boundary: no shown frames are output yet, so the
   harness reports 82 missing frames. Wasm/no-std parity still waits on moving
   mode-history storage into workspace state.
+
+## 2026-06-27 — VP9 mode history in workspace
+
+- rev: jj `rysswwlv`
+- Moved previous/current frame mode-history storage out of std-only `Vec`s and
+  into `DecodeWorkspace` as two packed byte slots, so host and no-std/wasm use
+  the same previous-frame MV candidate path.
+- Reduced tile above-context storage to a column cap sized for project targets
+  instead of 8192 MI columns, fixing a wasm stack trap in the d8 smoke path.
+- Host and wasm smoke runs on `bear-vp9.ivf` now both parse all 82 coded frames
+  and exit at the expected M1 boundary: no shown frames are output yet, so both
+  report 82 missing frames.

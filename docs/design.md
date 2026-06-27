@@ -90,13 +90,13 @@ $D8_LINUX64 dist/wasm-driver/main.js -- \
   /bulk/vip9r/chromium/bear-vp9.ivf
 ```
 
-Wasm parity is temporarily behind the host parse-only path because MV mode
-history storage is still `std`/host-owned rather than workspace-backed. Move
-that state into the no-std workspace before treating decode-path wasm failures
-as wrapper regressions. Failures before `decode_next` still implicate the
-JS/wasm wrapper, exported ABI, input copying, or packet setup. The driver also
-accepts `--allow-mismatch`; like the host harness, this only permits wrong frame
-hashes, not missing or extra shown frames.
+The current wasm driver also parses all 82 coded frames in `bear-vp9.ivf` and
+then exits with 82 missing shown frames. Decode-path wasm failures are now
+expected to be real core/no-std parity issues unless they happen before
+`decode_next`, which still implicates the JS/wasm wrapper, exported ABI, input
+copying, or packet setup. The driver also accepts `--allow-mismatch`; like the
+host harness, this only permits wrong frame hashes, not missing or extra shown
+frames.
 
 ### Decode API
 
@@ -107,11 +107,14 @@ ranges. `Decoder::decode_coded_frame` consumes one range with an explicit
 helpers are adapters, not the architecture.
 
 `Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to
-the supplied workspace. `WorkspaceLayout` currently defines a fixed arena with
-one current reconstruction frame slot plus 8 reference frame slots, each using
-simple 4:2:0 byte capacity derived from instance max dimensions. Additional maps
-and scratch should enter the layout only when implementation code actually
-consumes them.
+the supplied workspace. A decoder session must keep using the same workspace
+memory; previous-frame mode history for MV reference candidates lives there and
+is addressed by decoder-owned slot metadata. `WorkspaceLayout` currently defines
+a fixed arena with one current reconstruction frame slot plus 8 reference frame
+slots, each using simple 4:2:0 byte capacity derived from instance max
+dimensions, followed by two packed mode-history slots. Additional maps and
+scratch should enter the layout only when implementation code actually consumes
+them.
 
 Shown-frame output borrows from the supplied workspace and is invalid after the
 next decode or packet transition. Core output is an `I420Frame`: visible Y, U,
