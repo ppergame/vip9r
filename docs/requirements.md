@@ -117,6 +117,9 @@ moment the session is done.
   - Adds entries to log.md as appropriate
     - Put log changes in the implementation commit where it makes sense
 
+The grinder is a batch job. It is ok for the orchestrator to poll it at the
+maximum allowed interval.
+
 ### Codex implementor
 
 Scope: one decoder implementation functional block or optimization strategy.
