@@ -122,6 +122,28 @@ The wasm boundary uses the same shape: one instance is one decoder session,
 coded frame. There is no reset API; JS recreates the instance on stream changes
 or decode errors.
 
+### Wasm boundary
+
+`vip9r-wasm` exposes the manual integer ABI used by the paired JS binding:
+`vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
+`vip9r_begin_packet`, and `vip9r_decode_next`. Mutating exports return `0` for
+success or a negative error code; those codes are binding details, not a stable
+external API.
+
+The result block is a `u32` table in wasm memory. `reserve_input` publishes the
+packet-tail pointer and capacity; JS copies one complete demuxed VP9
+packet/superframe there; `begin_packet(len)` splits it into up to 8 coded-frame
+ranges; `decode_next` consumes exactly one range and records `has_output`,
+`packet_done`, dimensions, and native Y/U/V plane descriptors.
+
+Wasm lays out the fixed workspace once from the instance max dimensions,
+currently one current I420 frame slot plus 8 reference slots, followed by the
+growable packet tail. The packet tail is the only region `reserve_input` may
+grow. Persistent wasm state stores offsets, ranges, and layout descriptors, not
+long-lived Rust slices; slices are formed only inside exports after bounds
+checks. JS must refresh `memory.buffer` views after `reserve_input`, and output
+plane descriptors are ephemeral until the next wasm decoder call.
+
 ## Measurement
 
 The trusted harness answers two questions:
@@ -199,7 +221,5 @@ sandbox). Each vector has a `.md5` golden.
 
 ## Open design questions
 
-- Minimal wasm export surface and JS bindings for the wasm parity check and the
-  demo.
 - Which intermediate checks, if any, are worth adding after the first failures.
 - Device-time and token budget per optimization pass.
