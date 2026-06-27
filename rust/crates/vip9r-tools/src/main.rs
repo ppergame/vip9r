@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use md5::{Digest, Md5};
 use vip9r_core::{
-    DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane, PlaneShape,
+    DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane,
     WorkspaceLayout, split_packet,
 };
 
@@ -848,7 +848,7 @@ mod tests {
     fn plane(data: &[u8], width: u32, height: u32, stride: usize) -> Plane<'_> {
         Plane {
             data,
-            shape: PlaneShape::new(width, height, stride),
+            shape: vip9r_core::PlaneShape::new(width, height, stride),
         }
     }
 }

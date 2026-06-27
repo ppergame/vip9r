@@ -421,7 +421,8 @@ static mut SESSION: Session = Session::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn vip9r_result_ptr() -> u32 {
-    session_result_ptr()
+    let session = session();
+    (&raw const session.result) as u32
 }
 
 #[unsafe(no_mangle)]
@@ -445,12 +446,7 @@ pub extern "C" fn vip9r_decode_next() -> i32 {
 }
 
 fn session() -> &'static mut Session {
-    unsafe { &mut *(&raw mut SESSION) }
-}
-
-fn session_result_ptr() -> u32 {
-    let session = session();
-    (&raw const session.result) as u32
+    unsafe { &mut *core::ptr::addr_of_mut!(SESSION) }
 }
 
 fn range_from_packet_frame(

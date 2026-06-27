@@ -3,7 +3,7 @@ use crate::boolcoder::BoolDecoder;
 use crate::compressed_header::{CompressedHeader, TxMode};
 use crate::error::ParserError;
 use crate::header::UncompressedFrameHeader;
-use crate::probability::{FrameContext, TX_SIZE_CONTEXTS};
+use crate::probability::FrameContext;
 use crate::tile::{TileDescriptor, TileLayout};
 
 mod tables;
@@ -626,7 +626,7 @@ impl TileParser<'_, '_> {
         if node >= TOKEN_TREE_NODES {
             return Err(TileSyntaxError::InvalidBitstream);
         }
-        let prob_index = core::cmp::min(2, 1usize.saturating_add(node));
+        let prob_index = core::cmp::min(2, node + 1);
         let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)][0][band]
             [ctx][prob_index];
         pareto(node, prob)
@@ -837,9 +837,6 @@ impl TileModeContexts {
             above = left;
         }
         let ctx = usize::from((above + left) > max_tx_size.index());
-        if ctx >= TX_SIZE_CONTEXTS {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
         Ok(ctx)
     }
 
@@ -1347,9 +1344,7 @@ fn pareto(node: usize, prob: u8) -> Result<u8, TileSyntaxError> {
     if prob == 0 {
         return Err(TileSyntaxError::InvalidBitstream);
     }
-    let table_index = node
-        .checked_sub(2)
-        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let table_index = node - 2;
     let x = usize::from((prob - 1) / 2);
     if prob & 1 != 0 {
         PARETO_TABLE
@@ -1372,7 +1367,7 @@ fn pareto(node: usize, prob: u8) -> Result<u8, TileSyntaxError> {
                 .copied()
                 .ok_or(TileSyntaxError::InvalidBitstream)?,
         );
-        u8::try_from((a + b) >> 1).map_err(|_| TileSyntaxError::InvalidBitstream)
+        Ok(((a + b) >> 1) as u8)
     }
 }
 

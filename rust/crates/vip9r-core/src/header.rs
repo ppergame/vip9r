@@ -299,8 +299,7 @@ pub(crate) fn parse_uncompressed_frame_header(
     let quantization = quantization_params(&mut reader)?;
     let segmentation = segmentation_params(&mut reader)?;
     let tile_info = tile_info(&mut reader, frame_width)?;
-    let header_size_in_bytes =
-        usize::try_from(reader.read_f(16)?).map_err(|_| ParserError::InvalidBitstream)?;
+    let header_size_in_bytes = reader.read_f(16)? as usize;
     let (compressed_header_offset, tile_data_offset) =
         finish_uncompressed_header(&mut reader, header_size_in_bytes, frame.len())?;
 
@@ -387,14 +386,8 @@ fn color_config(reader: &mut FixedBitReader<'_>, profile: u8) -> Result<u8, Pars
 }
 
 fn frame_size(reader: &mut FixedBitReader<'_>) -> Result<(u32, u32), ParserError> {
-    let width = reader
-        .read_f(16)?
-        .checked_add(1)
-        .ok_or(ParserError::InvalidBitstream)?;
-    let height = reader
-        .read_f(16)?
-        .checked_add(1)
-        .ok_or(ParserError::InvalidBitstream)?;
+    let width = reader.read_f(16)? + 1;
+    let height = reader.read_f(16)? + 1;
     Ok((width, height))
 }
 
@@ -404,14 +397,8 @@ fn render_size(
     frame_height: u32,
 ) -> Result<(u32, u32), ParserError> {
     if reader.read_bool()? {
-        let render_width = reader
-            .read_f(16)?
-            .checked_add(1)
-            .ok_or(ParserError::InvalidBitstream)?;
-        let render_height = reader
-            .read_f(16)?
-            .checked_add(1)
-            .ok_or(ParserError::InvalidBitstream)?;
+        let render_width = reader.read_f(16)? + 1;
+        let render_height = reader.read_f(16)? + 1;
         Ok((render_width, render_height))
     } else {
         Ok((frame_width, frame_height))

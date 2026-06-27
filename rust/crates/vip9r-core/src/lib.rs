@@ -216,7 +216,7 @@ impl PlaneLayout {
 #[derive(Debug)]
 pub struct DecodeWorkspace<'a> {
     layout: WorkspaceLayout,
-    memory: &'a mut [u8],
+    _memory: &'a mut [u8],
 }
 
 impl<'a> DecodeWorkspace<'a> {
@@ -227,16 +227,13 @@ impl<'a> DecodeWorkspace<'a> {
         }
         Ok(Self {
             layout,
-            memory: &mut memory[..total_bytes],
+            _memory: &mut memory[..total_bytes],
         })
     }
 
     fn require_layout(&self, expected: WorkspaceLayout) -> Result<(), DecodeError> {
         if self.layout != expected {
             return Err(DecodeError::InvalidConfig);
-        }
-        if self.memory.len() < self.layout.total_bytes() {
-            return Err(DecodeError::ResourceLimit);
         }
         Ok(())
     }

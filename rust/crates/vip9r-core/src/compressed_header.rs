@@ -156,9 +156,7 @@ fn read_tx_mode(decoder: &mut BoolDecoder<'_>, lossless: bool) -> Result<TxMode,
 
     let mut raw = decoder.read_literal(2)? as u8;
     if raw == 3 {
-        raw = raw
-            .checked_add(decoder.read_literal(1)? as u8)
-            .ok_or(ParserError::InvalidBitstream)?;
+        raw += decoder.read_literal(1)? as u8;
     }
     TxMode::from_raw(raw)
 }
@@ -470,15 +468,13 @@ fn diff_update_prob(decoder: &mut BoolDecoder<'_>, prob: u8) -> Result<u8, Parse
 
 fn decode_term_subexp(decoder: &mut BoolDecoder<'_>) -> Result<u8, ParserError> {
     if decoder.read_literal(1)? == 0 {
-        return u8::try_from(decoder.read_literal(4)?).map_err(|_| ParserError::InvalidBitstream);
+        return Ok(decoder.read_literal(4)? as u8);
     }
     if decoder.read_literal(1)? == 0 {
-        return u8::try_from(decoder.read_literal(4)? + 16)
-            .map_err(|_| ParserError::InvalidBitstream);
+        return Ok((decoder.read_literal(4)? + 16) as u8);
     }
     if decoder.read_literal(1)? == 0 {
-        return u8::try_from(decoder.read_literal(5)? + 32)
-            .map_err(|_| ParserError::InvalidBitstream);
+        return Ok((decoder.read_literal(5)? + 32) as u8);
     }
 
     let v = decoder.read_literal(7)?;
@@ -490,7 +486,7 @@ fn decode_term_subexp(decoder: &mut BoolDecoder<'_>) -> Result<u8, ParserError> 
     if value >= u32::from(MAX_PROB) {
         return Err(ParserError::InvalidBitstream);
     }
-    u8::try_from(value).map_err(|_| ParserError::InvalidBitstream)
+    Ok(value as u8)
 }
 
 fn inv_remap_prob(delta_prob: u8, prob: u8) -> Result<u8, ParserError> {
@@ -505,7 +501,7 @@ fn inv_remap_prob(delta_prob: u8, prob: u8) -> Result<u8, ParserError> {
     } else {
         255 - inv_recenter_nonneg(v, 255 - 1 - m)
     };
-    u8::try_from(remapped).map_err(|_| ParserError::InvalidBitstream)
+    Ok(remapped as u8)
 }
 
 fn inv_recenter_nonneg(v: u16, m: u16) -> u16 {

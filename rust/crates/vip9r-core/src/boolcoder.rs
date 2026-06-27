@@ -3,7 +3,6 @@ use crate::error::ParserError;
 const MARKER_PROBABILITY: u8 = 128;
 const LITERAL_PROBABILITY: u8 = 128;
 
-#[allow(dead_code)]
 pub(crate) struct BoolDecoder<'a> {
     data: &'a [u8],
     value: u16,
@@ -11,7 +10,6 @@ pub(crate) struct BoolDecoder<'a> {
     bit_offset: usize,
 }
 
-#[allow(dead_code)]
 impl<'a> BoolDecoder<'a> {
     pub(crate) fn new(data: &'a [u8]) -> Result<Self, ParserError> {
         let initial_value = data.first().ok_or(ParserError::InvalidBitstream)?;
