@@ -318,47 +318,10 @@ pub struct I420Frame<'a> {
     pub v: Plane<'a>,
 }
 
-impl I420Frame<'_> {
-    pub fn write_compact(&self, output: &mut [u8]) -> Result<usize, FrameCopyError> {
-        let byte_len = self.info.i420_len().ok_or(FrameCopyError::InvalidPlane)?;
-        if output.len() < byte_len {
-            return Err(FrameCopyError::OutputTooSmall { required: byte_len });
-        }
-        self.validate_layout()?;
-
-        let mut written = 0;
-        written += copy_plane(&mut output[written..], self.y)?;
-        written += copy_plane(&mut output[written..], self.u)?;
-        written += copy_plane(&mut output[written..], self.v)?;
-        Ok(written)
-    }
-
-    fn validate_layout(&self) -> Result<(), FrameCopyError> {
-        let (chroma_width, chroma_height) =
-            chroma_dimensions(self.info.visible_width, self.info.visible_height);
-        if self.y.width != self.info.visible_width
-            || self.y.height != self.info.visible_height
-            || self.u.width != chroma_width
-            || self.u.height != chroma_height
-            || self.v.width != chroma_width
-            || self.v.height != chroma_height
-        {
-            return Err(FrameCopyError::InvalidPlane);
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeOutcome<'a> {
     NoOutput,
     Output(I420Frame<'a>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrameCopyError {
-    OutputTooSmall { required: usize },
-    InvalidPlane,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,56 +484,10 @@ fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn chroma_dimensions(width: u32, height: u32) -> (u32, u32) {
-    (width / 2 + width % 2, height / 2 + height % 2)
-}
-
-fn copy_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, FrameCopyError> {
-    let width = usize::try_from(plane.width).map_err(|_| FrameCopyError::InvalidPlane)?;
-    let height = usize::try_from(plane.height).map_err(|_| FrameCopyError::InvalidPlane)?;
-    if width == 0 || height == 0 || plane.stride < width {
-        return Err(FrameCopyError::InvalidPlane);
-    }
-
-    let last_row = plane
-        .stride
-        .checked_mul(height - 1)
-        .ok_or(FrameCopyError::InvalidPlane)?;
-    let required_input = last_row
-        .checked_add(width)
-        .ok_or(FrameCopyError::InvalidPlane)?;
-    if plane.data.len() < required_input {
-        return Err(FrameCopyError::InvalidPlane);
-    }
-
-    let required_output = width
-        .checked_mul(height)
-        .ok_or(FrameCopyError::InvalidPlane)?;
-    if output.len() < required_output {
-        return Err(FrameCopyError::OutputTooSmall {
-            required: required_output,
-        });
-    }
-
-    for row in 0..height {
-        let input_start = plane
-            .stride
-            .checked_mul(row)
-            .ok_or(FrameCopyError::InvalidPlane)?;
-        let input_end = input_start + width;
-        let output_start = width.checked_mul(row).ok_or(FrameCopyError::InvalidPlane)?;
-        let output_end = output_start + width;
-        output[output_start..output_end].copy_from_slice(&plane.data[input_start..input_end]);
-    }
-
-    Ok(required_output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, DecodeWorkspace, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane,
-        WorkspaceLayout, required_i420_len,
+        DecodeError, DecodeWorkspace, Decoder, OwnedWorkspace, WorkspaceLayout, required_i420_len,
     };
 
     #[test]
@@ -598,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_layout_is_current_plus_eight_compact_i420_frame_slots() {
+    fn workspace_layout_is_current_plus_eight_i420_frame_slots() {
         let layout = WorkspaceLayout::new(16, 16).unwrap();
 
         assert_eq!(layout.max_width(), 16);
@@ -645,99 +562,6 @@ mod tests {
             decoder.decode_coded_frame(&[], &mut workspace),
             Err(DecodeError::InvalidConfig)
         );
-    }
-
-    #[test]
-    fn compact_i420_write_strips_stride_and_orders_planes() {
-        let info = FrameInfo::i420(3, 3, 3, 3, 0).unwrap();
-        let y = [
-            1, 2, 3, 99, //
-            4, 5, 6, 99, //
-            7, 8, 9, 99,
-        ];
-        let u = [
-            10, 11, 99, //
-            12, 13, 99,
-        ];
-        let v = [
-            14, 15, 99, //
-            16, 17, 99,
-        ];
-        let frame = I420Frame {
-            info,
-            y: Plane {
-                data: &y,
-                stride: 4,
-                width: 3,
-                height: 3,
-            },
-            u: Plane {
-                data: &u,
-                stride: 3,
-                width: 2,
-                height: 2,
-            },
-            v: Plane {
-                data: &v,
-                stride: 3,
-                width: 2,
-                height: 2,
-            },
-        };
-
-        let mut output = [0; 17];
-        assert_eq!(frame.write_compact(&mut output), Ok(17));
-        assert_eq!(
-            output,
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-        );
-    }
-
-    #[test]
-    fn compact_i420_write_reports_whole_frame_len_when_output_is_too_small() {
-        let frame = tiny_i420_frame();
-        let mut output = [0; 5];
-
-        assert_eq!(
-            frame.write_compact(&mut output),
-            Err(super::FrameCopyError::OutputTooSmall { required: 6 })
-        );
-    }
-
-    #[test]
-    fn compact_i420_write_rejects_plane_dimension_mismatch() {
-        let mut frame = tiny_i420_frame();
-        frame.u.width = 2;
-        let mut output = [0; 6];
-
-        assert_eq!(
-            frame.write_compact(&mut output),
-            Err(super::FrameCopyError::InvalidPlane)
-        );
-    }
-
-    fn tiny_i420_frame() -> I420Frame<'static> {
-        I420Frame {
-            info: FrameInfo::i420(2, 2, 2, 2, 0).unwrap(),
-            y: Plane {
-                data: &[1, 2, 3, 4],
-                stride: 2,
-                width: 2,
-                height: 2,
-            },
-            u: Plane {
-                data: &[5],
-                stride: 1,
-                width: 1,
-                height: 1,
-            },
-            v: Plane {
-                data: &[6],
-                stride: 1,
-                width: 1,
-                height: 1,
-            },
-        }
     }
 
     #[test]

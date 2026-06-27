@@ -9,8 +9,8 @@ implemented decisions into `docs/design.md`.
   `split_packet(packet)` and
   `Decoder::decode_coded_frame(coded_frame, workspace)`.
 - Host packet-level md5 tooling wraps that step API.
-- Public core output remains compact I420 in libvpx-md5 order: visible Y, then
-  U, then V. Internal storage may use stride or padding.
+- Core output is `I420Frame`: visible Y, U, and V planes with explicit strides.
+  Compact I420 in libvpx-md5 order is a tools/harness serialization.
 - `vip9r-wasm` exports the first boundary shape:
   `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
   `vip9r_begin_packet`, and `vip9r_decode_next`.
@@ -134,7 +134,8 @@ Target model:
   probability contexts, segmentation state, and counters.
 - `WorkspaceLayout`: core-owned byte layout for geometry-sized storage. The
   current layout is one current reconstruction frame slot plus 8 reference frame
-  slots, each with compact I420 capacity derived from instance max dimensions.
+  slots, each with simple 4:2:0 byte capacity derived from instance max
+  dimensions.
 - `DecodeWorkspace`: a checked borrowed arena view over a `WorkspaceLayout`.
 - Native owned workspace: `std`/test convenience that owns host allocations and
   yields a `DecodeWorkspace`.

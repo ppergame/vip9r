@@ -99,15 +99,15 @@ helpers are adapters, not the architecture.
 
 `Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to
 the supplied workspace. `WorkspaceLayout` currently defines a fixed arena with
-one current reconstruction frame slot plus 8 reference frame slots, each using a
-compact I420 capacity derived from instance max dimensions. Additional maps and
-scratch should enter the layout only when implementation code actually consumes
-them.
+one current reconstruction frame slot plus 8 reference frame slots, each using
+simple 4:2:0 byte capacity derived from instance max dimensions. Additional maps
+and scratch should enter the layout only when implementation code actually
+consumes them.
 
 Shown-frame output borrows from the supplied workspace and is invalid after the
-next decode or packet transition. Public output is compact I420 in libvpx-md5
-order: visible Y, then U, then V. Internal plane storage may have stride;
-`I420Frame::write_compact` is the bridge for the golden harness.
+next decode or packet transition. Core output is an `I420Frame`: visible Y, U,
+and V planes with explicit lengths and strides. Compact I420 in libvpx-md5 order
+is a tools/harness serialization, not the core output model.
 
 The wasm boundary uses the same shape: one instance is one decoder session,
 `begin_packet` stages packet ranges, and `decode_next` advances exactly one
