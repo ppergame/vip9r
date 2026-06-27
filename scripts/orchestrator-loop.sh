@@ -9,6 +9,8 @@ usage:
 Runs fresh Codex exec sessions until the final agent message does not end with
 the continue signal.
 
+This script must run inside the gptpod shell sandbox (`gptpod -s`).
+
 Environment:
   VIP9R_ORCHESTRATOR_SIGNAL    Continue signal. Default: VIP9R_ORCHESTRATOR_CONTINUE
   VIP9R_ORCHESTRATOR_MAX_RUNS  Safety cap. 0 means unlimited. Default: 0
@@ -27,6 +29,37 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/.." && pwd)"
+
+require_gptpod_sandbox() {
+  local project_marker="/run/claudepod-project"
+  local mode_marker="/run/claudepod-mode"
+  local project
+  local mode
+
+  if [[ ! -r "$project_marker" || ! -r "$mode_marker" ]]; then
+    echo "orchestrator-loop: not running inside the gptpod shell sandbox" >&2
+    echo "orchestrator-loop: start it with: gptpod -s" >&2
+    exit 2
+  fi
+
+  project="$(<"$project_marker")"
+  mode="$(<"$mode_marker")"
+
+  if [[ "$mode" != "shell" ]]; then
+    echo "orchestrator-loop: expected gptpod shell mode, got: $mode" >&2
+    echo "orchestrator-loop: start it with: gptpod -s" >&2
+    exit 2
+  fi
+
+  if [[ "$project" != "$repo" ]]; then
+    echo "orchestrator-loop: gptpod project mismatch" >&2
+    echo "orchestrator-loop: /run/claudepod-project=$project" >&2
+    echo "orchestrator-loop: script repo=$repo" >&2
+    exit 2
+  fi
+}
+
+require_gptpod_sandbox
 
 signal="${VIP9R_ORCHESTRATOR_SIGNAL:-VIP9R_ORCHESTRATOR_CONTINUE}"
 max_runs="${VIP9R_ORCHESTRATOR_MAX_RUNS:-0}"
