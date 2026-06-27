@@ -9,8 +9,9 @@ implemented decisions into `docs/design.md`.
   `split_packet(packet)` and
   `Decoder::decode_coded_frame(coded_frame, workspace)`.
 - Host packet-level md5 tooling wraps that step API.
-- Core output is `I420Frame`: visible Y, U, and V planes with explicit strides.
-  Compact I420 in libvpx-md5 order is a tools/harness serialization.
+- Core output is `I420Frame`: visible Y, U, and V planes with a shared
+  `PlaneShape` for width, height, and stride. Compact I420 in libvpx-md5 order
+  is a tools/harness serialization.
 - `vip9r-wasm` exports the first boundary shape:
   `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
   `vip9r_begin_packet`, and `vip9r_decode_next`.

@@ -397,19 +397,19 @@ impl Session {
         self.result.render_height = frame.info.render_height;
         self.result.y_ptr = y.offset;
         self.result.y_len = y.len;
-        self.result.y_stride = match u32::try_from(frame.y.stride) {
+        self.result.y_stride = match u32::try_from(frame.y.shape.stride) {
             Ok(stride) => stride,
             Err(_) => return RESOURCE_LIMIT,
         };
         self.result.u_ptr = u.offset;
         self.result.u_len = u.len;
-        self.result.u_stride = match u32::try_from(frame.u.stride) {
+        self.result.u_stride = match u32::try_from(frame.u.shape.stride) {
             Ok(stride) => stride,
             Err(_) => return RESOURCE_LIMIT,
         };
         self.result.v_ptr = v.offset;
         self.result.v_len = v.len;
-        self.result.v_stride = match u32::try_from(frame.v.stride) {
+        self.result.v_stride = match u32::try_from(frame.v.shape.stride) {
             Ok(stride) => stride,
             Err(_) => return RESOURCE_LIMIT,
         };

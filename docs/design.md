@@ -106,8 +106,9 @@ consumes them.
 
 Shown-frame output borrows from the supplied workspace and is invalid after the
 next decode or packet transition. Core output is an `I420Frame`: visible Y, U,
-and V planes with explicit lengths and strides. Compact I420 in libvpx-md5 order
-is a tools/harness serialization, not the core output model.
+and V planes with a shared `PlaneShape` for width, height, and stride, plus a
+backing byte slice. Compact I420 in libvpx-md5 order is a tools/harness
+serialization, not the core output model.
 
 The wasm boundary uses the same shape: one instance is one decoder session,
 `begin_packet` stages packet ranges, and `decode_next` advances exactly one

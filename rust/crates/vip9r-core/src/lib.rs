@@ -163,15 +163,13 @@ struct FrameLayout {
 impl FrameLayout {
     fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
         let y_stride = usize::try_from(max_width).map_err(|_| DecodeError::InvalidConfig)?;
-        let y_height = usize::try_from(max_height).map_err(|_| DecodeError::InvalidConfig)?;
-        let uv_width =
-            usize::try_from(max_width.div_ceil(2)).map_err(|_| DecodeError::InvalidConfig)?;
-        let uv_height =
-            usize::try_from(max_height.div_ceil(2)).map_err(|_| DecodeError::InvalidConfig)?;
+        let uv_width = max_width.div_ceil(2);
+        let uv_height = max_height.div_ceil(2);
+        let uv_stride = usize::try_from(uv_width).map_err(|_| DecodeError::InvalidConfig)?;
 
-        let y = PlaneLayout::new(0, y_stride, y_height)?;
-        let u = PlaneLayout::new(y.end()?, uv_width, uv_height)?;
-        let v = PlaneLayout::new(u.end()?, uv_width, uv_height)?;
+        let y = PlaneLayout::new(0, PlaneShape::new(max_width, max_height, y_stride))?;
+        let u = PlaneLayout::new(y.end()?, PlaneShape::new(uv_width, uv_height, uv_stride))?;
+        let v = PlaneLayout::new(u.end()?, u.shape)?;
         let frame = Self { y, u, v };
         frame
             .bytes()
@@ -192,27 +190,25 @@ impl FrameLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlaneLayout {
     offset: usize,
-    len: usize,
-    stride: usize,
+    shape: PlaneShape,
 }
 
 impl PlaneLayout {
-    fn new(offset: usize, stride: usize, height: usize) -> Result<Self, DecodeError> {
-        let len = stride
-            .checked_mul(height)
-            .ok_or(DecodeError::InvalidConfig)?;
+    fn new(offset: usize, shape: PlaneShape) -> Result<Self, DecodeError> {
+        let len = shape.byte_len().ok_or(DecodeError::InvalidConfig)?;
         offset.checked_add(len).ok_or(DecodeError::InvalidConfig)?;
-        Ok(Self {
-            offset,
-            len,
-            stride,
-        })
+        Ok(Self { offset, shape })
+    }
+
+    fn len(self) -> usize {
+        self.shape
+            .byte_len()
+            .expect("plane layout was checked at construction")
     }
 
     fn end(self) -> Result<usize, DecodeError> {
-        debug_assert!(self.stride <= self.len || self.len == 0);
         self.offset
-            .checked_add(self.len)
+            .checked_add(self.len())
             .ok_or(DecodeError::InvalidConfig)
     }
 }
@@ -303,11 +299,31 @@ impl FrameInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Plane<'a> {
-    pub data: &'a [u8],
-    pub stride: usize,
+pub struct PlaneShape {
     pub width: u32,
     pub height: u32,
+    pub stride: usize,
+}
+
+impl PlaneShape {
+    pub const fn new(width: u32, height: u32, stride: usize) -> Self {
+        Self {
+            width,
+            height,
+            stride,
+        }
+    }
+
+    pub fn byte_len(self) -> Option<usize> {
+        let height = usize::try_from(self.height).ok()?;
+        self.stride.checked_mul(height)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Plane<'a> {
+    pub data: &'a [u8],
+    pub shape: PlaneShape,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -529,14 +545,14 @@ mod tests {
             layout.total_bytes()
         );
         assert_eq!(layout.frame_pool.frame.y.offset, 0);
-        assert_eq!(layout.frame_pool.frame.y.stride, 16);
-        assert_eq!(layout.frame_pool.frame.y.len, 16 * 16);
+        assert_eq!(layout.frame_pool.frame.y.shape.stride, 16);
+        assert_eq!(layout.frame_pool.frame.y.len(), 16 * 16);
         assert_eq!(layout.frame_pool.frame.u.offset, 16 * 16);
-        assert_eq!(layout.frame_pool.frame.u.stride, 8);
-        assert_eq!(layout.frame_pool.frame.u.len, 8 * 8);
+        assert_eq!(layout.frame_pool.frame.u.shape.stride, 8);
+        assert_eq!(layout.frame_pool.frame.u.len(), 8 * 8);
         assert_eq!(layout.frame_pool.frame.v.offset, 16 * 16 + 8 * 8);
-        assert_eq!(layout.frame_pool.frame.v.stride, 8);
-        assert_eq!(layout.frame_pool.frame.v.len, 8 * 8);
+        assert_eq!(layout.frame_pool.frame.v.shape.stride, 8);
+        assert_eq!(layout.frame_pool.frame.v.len(), 8 * 8);
     }
 
     #[test]

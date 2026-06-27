@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use md5::{Digest, Md5};
 use vip9r_core::{
-    DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane,
+    DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane, PlaneShape,
     WorkspaceLayout, split_packet,
 };
 
@@ -458,12 +458,12 @@ fn write_compact_i420(frame: I420Frame<'_>, output: &mut [u8]) -> Result<usize, 
 fn validate_compact_i420_layout(frame: I420Frame<'_>) -> Result<(), CompactI420Error> {
     let chroma_width = frame.info.visible_width / 2 + frame.info.visible_width % 2;
     let chroma_height = frame.info.visible_height / 2 + frame.info.visible_height % 2;
-    if frame.y.width != frame.info.visible_width
-        || frame.y.height != frame.info.visible_height
-        || frame.u.width != chroma_width
-        || frame.u.height != chroma_height
-        || frame.v.width != chroma_width
-        || frame.v.height != chroma_height
+    if frame.y.shape.width != frame.info.visible_width
+        || frame.y.shape.height != frame.info.visible_height
+        || frame.u.shape.width != chroma_width
+        || frame.u.shape.height != chroma_height
+        || frame.v.shape.width != chroma_width
+        || frame.v.shape.height != chroma_height
     {
         return Err(CompactI420Error::InvalidPlane);
     }
@@ -471,13 +471,14 @@ fn validate_compact_i420_layout(frame: I420Frame<'_>) -> Result<(), CompactI420E
 }
 
 fn copy_compact_i420_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, CompactI420Error> {
-    let width = usize::try_from(plane.width).map_err(|_| CompactI420Error::InvalidPlane)?;
-    let height = usize::try_from(plane.height).map_err(|_| CompactI420Error::InvalidPlane)?;
-    if width == 0 || height == 0 || plane.stride < width {
+    let width = usize::try_from(plane.shape.width).map_err(|_| CompactI420Error::InvalidPlane)?;
+    let height = usize::try_from(plane.shape.height).map_err(|_| CompactI420Error::InvalidPlane)?;
+    if width == 0 || height == 0 || plane.shape.stride < width {
         return Err(CompactI420Error::InvalidPlane);
     }
 
     let last_row = plane
+        .shape
         .stride
         .checked_mul(height - 1)
         .ok_or(CompactI420Error::InvalidPlane)?;
@@ -499,6 +500,7 @@ fn copy_compact_i420_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize,
 
     for row in 0..height {
         let input_start = plane
+            .shape
             .stride
             .checked_mul(row)
             .ok_or(CompactI420Error::InvalidPlane)?;
@@ -705,24 +707,9 @@ mod tests {
         ];
         let frame = I420Frame {
             info,
-            y: Plane {
-                data: &y,
-                stride: 4,
-                width: 3,
-                height: 3,
-            },
-            u: Plane {
-                data: &u,
-                stride: 3,
-                width: 2,
-                height: 2,
-            },
-            v: Plane {
-                data: &v,
-                stride: 3,
-                width: 2,
-                height: 2,
-            },
+            y: plane(&y, 3, 3, 4),
+            u: plane(&u, 2, 2, 3),
+            v: plane(&v, 2, 2, 3),
         };
 
         let mut output = [0; 17];
@@ -747,7 +734,7 @@ mod tests {
     #[test]
     fn compact_i420_write_rejects_plane_dimension_mismatch() {
         let mut frame = tiny_i420_frame();
-        frame.u.width = 2;
+        frame.u.shape.width = 2;
         let mut output = [0; 6];
 
         assert_eq!(
@@ -852,24 +839,16 @@ mod tests {
     fn tiny_i420_frame() -> I420Frame<'static> {
         I420Frame {
             info: FrameInfo::i420(2, 2, 2, 2, 0).unwrap(),
-            y: Plane {
-                data: &[1, 2, 3, 4],
-                stride: 2,
-                width: 2,
-                height: 2,
-            },
-            u: Plane {
-                data: &[5],
-                stride: 1,
-                width: 1,
-                height: 1,
-            },
-            v: Plane {
-                data: &[6],
-                stride: 1,
-                width: 1,
-                height: 1,
-            },
+            y: plane(&[1, 2, 3, 4], 2, 2, 2),
+            u: plane(&[5], 1, 1, 1),
+            v: plane(&[6], 1, 1, 1),
+        }
+    }
+
+    fn plane(data: &[u8], width: u32, height: u32, stride: usize) -> Plane<'_> {
+        Plane {
+            data,
+            shape: PlaneShape::new(width, height, stride),
         }
     }
 }
