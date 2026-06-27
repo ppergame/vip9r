@@ -36,6 +36,7 @@ pub(crate) type CompModeProb = [u8; COMP_MODE_CONTEXTS];
 pub(crate) type SingleRefProb = [[u8; 2]; REF_CONTEXTS];
 pub(crate) type CompRefProb = [u8; REF_CONTEXTS];
 pub(crate) type YModeProbs = [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS];
+pub(crate) type UvModeProbs = [[u8; INTRA_MODES - 1]; INTRA_MODES];
 pub(crate) type PartitionProbs = [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,7 @@ pub(crate) struct FrameContext {
     pub(crate) single_ref_prob: SingleRefProb,
     pub(crate) comp_ref_prob: CompRefProb,
     pub(crate) y_mode_probs: YModeProbs,
+    pub(crate) uv_mode_probs: UvModeProbs,
     pub(crate) partition_probs: PartitionProbs,
     pub(crate) mv_probs: MvProbs,
 }
@@ -93,6 +95,7 @@ impl FrameContext {
         single_ref_prob: DEFAULT_SINGLE_REF_PROB,
         comp_ref_prob: DEFAULT_COMP_REF_PROB,
         y_mode_probs: DEFAULT_Y_MODE_PROBS,
+        uv_mode_probs: DEFAULT_UV_MODE_PROBS,
         partition_probs: DEFAULT_PARTITION_PROBS,
         mv_probs: MvProbs::DEFAULT,
     };
@@ -130,6 +133,7 @@ impl ProbabilityState {
         self.current.single_ref_prob = context.single_ref_prob;
         self.current.comp_ref_prob = context.comp_ref_prob;
         self.current.y_mode_probs = context.y_mode_probs;
+        self.current.uv_mode_probs = context.uv_mode_probs;
         self.current.partition_probs = context.partition_probs;
         self.current.mv_probs = context.mv_probs;
         Ok(())
@@ -199,6 +203,19 @@ const DEFAULT_Y_MODE_PROBS: YModeProbs = [
     [132, 68, 18, 165, 217, 196, 45, 40, 78],
     [173, 80, 19, 176, 240, 193, 64, 35, 46],
     [221, 135, 38, 194, 248, 121, 96, 85, 29],
+];
+
+const DEFAULT_UV_MODE_PROBS: UvModeProbs = [
+    [120, 7, 76, 176, 208, 126, 28, 54, 103],
+    [48, 12, 154, 155, 139, 90, 34, 117, 119],
+    [67, 6, 25, 204, 243, 158, 13, 21, 96],
+    [97, 5, 44, 131, 176, 139, 48, 68, 97],
+    [83, 5, 42, 156, 111, 152, 26, 49, 152],
+    [80, 5, 58, 178, 74, 83, 33, 62, 145],
+    [86, 5, 32, 154, 192, 168, 14, 22, 163],
+    [85, 5, 32, 156, 216, 148, 19, 29, 73],
+    [77, 7, 64, 116, 132, 122, 37, 126, 120],
+    [101, 21, 107, 181, 192, 103, 19, 67, 125],
 ];
 
 const DEFAULT_PARTITION_PROBS: PartitionProbs = [

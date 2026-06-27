@@ -51,7 +51,9 @@ harness.
 - [x] key/intra tile partition and mode-info syntax through residual handoff
 - [x] key/intra residual traversal and coefficient token syntax parse-only
 - [x] inter compressed-header parser and default non-coef/MV probability state
-- [ ] decompose the decode path into reviewable, grinder-sized blocks
+- [x] inter tile partition/mode-info/MV syntax and residual parse-only
+- [ ] syntax counts and adaptive probability refresh
+- [ ] decompose the remaining decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 
 ### M2 — Decode, correct (bring-up campaign)

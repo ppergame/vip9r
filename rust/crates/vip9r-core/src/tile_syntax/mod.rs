@@ -1,9 +1,11 @@
 use crate::DecodeError;
 use crate::boolcoder::BoolDecoder;
-use crate::compressed_header::{CompressedHeader, TxMode};
+use crate::compressed_header::{
+    CompoundReferenceSetup, CompressedHeader, InterReferenceFrame, ReferenceMode, TxMode,
+};
 use crate::error::ParserError;
-use crate::header::UncompressedFrameHeader;
-use crate::probability::FrameContext;
+use crate::header::{InterpolationFilter, UncompressedFrameHeader};
+use crate::probability::{CLASS0_SIZE, FrameContext, MV_OFFSET_BITS};
 use crate::tile::{TileDescriptor, TileLayout};
 
 mod tables;
@@ -24,6 +26,23 @@ const SUBSAMPLING_X: usize = 1;
 const SUBSAMPLING_Y: usize = 1;
 const MAX_TX_COEFFS: usize = 1024;
 const TOKEN_TREE_NODES: usize = 10;
+const REF_LISTS: usize = 2;
+const SUB_BLOCKS: usize = 4;
+const INTRA_FRAME: u8 = 0;
+const NONE_FRAME: u8 = 0;
+const LAST_FRAME: u8 = 1;
+const GOLDEN_FRAME: u8 = 2;
+const ALTREF_FRAME: u8 = 3;
+const NEARESTMV: u8 = 10;
+const ZEROMV: u8 = 12;
+const SWITCHABLE_FILTER_SENTINEL: u8 = 3;
+const MVREF_NEIGHBOURS: usize = 8;
+const MAX_MV_REF_CANDIDATES: usize = 2;
+const INTER_MODE_CONTEXTS_U8: u8 = 7;
+const MV_BORDER: i32 = 128;
+const BORDERINPIXELS: i32 = 160;
+const INTERP_EXTEND: i32 = 4;
+const COMPANDED_MVREF_THRESH: i32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TileSyntaxError {
@@ -70,30 +89,85 @@ pub(crate) fn parse_intra_tiles(
     let mut contexts = TileModeContexts::new(mi_cols)?;
 
     for tile in layout.as_slice() {
-        parse_intra_tile(
-            frame,
-            tile,
-            compressed_header.tx_mode,
-            header.lossless,
-            probabilities,
-            &mut contexts,
-            (mi_rows, mi_cols),
-        )?;
+        let config = TileParserConfig {
+            frame_is_intra: true,
+            tx_mode: compressed_header.tx_mode,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: None,
+            allow_high_precision_mv: false,
+            ref_frame_sign_bias: [false; 4],
+            lossless: header.lossless,
+            frame_mis: (mi_rows, mi_cols),
+        };
+        parse_tile(frame, tile, config, probabilities, &mut contexts)?;
     }
 
     Ok(())
 }
 
-fn parse_intra_tile(
+pub(crate) fn parse_inter_tiles(
+    frame: &[u8],
+    header: &UncompressedFrameHeader,
+    compressed_header: &CompressedHeader,
+    probabilities: &FrameContext,
+    layout: &TileLayout,
+) -> Result<(), TileSyntaxError> {
+    if header.frame_is_intra || header.show_existing_frame {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    if header.profile != 0 || header.bit_depth != 8 {
+        return Err(TileSyntaxError::Unimplemented);
+    }
+
+    if header.segmentation_enabled || header.segmentation_update_map {
+        return Err(TileSyntaxError::Unimplemented);
+    }
+
+    let mi_cols = mi_size(header.frame_width)?;
+    let mi_rows = mi_size(header.frame_height)?;
+    let mut contexts = TileModeContexts::new(mi_cols)?;
+
+    for tile in layout.as_slice() {
+        let config = TileParserConfig {
+            frame_is_intra: false,
+            tx_mode: compressed_header.tx_mode,
+            reference_mode: compressed_header.reference_mode,
+            compound_reference: compressed_header.compound_reference,
+            interpolation_filter: header.interpolation_filter,
+            allow_high_precision_mv: header.allow_high_precision_mv,
+            ref_frame_sign_bias: header.ref_frame_sign_bias,
+            lossless: header.lossless,
+            frame_mis: (mi_rows, mi_cols),
+        };
+        parse_tile(frame, tile, config, probabilities, &mut contexts)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TileParserConfig {
+    frame_is_intra: bool,
+    tx_mode: TxMode,
+    reference_mode: ReferenceMode,
+    compound_reference: Option<CompoundReferenceSetup>,
+    interpolation_filter: Option<InterpolationFilter>,
+    allow_high_precision_mv: bool,
+    ref_frame_sign_bias: [bool; 4],
+    lossless: bool,
+    frame_mis: (usize, usize),
+}
+
+fn parse_tile(
     frame: &[u8],
     tile: &TileDescriptor,
-    tx_mode: TxMode,
-    lossless: bool,
+    config: TileParserConfig,
     probabilities: &FrameContext,
     contexts: &mut TileModeContexts,
-    frame_mis: (usize, usize),
 ) -> Result<(), TileSyntaxError> {
-    let (mi_rows, mi_cols) = frame_mis;
+    let (mi_rows, mi_cols) = config.frame_mis;
     let payload = frame
         .get(tile.payload_start..tile.payload_end)
         .ok_or(TileSyntaxError::InvalidBitstream)?;
@@ -119,11 +193,18 @@ fn parse_intra_tile(
         decoder,
         probabilities,
         contexts,
-        tx_mode,
-        lossless,
+        tx_mode: config.tx_mode,
+        frame_is_intra: config.frame_is_intra,
+        reference_mode: config.reference_mode,
+        compound_reference: config.compound_reference,
+        interpolation_filter: config.interpolation_filter,
+        allow_high_precision_mv: config.allow_high_precision_mv,
+        ref_frame_sign_bias: config.ref_frame_sign_bias,
+        lossless: config.lossless,
         mi_rows,
         mi_cols,
         tile_col_start,
+        tile_col_end,
         left_row_base: tile_row_start,
     };
 
@@ -154,11 +235,40 @@ struct TileParser<'a, 'b> {
     probabilities: &'b FrameContext,
     contexts: &'b mut TileModeContexts,
     tx_mode: TxMode,
+    frame_is_intra: bool,
+    reference_mode: ReferenceMode,
+    compound_reference: Option<CompoundReferenceSetup>,
+    interpolation_filter: Option<InterpolationFilter>,
+    allow_high_precision_mv: bool,
+    ref_frame_sign_bias: [bool; 4],
     lossless: bool,
     mi_rows: usize,
     mi_cols: usize,
     tile_col_start: usize,
+    tile_col_end: usize,
     left_row_base: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockModeContext {
+    row: usize,
+    col: usize,
+    block_size: BlockSize,
+    tx_size: TxSize,
+    skip: bool,
+    segment_id: u8,
+    avail_u: bool,
+    avail_l: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Sub8x8MvContext {
+    row: usize,
+    col: usize,
+    block_size: BlockSize,
+    ref_frame: u8,
+    block: usize,
+    ref_list: usize,
 }
 
 impl TileParser<'_, '_> {
@@ -232,7 +342,11 @@ impl TileParser<'_, '_> {
         let ctx = self
             .contexts
             .partition_context(self.left_row_base, row, col, block_size)?;
-        let probs = &KF_PARTITION_PROBS[ctx];
+        let probs = if self.frame_is_intra {
+            &KF_PARTITION_PROBS[ctx]
+        } else {
+            &self.probabilities.partition_probs[ctx]
+        };
         let raw = if has_rows && has_cols {
             self.decoder.read_tree(&PARTITION_TREE, probs)?
         } else if has_cols {
@@ -252,9 +366,15 @@ impl TileParser<'_, '_> {
     ) -> Result<(), TileSyntaxError> {
         let avail_u = row > 0;
         let avail_l = col > self.tile_col_start;
-        let block = self.intra_frame_mode_info(row, col, block_size, avail_u, avail_l)?;
-
-        self.decode_residual(row, col, block_size, block)?;
+        let mut block = if self.frame_is_intra {
+            self.intra_frame_mode_info(row, col, block_size, avail_u, avail_l)?
+        } else {
+            self.inter_frame_mode_info(row, col, block_size, avail_u, avail_l)?
+        };
+        let has_nonzero_coefficients = self.decode_residual(row, col, block_size, block)?;
+        if block.is_inter && block_size.is_at_least_8x8() && !has_nonzero_coefficients {
+            block.skip = true;
+        }
         self.contexts
             .update_mode_context(self.left_row_base, row, col, block_size, block)?;
         Ok(())
@@ -270,17 +390,218 @@ impl TileParser<'_, '_> {
     ) -> Result<DecodedBlockInfo, TileSyntaxError> {
         let segment_id = 0;
         let skip = self.read_skip(row, col, avail_u, avail_l)?;
-        let tx_size = self.read_tx_size(row, col, block_size, avail_u, avail_l)?;
+        let tx_size = self.read_tx_size(row, col, block_size, true, avail_u, avail_l)?;
         let (y_mode, sub_modes) = self.read_intra_modes(row, col, block_size, avail_u, avail_l)?;
         let uv_mode = self.read_default_uv_mode(y_mode)?;
 
         Ok(DecodedBlockInfo {
             skip,
             tx_size,
-            y_mode,
+            y_mode: y_mode.raw(),
             uv_mode,
             sub_modes,
             segment_id,
+            is_inter: false,
+            ref_frames: [INTRA_FRAME, NONE_FRAME],
+            interp_filter: SWITCHABLE_FILTER_SENTINEL,
+            block_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
+        })
+    }
+
+    fn inter_frame_mode_info(
+        &mut self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        avail_u: bool,
+        avail_l: bool,
+    ) -> Result<DecodedBlockInfo, TileSyntaxError> {
+        let left = if avail_l {
+            self.contexts.left_mode(self.left_row_base, row)?
+        } else {
+            NeighborModeInfo::DEFAULT
+        };
+        let above = if avail_u {
+            self.contexts.above_mode(col)?
+        } else {
+            NeighborModeInfo::DEFAULT
+        };
+        let left_intra = left.ref_frames[0] == INTRA_FRAME;
+        let above_intra = above.ref_frames[0] == INTRA_FRAME;
+        let segment_id = 0;
+        let skip = self.read_skip(row, col, avail_u, avail_l)?;
+        let is_inter = self.read_is_inter(avail_u, avail_l, left_intra, above_intra)?;
+        let tx_size =
+            self.read_tx_size(row, col, block_size, !skip || !is_inter, avail_u, avail_l)?;
+        let block_context = BlockModeContext {
+            row,
+            col,
+            block_size,
+            tx_size,
+            skip,
+            segment_id,
+            avail_u,
+            avail_l,
+        };
+
+        if is_inter {
+            self.inter_block_mode_info(block_context, left, above)
+        } else {
+            self.intra_block_mode_info(block_context)
+        }
+    }
+
+    fn read_is_inter(
+        &mut self,
+        avail_u: bool,
+        avail_l: bool,
+        left_intra: bool,
+        above_intra: bool,
+    ) -> Result<bool, TileSyntaxError> {
+        let ctx = if avail_u && avail_l {
+            if left_intra && above_intra {
+                3
+            } else {
+                usize::from(left_intra || above_intra)
+            }
+        } else if avail_u || avail_l {
+            2 * usize::from(if avail_u { above_intra } else { left_intra })
+        } else {
+            0
+        };
+        Ok(self
+            .decoder
+            .read_bool(self.probabilities.is_inter_prob[ctx])?)
+    }
+
+    fn intra_block_mode_info(
+        &mut self,
+        context: BlockModeContext,
+    ) -> Result<DecodedBlockInfo, TileSyntaxError> {
+        let (y_mode, sub_modes) = self.read_intra_block_modes(
+            context.row,
+            context.col,
+            context.block_size,
+            context.avail_u,
+            context.avail_l,
+        )?;
+        let uv_mode = self.read_uv_mode(y_mode)?;
+
+        Ok(DecodedBlockInfo {
+            skip: context.skip,
+            tx_size: context.tx_size,
+            y_mode: y_mode.raw(),
+            uv_mode,
+            sub_modes,
+            segment_id: context.segment_id,
+            is_inter: false,
+            ref_frames: [INTRA_FRAME, NONE_FRAME],
+            interp_filter: SWITCHABLE_FILTER_SENTINEL,
+            block_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
+        })
+    }
+
+    fn inter_block_mode_info(
+        &mut self,
+        context: BlockModeContext,
+        left: NeighborModeInfo,
+        above: NeighborModeInfo,
+    ) -> Result<DecodedBlockInfo, TileSyntaxError> {
+        let ref_frames = self.read_ref_frames(
+            left,
+            above,
+            context.col > self.tile_col_start,
+            context.row > 0,
+        )?;
+        let is_compound = ref_frames[1] > INTRA_FRAME;
+        let ref_count = 1 + usize::from(is_compound);
+        let mut mv_state = [MvRefState::DEFAULT; REF_LISTS];
+        for ref_list in 0..ref_count {
+            let state = self.find_mv_refs(
+                context.row,
+                context.col,
+                context.block_size,
+                ref_frames[ref_list],
+                -1,
+            )?;
+            mv_state[ref_list] =
+                self.find_best_ref_mvs(context.row, context.col, context.block_size, state);
+        }
+
+        let mut y_mode = ZEROMV;
+        let mut block_mvs = [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS];
+        if context.block_size.is_at_least_8x8() {
+            let inter_mode = self.read_inter_mode(mv_state[0].mode_context)?;
+            y_mode = inter_mode.y_mode();
+        }
+
+        let interp_filter = self.read_block_interp_filter(context.row, context.col, left, above)?;
+
+        if context.block_size < BlockSize::Block8x8 {
+            let num4x4w = usize::from(context.block_size.num_4x4_wide());
+            let num4x4h = usize::from(context.block_size.num_4x4_high());
+            let mut idy = 0usize;
+            while idy < 2 {
+                let mut idx = 0usize;
+                while idx < 2 {
+                    let block = idy * 2 + idx;
+                    let inter_mode = self.read_inter_mode(mv_state[0].mode_context)?;
+                    y_mode = inter_mode.y_mode();
+                    if matches!(inter_mode, InterMode::Nearest | InterMode::Near) {
+                        for (ref_list, state) in mv_state.iter_mut().enumerate().take(ref_count) {
+                            *state = self.append_sub8x8_mvs(
+                                Sub8x8MvContext {
+                                    row: context.row,
+                                    col: context.col,
+                                    block_size: context.block_size,
+                                    ref_frame: ref_frames[ref_list],
+                                    block,
+                                    ref_list,
+                                },
+                                &block_mvs,
+                                *state,
+                            )?;
+                        }
+                    }
+                    let assigned = self.assign_mv(inter_mode, is_compound, &mv_state)?;
+                    for y2 in 0..num4x4h {
+                        for x2 in 0..num4x4w {
+                            let dst = (idy + y2) * 2 + idx + x2;
+                            for ref_list in 0..ref_count {
+                                block_mvs[ref_list][dst] = assigned[ref_list];
+                            }
+                        }
+                    }
+
+                    idx = idx
+                        .checked_add(num4x4w)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                }
+                idy = idy
+                    .checked_add(num4x4h)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+        } else {
+            let inter_mode = InterMode::from_y_mode(y_mode)?;
+            let assigned = self.assign_mv(inter_mode, is_compound, &mv_state)?;
+            for ref_list in 0..ref_count {
+                for mv in block_mvs[ref_list].iter_mut().take(SUB_BLOCKS) {
+                    *mv = assigned[ref_list];
+                }
+            }
+        }
+
+        Ok(DecodedBlockInfo {
+            skip: context.skip,
+            tx_size: context.tx_size,
+            y_mode,
+            uv_mode: IntraMode::Dc,
+            sub_modes: [IntraMode::Dc; SUB_BLOCKS],
+            segment_id: context.segment_id,
+            is_inter: true,
+            ref_frames,
+            interp_filter,
+            block_mvs,
         })
     }
 
@@ -302,11 +623,12 @@ impl TileParser<'_, '_> {
         row: usize,
         col: usize,
         block_size: BlockSize,
+        allow_select: bool,
         avail_u: bool,
         avail_l: bool,
     ) -> Result<TxSize, TileSyntaxError> {
         let max_tx_size = block_size.max_tx_size();
-        if self.tx_mode == TxMode::Select && block_size.is_at_least_8x8() {
+        if allow_select && self.tx_mode == TxMode::Select && block_size.is_at_least_8x8() {
             let ctx = self.contexts.tx_size_context(
                 self.left_row_base,
                 row,
@@ -396,6 +718,47 @@ impl TileParser<'_, '_> {
         Ok((y_mode, sub_modes))
     }
 
+    fn read_intra_block_modes(
+        &mut self,
+        _row: usize,
+        _col: usize,
+        block_size: BlockSize,
+        _avail_u: bool,
+        _avail_l: bool,
+    ) -> Result<(IntraMode, [IntraMode; 4]), TileSyntaxError> {
+        if block_size.is_at_least_8x8() {
+            let y_mode = self.read_inter_intra_mode(size_group(block_size))?;
+            return Ok((y_mode, [y_mode; 4]));
+        }
+
+        let num4x4w = usize::from(block_size.num_4x4_wide());
+        let num4x4h = usize::from(block_size.num_4x4_high());
+        let mut sub_modes = [IntraMode::Dc; 4];
+        let mut y_mode = IntraMode::Dc;
+        let mut idy = 0usize;
+        while idy < 2 {
+            let mut idx = 0usize;
+            while idx < 2 {
+                y_mode = self.read_inter_intra_mode(0)?;
+
+                for y2 in 0..num4x4h {
+                    for x2 in 0..num4x4w {
+                        sub_modes[(idy + y2) * 2 + idx + x2] = y_mode;
+                    }
+                }
+
+                idx = idx
+                    .checked_add(num4x4w)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+            idy = idy
+                .checked_add(num4x4h)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+        }
+
+        Ok((y_mode, sub_modes))
+    }
+
     fn read_default_intra_mode(
         &mut self,
         above_mode: IntraMode,
@@ -406,10 +769,510 @@ impl TileParser<'_, '_> {
         IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
     }
 
+    fn read_inter_intra_mode(&mut self, ctx: usize) -> Result<IntraMode, TileSyntaxError> {
+        let probs = self
+            .probabilities
+            .y_mode_probs
+            .get(ctx)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
+        IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
     fn read_default_uv_mode(&mut self, y_mode: IntraMode) -> Result<IntraMode, TileSyntaxError> {
         let probs = &KF_UV_MODE_PROBS[y_mode.index()];
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
         IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn read_uv_mode(&mut self, y_mode: IntraMode) -> Result<IntraMode, TileSyntaxError> {
+        let probs = &self.probabilities.uv_mode_probs[y_mode.index()];
+        let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
+        IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn read_ref_frames(
+        &mut self,
+        left: NeighborModeInfo,
+        above: NeighborModeInfo,
+        avail_l: bool,
+        avail_u: bool,
+    ) -> Result<[u8; REF_LISTS], TileSyntaxError> {
+        if self.reference_mode == ReferenceMode::Select {
+            let ctx = self.comp_mode_context(left, above, avail_l, avail_u)?;
+            let compound = self
+                .decoder
+                .read_bool(self.probabilities.comp_mode_prob[ctx])?;
+            if compound {
+                return self.read_compound_ref_frames(left, above, avail_l, avail_u);
+            }
+        } else if self.reference_mode == ReferenceMode::Compound {
+            return self.read_compound_ref_frames(left, above, avail_l, avail_u);
+        }
+
+        let ctx = single_ref_p1_context(left, above, avail_l, avail_u);
+        let single_ref_p1 = self
+            .decoder
+            .read_bool(self.probabilities.single_ref_prob[ctx][0])?;
+        let ref_frame = if single_ref_p1 {
+            let ctx = single_ref_p2_context(left, above, avail_l, avail_u);
+            if self
+                .decoder
+                .read_bool(self.probabilities.single_ref_prob[ctx][1])?
+            {
+                ALTREF_FRAME
+            } else {
+                GOLDEN_FRAME
+            }
+        } else {
+            LAST_FRAME
+        };
+        Ok([ref_frame, NONE_FRAME])
+    }
+
+    fn read_compound_ref_frames(
+        &mut self,
+        left: NeighborModeInfo,
+        above: NeighborModeInfo,
+        avail_l: bool,
+        avail_u: bool,
+    ) -> Result<[u8; REF_LISTS], TileSyntaxError> {
+        let compound = self
+            .compound_reference
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let ctx = comp_ref_context(
+            compound,
+            left,
+            above,
+            avail_l,
+            avail_u,
+            self.ref_sign_biases(),
+        )?;
+        let comp_ref = usize::from(
+            self.decoder
+                .read_bool(self.probabilities.comp_ref_prob[ctx])?,
+        );
+        let fixed_ref = reference_frame_raw(compound.comp_fixed_ref);
+        let variable_ref = reference_frame_raw(compound.comp_var_ref[comp_ref]);
+        let fixed_index = usize::from(self.sign_bias(fixed_ref)?);
+        let mut ref_frames = [NONE_FRAME; REF_LISTS];
+        ref_frames[fixed_index] = fixed_ref;
+        ref_frames[1 - fixed_index] = variable_ref;
+        Ok(ref_frames)
+    }
+
+    fn comp_mode_context(
+        &self,
+        left: NeighborModeInfo,
+        above: NeighborModeInfo,
+        avail_l: bool,
+        avail_u: bool,
+    ) -> Result<usize, TileSyntaxError> {
+        let compound = self
+            .compound_reference
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let fixed_ref = reference_frame_raw(compound.comp_fixed_ref);
+        let left_intra = left.ref_frames[0] == INTRA_FRAME;
+        let above_intra = above.ref_frames[0] == INTRA_FRAME;
+        let left_single = left.ref_frames[1] == NONE_FRAME;
+        let above_single = above.ref_frames[1] == NONE_FRAME;
+        let ctx = if avail_u && avail_l {
+            if above_single && left_single {
+                usize::from((above.ref_frames[0] == fixed_ref) ^ (left.ref_frames[0] == fixed_ref))
+            } else if above_single {
+                2 + usize::from(above.ref_frames[0] == fixed_ref || above_intra)
+            } else if left_single {
+                2 + usize::from(left.ref_frames[0] == fixed_ref || left_intra)
+            } else {
+                4
+            }
+        } else if avail_u {
+            if above_single {
+                usize::from(above.ref_frames[0] == fixed_ref)
+            } else {
+                3
+            }
+        } else if avail_l {
+            if left_single {
+                usize::from(left.ref_frames[0] == fixed_ref)
+            } else {
+                3
+            }
+        } else {
+            1
+        };
+        Ok(ctx)
+    }
+
+    fn read_inter_mode(&mut self, ctx: usize) -> Result<InterMode, TileSyntaxError> {
+        let probs = self
+            .probabilities
+            .inter_mode_probs
+            .get(ctx)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let raw = self.decoder.read_tree(&INTER_MODE_TREE, probs)?;
+        InterMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn read_block_interp_filter(
+        &mut self,
+        row: usize,
+        col: usize,
+        left: NeighborModeInfo,
+        above: NeighborModeInfo,
+    ) -> Result<u8, TileSyntaxError> {
+        match self
+            .interpolation_filter
+            .ok_or(TileSyntaxError::InvalidBitstream)?
+        {
+            InterpolationFilter::Switchable => {
+                let left_interp = if col > self.tile_col_start && left.ref_frames[0] > INTRA_FRAME {
+                    left.interp_filter
+                } else {
+                    SWITCHABLE_FILTER_SENTINEL
+                };
+                let above_interp = if row > 0 && above.ref_frames[0] > INTRA_FRAME {
+                    above.interp_filter
+                } else {
+                    SWITCHABLE_FILTER_SENTINEL
+                };
+                let ctx = if left_interp == above_interp {
+                    left_interp
+                } else if left_interp == SWITCHABLE_FILTER_SENTINEL
+                    && above_interp != SWITCHABLE_FILTER_SENTINEL
+                {
+                    above_interp
+                } else if left_interp != SWITCHABLE_FILTER_SENTINEL
+                    && above_interp == SWITCHABLE_FILTER_SENTINEL
+                {
+                    left_interp
+                } else {
+                    SWITCHABLE_FILTER_SENTINEL
+                };
+                let probs = &self.probabilities.interp_filter_probs[usize::from(ctx)];
+                self.decoder
+                    .read_tree(&INTERP_FILTER_TREE, probs)
+                    .map_err(TileSyntaxError::from)
+            }
+            filter => fixed_interp_filter(filter),
+        }
+    }
+
+    fn assign_mv(
+        &mut self,
+        inter_mode: InterMode,
+        is_compound: bool,
+        mv_state: &[MvRefState; REF_LISTS],
+    ) -> Result<[MotionVector; REF_LISTS], TileSyntaxError> {
+        let mut mvs = [MotionVector::ZERO; REF_LISTS];
+        for ref_list in 0..(1 + usize::from(is_compound)) {
+            mvs[ref_list] = match inter_mode {
+                InterMode::New => self.read_mv(mv_state[ref_list].best)?,
+                InterMode::Nearest => mv_state[ref_list].nearest,
+                InterMode::Near => mv_state[ref_list].near,
+                InterMode::Zero => MotionVector::ZERO,
+            };
+        }
+        Ok(mvs)
+    }
+
+    fn read_mv(&mut self, best_mv: MotionVector) -> Result<MotionVector, TileSyntaxError> {
+        let use_hp = self.allow_high_precision_mv && use_mv_hp(best_mv);
+        let joint = self
+            .decoder
+            .read_tree(&MV_JOINT_TREE, &self.probabilities.mv_probs.joint)?;
+        let mut diff_row = 0i32;
+        let mut diff_col = 0i32;
+        if matches!(joint, 2 | 3) {
+            diff_row = self.read_mv_component(0, use_hp)?;
+        }
+        if matches!(joint, 1 | 3) {
+            diff_col = self.read_mv_component(1, use_hp)?;
+        }
+        let diff = MotionVector::new(diff_row, diff_col)?;
+        best_mv.add(diff)
+    }
+
+    fn read_mv_component(&mut self, comp: usize, use_hp: bool) -> Result<i32, TileSyntaxError> {
+        let probs = &self.probabilities.mv_probs;
+        let sign = self.decoder.read_bool(probs.sign[comp])?;
+        let mv_class = usize::from(self.decoder.read_tree(&MV_CLASS_TREE, &probs.class[comp])?);
+        let mag = if mv_class == 0 {
+            let class0_bit = usize::from(self.decoder.read_bool(probs.class0_bit[comp])?);
+            let class0_fr = usize::from(
+                self.decoder
+                    .read_tree(&MV_FR_TREE, &probs.class0_fr[comp][class0_bit])?,
+            );
+            let class0_hp = if use_hp {
+                usize::from(self.decoder.read_bool(probs.class0_hp[comp])?)
+            } else {
+                1
+            };
+            ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
+        } else {
+            let mut d = 0usize;
+            for i in 0..mv_class {
+                if i >= MV_OFFSET_BITS {
+                    return Err(TileSyntaxError::InvalidBitstream);
+                }
+                if self.decoder.read_bool(probs.bits[comp][i])? {
+                    d |= 1usize << i;
+                }
+            }
+            let mv_fr = usize::from(self.decoder.read_tree(&MV_FR_TREE, &probs.fr[comp])?);
+            let mv_hp = if use_hp {
+                usize::from(self.decoder.read_bool(probs.hp[comp])?)
+            } else {
+                1
+            };
+            (CLASS0_SIZE << (mv_class + 2)) + ((d << 3) | (mv_fr << 1) | mv_hp) + 1
+        };
+        let mag = i32::try_from(mag).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        Ok(if sign { -mag } else { mag })
+    }
+
+    fn find_mv_refs(
+        &self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        ref_frame: u8,
+        block: i8,
+    ) -> Result<MvRefState, TileSyntaxError> {
+        let mut state = MvRefState::DEFAULT;
+        let mut different_ref_found = false;
+        let mut context_counter = 0usize;
+        let search = &MV_REF_BLOCKS[block_size.index()];
+
+        for candidate in search.iter().take(2) {
+            if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
+                different_ref_found = true;
+                context_counter = context_counter
+                    .checked_add(usize::from(MODE_2_COUNTER[usize::from(info.y_mode)]))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                for ref_list in 0..REF_LISTS {
+                    if info.ref_frames[ref_list] == ref_frame {
+                        let mv = get_sub_block_mv(info, ref_list, candidate[1], block)?;
+                        state.add_mv_ref(mv);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for candidate in search.iter().skip(2) {
+            if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
+                different_ref_found = true;
+                if_same_ref_frame_add_mv(&mut state, info, ref_frame);
+            }
+        }
+
+        // Parse-only shortcut: previous-frame motion-vector candidates are not
+        // retained yet, so UsePrevFrameMvs is treated as false. The current
+        // frame's above/left candidates are still used for inter_mode contexts
+        // and MV syntax decisions.
+        if different_ref_found {
+            for candidate in search {
+                if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
+                    if_diff_ref_frame_add_mv(&mut state, info, ref_frame, self.ref_sign_biases())?;
+                }
+            }
+        }
+
+        let mode_context = *COUNTER_TO_CONTEXT
+            .get(context_counter)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if mode_context >= INTER_MODE_CONTEXTS_U8 {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        state.mode_context = usize::from(mode_context);
+        for mv in &mut state.ref_list {
+            *mv = self.clamp_mv_ref(row, col, block_size, *mv, MV_BORDER)?;
+        }
+        Ok(state)
+    }
+
+    fn append_sub8x8_mvs(
+        &self,
+        context: Sub8x8MvContext,
+        block_mvs: &[[MotionVector; SUB_BLOCKS]; REF_LISTS],
+        mut state: MvRefState,
+    ) -> Result<MvRefState, TileSyntaxError> {
+        let found = self.find_mv_refs(
+            context.row,
+            context.col,
+            context.block_size,
+            context.ref_frame,
+            i8::try_from(context.block).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        )?;
+        state.mode_context = found.mode_context;
+        let mut sub8x8 = [MotionVector::ZERO; MAX_MV_REF_CANDIDATES];
+        let mut dst = 0usize;
+        if context.block == 0 {
+            sub8x8 = found.ref_list;
+            dst = MAX_MV_REF_CANDIDATES;
+        } else if context.block <= 2 {
+            sub8x8[dst] = block_mvs[context.ref_list][0];
+            dst += 1;
+        } else {
+            sub8x8[dst] = block_mvs[context.ref_list][2];
+            dst += 1;
+            for idx in (0..=1).rev() {
+                let mv = block_mvs[context.ref_list][idx];
+                if dst < MAX_MV_REF_CANDIDATES && mv != sub8x8[0] {
+                    sub8x8[dst] = mv;
+                    dst += 1;
+                }
+            }
+        }
+        for mv in found.ref_list {
+            if dst < MAX_MV_REF_CANDIDATES && mv != sub8x8[0] {
+                sub8x8[dst] = mv;
+                dst += 1;
+            }
+        }
+        if dst < MAX_MV_REF_CANDIDATES {
+            sub8x8[dst] = MotionVector::ZERO;
+        }
+        state.nearest = sub8x8[0];
+        state.near = sub8x8[1];
+        Ok(state)
+    }
+
+    fn find_best_ref_mvs(
+        &self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        mut state: MvRefState,
+    ) -> MvRefState {
+        for mv in &mut state.ref_list {
+            if !self.allow_high_precision_mv || !use_mv_hp(*mv) {
+                mv.row = i16::try_from(lower_mv_precision(i32::from(mv.row))).unwrap_or(0);
+                mv.col = i16::try_from(lower_mv_precision(i32::from(mv.col))).unwrap_or(0);
+            }
+            *mv = self
+                .clamp_mv_ref(
+                    row,
+                    col,
+                    block_size,
+                    *mv,
+                    (BORDERINPIXELS - INTERP_EXTEND) << 3,
+                )
+                .unwrap_or(MotionVector::ZERO);
+        }
+        state.nearest = state.ref_list[0];
+        state.near = state.ref_list[1];
+        state.best = state.ref_list[0];
+        state
+    }
+
+    fn mv_ref_candidate(
+        &self,
+        row: usize,
+        col: usize,
+        candidate: &[i8; 2],
+    ) -> Result<Option<CandidateModeInfo>, TileSyntaxError> {
+        let candidate_r = isize::try_from(row)
+            .map_err(|_| TileSyntaxError::InvalidBitstream)?
+            .checked_add(isize::from(candidate[0]))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let candidate_c = isize::try_from(col)
+            .map_err(|_| TileSyntaxError::InvalidBitstream)?
+            .checked_add(isize::from(candidate[1]))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if candidate_r < 0
+            || candidate_c
+                < isize::try_from(self.tile_col_start)
+                    .map_err(|_| TileSyntaxError::InvalidBitstream)?
+            || candidate_c
+                >= isize::try_from(self.tile_col_end)
+                    .map_err(|_| TileSyntaxError::InvalidBitstream)?
+            || candidate_r
+                >= isize::try_from(self.mi_rows).map_err(|_| TileSyntaxError::InvalidBitstream)?
+        {
+            return Ok(None);
+        }
+
+        let candidate_r =
+            usize::try_from(candidate_r).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let candidate_c =
+            usize::try_from(candidate_c).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        if candidate_r < self.left_row_base {
+            return self
+                .contexts
+                .above_mode(candidate_c)
+                .map(|info| Some(CandidateModeInfo::from(info)));
+        }
+        if candidate_c < col {
+            let row_offset = row_offset(self.left_row_base, candidate_r)?;
+            return Ok(self
+                .contexts
+                .left_mode
+                .get(row_offset)
+                .copied()
+                .map(CandidateModeInfo::from));
+        }
+        if candidate_r < row {
+            return self
+                .contexts
+                .above_mode(candidate_c)
+                .map(|info| Some(CandidateModeInfo::from(info)));
+        }
+        Ok(None)
+    }
+
+    fn clamp_mv_ref(
+        &self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        mv: MotionVector,
+        border: i32,
+    ) -> Result<MotionVector, TileSyntaxError> {
+        let bh = i32::from(block_size.num_8x8_high());
+        let bw = i32::from(block_size.num_8x8_wide());
+        let row = i32::try_from(row).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let col = i32::try_from(col).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let mi_rows = i32::try_from(self.mi_rows).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let mi_cols = i32::try_from(self.mi_cols).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let top = -(row * 64);
+        let bottom = (mi_rows - bh - row) * 64;
+        let left = -(col * 64);
+        let right = (mi_cols - bw - col) * 64;
+        MotionVector::new(
+            clip3(top - border, bottom + border, i32::from(mv.row)),
+            clip3(left - border, right + border, i32::from(mv.col)),
+        )
+    }
+
+    fn ref_sign_biases(&self) -> [bool; 4] {
+        // The uncompressed header only defines sign bias for inter references.
+        // INTRA/NONE is always treated as unbiased for context calculations.
+        [
+            false,
+            self.sign_bias(LAST_FRAME).unwrap_or(false),
+            self.sign_bias(GOLDEN_FRAME).unwrap_or(false),
+            self.sign_bias(ALTREF_FRAME).unwrap_or(false),
+        ]
+    }
+
+    fn sign_bias(&self, ref_frame: u8) -> Result<bool, TileSyntaxError> {
+        self.sign_bias_from_header(ref_frame)
+    }
+
+    fn sign_bias_from_header(&self, ref_frame: u8) -> Result<bool, TileSyntaxError> {
+        // Tile parsing receives sign-bias values through the uncompressed header.
+        // The four-element layout is INTRA/LAST/GOLDEN/ALTREF.
+        // Stored as a helper so all raw reference-frame indexing stays checked.
+        self.header_sign_bias(ref_frame)
+    }
+
+    fn header_sign_bias(&self, ref_frame: u8) -> Result<bool, TileSyntaxError> {
+        self.ref_frame_sign_bias
+            .get(usize::from(ref_frame))
+            .copied()
+            .ok_or(TileSyntaxError::InvalidBitstream)
     }
 
     fn decode_residual(
@@ -418,12 +1281,13 @@ impl TileParser<'_, '_> {
         col: usize,
         mi_size: BlockSize,
         block: DecodedBlockInfo,
-    ) -> Result<(), TileSyntaxError> {
+    ) -> Result<bool, TileSyntaxError> {
         let bsize = if mi_size < BlockSize::Block8x8 {
             BlockSize::Block8x8
         } else {
             mi_size
         };
+        let mut any_nonzero = false;
 
         for plane in 0..PLANES {
             let tx_size = if plane > 0 {
@@ -487,6 +1351,7 @@ impl TileParser<'_, '_> {
                         step,
                         nonzero,
                     )?;
+                    any_nonzero |= nonzero;
                     block_idx = block_idx
                         .checked_add(1)
                         .ok_or(TileSyntaxError::InvalidBitstream)?;
@@ -500,7 +1365,7 @@ impl TileParser<'_, '_> {
             }
         }
 
-        Ok(())
+        Ok(any_nonzero)
     }
 
     fn tokens(
@@ -533,11 +1398,11 @@ impl TileParser<'_, '_> {
                 coefficient_token_context(pos, tx_size, tx_type, &token_cache)?
             };
 
-            if check_eob && !self.read_more_coefs(tx_size, plane, band, ctx)? {
+            if check_eob && !self.read_more_coefs(tx_size, plane, band, ctx, block)? {
                 break;
             }
 
-            let token = self.read_token(tx_size, plane, band, ctx)?;
+            let token = self.read_token(tx_size, plane, band, ctx, block)?;
             token_cache[pos] = ENERGY_CLASS[token.index()];
             if token == CoefToken::Zero {
                 check_eob = false;
@@ -564,6 +1429,9 @@ impl TileParser<'_, '_> {
         if plane > 0 || tx_size == TxSize::Tx32x32 || self.lossless {
             return Ok(TxType::DctDct);
         }
+        if block.is_inter {
+            return Ok(TxType::DctDct);
+        }
 
         let mode = if tx_size == TxSize::Tx4x4 && mi_size < BlockSize::Block8x8 {
             *block
@@ -571,7 +1439,7 @@ impl TileParser<'_, '_> {
                 .get(block_idx)
                 .ok_or(TileSyntaxError::InvalidBitstream)?
         } else {
-            block.y_mode
+            IntraMode::from_raw(block.y_mode).ok_or(TileSyntaxError::InvalidBitstream)?
         };
         Ok(MODE_TO_TXFM_MAP[mode.index()])
     }
@@ -582,9 +1450,10 @@ impl TileParser<'_, '_> {
         plane: usize,
         band: usize,
         ctx: usize,
+        block: DecodedBlockInfo,
     ) -> Result<bool, TileSyntaxError> {
-        let prob =
-            self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)][0][band][ctx][0];
+        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)]
+            [usize::from(block.is_inter)][band][ctx][0];
         Ok(self.decoder.read_bool(prob)?)
     }
 
@@ -594,11 +1463,12 @@ impl TileParser<'_, '_> {
         plane: usize,
         band: usize,
         ctx: usize,
+        block: DecodedBlockInfo,
     ) -> Result<CoefToken, TileSyntaxError> {
         let mut index = 0usize;
         loop {
             let node = index >> 1;
-            let probability = self.token_probability(tx_size, plane, band, ctx, node)?;
+            let probability = self.token_probability(tx_size, plane, band, ctx, node, block)?;
             let bit = usize::from(self.decoder.read_bool(probability)?);
             let next = *TOKEN_TREE
                 .get(
@@ -622,13 +1492,14 @@ impl TileParser<'_, '_> {
         band: usize,
         ctx: usize,
         node: usize,
+        block: DecodedBlockInfo,
     ) -> Result<u8, TileSyntaxError> {
         if node >= TOKEN_TREE_NODES {
             return Err(TileSyntaxError::InvalidBitstream);
         }
         let prob_index = core::cmp::min(2, node + 1);
-        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)][0][band]
-            [ctx][prob_index];
+        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)]
+            [usize::from(block.is_inter)][band][ctx][prob_index];
         pareto(node, prob)
     }
 
@@ -654,25 +1525,116 @@ impl TileParser<'_, '_> {
 struct DecodedBlockInfo {
     skip: bool,
     tx_size: TxSize,
-    y_mode: IntraMode,
+    y_mode: u8,
     uv_mode: IntraMode,
     sub_modes: [IntraMode; 4],
     segment_id: u8,
+    is_inter: bool,
+    ref_frames: [u8; REF_LISTS],
+    interp_filter: u8,
+    block_mvs: [[MotionVector; SUB_BLOCKS]; REF_LISTS],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NeighborModeInfo {
     skip: bool,
     tx_size: TxSize,
+    y_mode: u8,
     sub_modes: [IntraMode; 4],
+    ref_frames: [u8; REF_LISTS],
+    interp_filter: u8,
+    mvs: [MotionVector; REF_LISTS],
 }
 
 impl NeighborModeInfo {
     const DEFAULT: Self = Self {
         skip: false,
         tx_size: TxSize::Tx4x4,
+        y_mode: IntraMode::Dc as u8,
         sub_modes: [IntraMode::Dc; 4],
+        ref_frames: [INTRA_FRAME, NONE_FRAME],
+        interp_filter: SWITCHABLE_FILTER_SENTINEL,
+        mvs: [MotionVector::ZERO; REF_LISTS],
     };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateModeInfo {
+    y_mode: u8,
+    ref_frames: [u8; REF_LISTS],
+    interp_filter: u8,
+    mvs: [MotionVector; REF_LISTS],
+}
+
+impl From<NeighborModeInfo> for CandidateModeInfo {
+    fn from(info: NeighborModeInfo) -> Self {
+        Self {
+            y_mode: info.y_mode,
+            ref_frames: info.ref_frames,
+            interp_filter: info.interp_filter,
+            mvs: info.mvs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MotionVector {
+    row: i16,
+    col: i16,
+}
+
+impl MotionVector {
+    const ZERO: Self = Self { row: 0, col: 0 };
+
+    fn add(self, other: Self) -> Result<Self, TileSyntaxError> {
+        Self::new(
+            i32::from(self.row)
+                .checked_add(i32::from(other.row))
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            i32::from(self.col)
+                .checked_add(i32::from(other.col))
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        )
+    }
+
+    fn new(row: i32, col: i32) -> Result<Self, TileSyntaxError> {
+        Ok(Self {
+            row: i16::try_from(row).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+            col: i16::try_from(col).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MvRefState {
+    ref_list: [MotionVector; MAX_MV_REF_CANDIDATES],
+    nearest: MotionVector,
+    near: MotionVector,
+    best: MotionVector,
+    mode_context: usize,
+    count: usize,
+}
+
+impl MvRefState {
+    const DEFAULT: Self = Self {
+        ref_list: [MotionVector::ZERO; MAX_MV_REF_CANDIDATES],
+        nearest: MotionVector::ZERO,
+        near: MotionVector::ZERO,
+        best: MotionVector::ZERO,
+        mode_context: 0,
+        count: 0,
+    };
+
+    fn add_mv_ref(&mut self, mv: MotionVector) {
+        if self.count >= MAX_MV_REF_CANDIDATES {
+            return;
+        }
+        if self.count > 0 && self.ref_list[0] == mv {
+            return;
+        }
+        self.ref_list[self.count] = mv;
+        self.count += 1;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -934,10 +1896,18 @@ impl TileModeContexts {
         let _ = block.y_mode;
         let _ = block.uv_mode;
         let _ = block.segment_id;
+        let mut mvs = [MotionVector::ZERO; REF_LISTS];
+        for (ref_list, mv) in mvs.iter_mut().enumerate() {
+            *mv = block.block_mvs[ref_list][3];
+        }
         let mode_info = NeighborModeInfo {
             skip: block.skip,
             tx_size: block.tx_size,
+            y_mode: block.y_mode,
             sub_modes: block.sub_modes,
+            ref_frames: block.ref_frames,
+            interp_filter: block.interp_filter,
+            mvs,
         };
         let width = usize::from(block_size.num_8x8_wide());
         let height = usize::from(block_size.num_8x8_high());
@@ -1107,6 +2077,42 @@ impl IntraMode {
     const fn index(self) -> usize {
         self as usize
     }
+
+    const fn raw(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum InterMode {
+    Nearest = 0,
+    Near = 1,
+    Zero = 2,
+    New = 3,
+}
+
+impl InterMode {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Nearest),
+            1 => Some(Self::Near),
+            2 => Some(Self::Zero),
+            3 => Some(Self::New),
+            _ => None,
+        }
+    }
+
+    fn from_y_mode(y_mode: u8) -> Result<Self, TileSyntaxError> {
+        y_mode
+            .checked_sub(NEARESTMV)
+            .and_then(Self::from_raw)
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    const fn y_mode(self) -> u8 {
+        NEARESTMV + self as u8
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1247,6 +2253,411 @@ fn get_plane_block_size(subsize: BlockSize, plane: usize) -> Result<BlockSize, T
         .copied()
         .flatten()
         .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+fn size_group(block_size: BlockSize) -> usize {
+    SIZE_GROUP_LOOKUP[block_size.index()]
+}
+
+fn fixed_interp_filter(filter: InterpolationFilter) -> Result<u8, TileSyntaxError> {
+    match filter {
+        InterpolationFilter::EightTap => Ok(0),
+        InterpolationFilter::EightTapSmooth => Ok(1),
+        InterpolationFilter::EightTapSharp => Ok(2),
+        InterpolationFilter::Bilinear => Ok(3),
+        InterpolationFilter::Switchable => Err(TileSyntaxError::InvalidBitstream),
+    }
+}
+
+fn reference_frame_raw(reference: InterReferenceFrame) -> u8 {
+    match reference {
+        InterReferenceFrame::Last => LAST_FRAME,
+        InterReferenceFrame::Golden => GOLDEN_FRAME,
+        InterReferenceFrame::Altref => ALTREF_FRAME,
+    }
+}
+
+fn is_intra(info: NeighborModeInfo) -> bool {
+    info.ref_frames[0] == INTRA_FRAME
+}
+
+fn is_single(info: NeighborModeInfo) -> bool {
+    info.ref_frames[1] == NONE_FRAME
+}
+
+fn single_ref_p1_context(
+    left: NeighborModeInfo,
+    above: NeighborModeInfo,
+    avail_l: bool,
+    avail_u: bool,
+) -> usize {
+    let left_intra = is_intra(left);
+    let above_intra = is_intra(above);
+    let left_single = is_single(left);
+    let above_single = is_single(above);
+
+    if avail_u && avail_l {
+        if above_intra && left_intra {
+            2
+        } else if left_intra {
+            if above_single {
+                4 * usize::from(above.ref_frames[0] == LAST_FRAME)
+            } else {
+                1 + usize::from(
+                    above.ref_frames[0] == LAST_FRAME || above.ref_frames[1] == LAST_FRAME,
+                )
+            }
+        } else if above_intra {
+            if left_single {
+                4 * usize::from(left.ref_frames[0] == LAST_FRAME)
+            } else {
+                1 + usize::from(
+                    left.ref_frames[0] == LAST_FRAME || left.ref_frames[1] == LAST_FRAME,
+                )
+            }
+        } else if above_single && left_single {
+            2 * usize::from(above.ref_frames[0] == LAST_FRAME)
+                + 2 * usize::from(left.ref_frames[0] == LAST_FRAME)
+        } else if !above_single && !left_single {
+            1 + usize::from(
+                above.ref_frames[0] == LAST_FRAME
+                    || above.ref_frames[1] == LAST_FRAME
+                    || left.ref_frames[0] == LAST_FRAME
+                    || left.ref_frames[1] == LAST_FRAME,
+            )
+        } else {
+            let rfs = if above_single {
+                above.ref_frames[0]
+            } else {
+                left.ref_frames[0]
+            };
+            let crf1 = if above_single {
+                left.ref_frames[0]
+            } else {
+                above.ref_frames[0]
+            };
+            let crf2 = if above_single {
+                left.ref_frames[1]
+            } else {
+                above.ref_frames[1]
+            };
+            if rfs == LAST_FRAME {
+                3 + usize::from(crf1 == LAST_FRAME || crf2 == LAST_FRAME)
+            } else {
+                usize::from(crf1 == LAST_FRAME || crf2 == LAST_FRAME)
+            }
+        }
+    } else if avail_u {
+        if above_intra {
+            2
+        } else if above_single {
+            4 * usize::from(above.ref_frames[0] == LAST_FRAME)
+        } else {
+            1 + usize::from(above.ref_frames[0] == LAST_FRAME || above.ref_frames[1] == LAST_FRAME)
+        }
+    } else if avail_l {
+        if left_intra {
+            2
+        } else if left_single {
+            4 * usize::from(left.ref_frames[0] == LAST_FRAME)
+        } else {
+            1 + usize::from(left.ref_frames[0] == LAST_FRAME || left.ref_frames[1] == LAST_FRAME)
+        }
+    } else {
+        2
+    }
+}
+
+fn single_ref_p2_context(
+    left: NeighborModeInfo,
+    above: NeighborModeInfo,
+    avail_l: bool,
+    avail_u: bool,
+) -> usize {
+    let left_intra = is_intra(left);
+    let above_intra = is_intra(above);
+    let left_single = is_single(left);
+    let above_single = is_single(above);
+
+    if avail_u && avail_l {
+        if above_intra && left_intra {
+            2
+        } else if left_intra {
+            if above_single {
+                if above.ref_frames[0] == LAST_FRAME {
+                    3
+                } else {
+                    4 * usize::from(above.ref_frames[0] == GOLDEN_FRAME)
+                }
+            } else {
+                1 + 2 * usize::from(
+                    above.ref_frames[0] == GOLDEN_FRAME || above.ref_frames[1] == GOLDEN_FRAME,
+                )
+            }
+        } else if above_intra {
+            if left_single {
+                if left.ref_frames[0] == LAST_FRAME {
+                    3
+                } else {
+                    4 * usize::from(left.ref_frames[0] == GOLDEN_FRAME)
+                }
+            } else {
+                1 + 2 * usize::from(
+                    left.ref_frames[0] == GOLDEN_FRAME || left.ref_frames[1] == GOLDEN_FRAME,
+                )
+            }
+        } else if above_single && left_single {
+            if above.ref_frames[0] == LAST_FRAME && left.ref_frames[0] == LAST_FRAME {
+                3
+            } else if above.ref_frames[0] == LAST_FRAME {
+                4 * usize::from(left.ref_frames[0] == GOLDEN_FRAME)
+            } else if left.ref_frames[0] == LAST_FRAME {
+                4 * usize::from(above.ref_frames[0] == GOLDEN_FRAME)
+            } else {
+                2 * usize::from(above.ref_frames[0] == GOLDEN_FRAME)
+                    + 2 * usize::from(left.ref_frames[0] == GOLDEN_FRAME)
+            }
+        } else if !above_single && !left_single {
+            if above.ref_frames == left.ref_frames {
+                3 * usize::from(
+                    above.ref_frames[0] == GOLDEN_FRAME || above.ref_frames[1] == GOLDEN_FRAME,
+                )
+            } else {
+                2
+            }
+        } else {
+            let rfs = if above_single {
+                above.ref_frames[0]
+            } else {
+                left.ref_frames[0]
+            };
+            let crf1 = if above_single {
+                left.ref_frames[0]
+            } else {
+                above.ref_frames[0]
+            };
+            let crf2 = if above_single {
+                left.ref_frames[1]
+            } else {
+                above.ref_frames[1]
+            };
+            if rfs == GOLDEN_FRAME {
+                3 + usize::from(crf1 == GOLDEN_FRAME || crf2 == GOLDEN_FRAME)
+            } else if rfs == ALTREF_FRAME {
+                usize::from(crf1 == GOLDEN_FRAME || crf2 == GOLDEN_FRAME)
+            } else {
+                1 + 2 * usize::from(crf1 == GOLDEN_FRAME || crf2 == GOLDEN_FRAME)
+            }
+        }
+    } else if avail_u {
+        if above_intra || (above.ref_frames[0] == LAST_FRAME && above_single) {
+            2
+        } else if above_single {
+            4 * usize::from(above.ref_frames[0] == GOLDEN_FRAME)
+        } else {
+            3 * usize::from(
+                above.ref_frames[0] == GOLDEN_FRAME || above.ref_frames[1] == GOLDEN_FRAME,
+            )
+        }
+    } else if avail_l {
+        if left_intra || (left.ref_frames[0] == LAST_FRAME && left_single) {
+            2
+        } else if left_single {
+            4 * usize::from(left.ref_frames[0] == GOLDEN_FRAME)
+        } else {
+            3 * usize::from(
+                left.ref_frames[0] == GOLDEN_FRAME || left.ref_frames[1] == GOLDEN_FRAME,
+            )
+        }
+    } else {
+        2
+    }
+}
+
+fn comp_ref_context(
+    compound: CompoundReferenceSetup,
+    left: NeighborModeInfo,
+    above: NeighborModeInfo,
+    avail_l: bool,
+    avail_u: bool,
+    sign_biases: [bool; 4],
+) -> Result<usize, TileSyntaxError> {
+    let fixed_ref = reference_frame_raw(compound.comp_fixed_ref);
+    let comp_var_ref = [
+        reference_frame_raw(compound.comp_var_ref[0]),
+        reference_frame_raw(compound.comp_var_ref[1]),
+    ];
+    let fix_ref_idx = usize::from(
+        *sign_biases
+            .get(usize::from(fixed_ref))
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+    );
+    let var_ref_idx = 1 - fix_ref_idx;
+    let left_intra = is_intra(left);
+    let above_intra = is_intra(above);
+    let left_single = is_single(left);
+    let above_single = is_single(above);
+
+    let ctx = if avail_u && avail_l {
+        if above_intra && left_intra {
+            2
+        } else if left_intra {
+            if above_single {
+                1 + 2 * usize::from(above.ref_frames[0] != comp_var_ref[1])
+            } else {
+                1 + 2 * usize::from(above.ref_frames[var_ref_idx] != comp_var_ref[1])
+            }
+        } else if above_intra {
+            if left_single {
+                1 + 2 * usize::from(left.ref_frames[0] != comp_var_ref[1])
+            } else {
+                1 + 2 * usize::from(left.ref_frames[var_ref_idx] != comp_var_ref[1])
+            }
+        } else {
+            let vrfa = if above_single {
+                above.ref_frames[0]
+            } else {
+                above.ref_frames[var_ref_idx]
+            };
+            let vrfl = if left_single {
+                left.ref_frames[0]
+            } else {
+                left.ref_frames[var_ref_idx]
+            };
+            if vrfa == vrfl && comp_var_ref[1] == vrfa {
+                0
+            } else if left_single && above_single {
+                if (vrfa == fixed_ref && vrfl == comp_var_ref[0])
+                    || (vrfl == fixed_ref && vrfa == comp_var_ref[0])
+                {
+                    4
+                } else if vrfa == vrfl {
+                    3
+                } else {
+                    1
+                }
+            } else if left_single || above_single {
+                let vrfc = if left_single { vrfa } else { vrfl };
+                let rfs = if above_single { vrfa } else { vrfl };
+                if vrfc == comp_var_ref[1] && rfs != comp_var_ref[1] {
+                    1
+                } else if rfs == comp_var_ref[1] && vrfc != comp_var_ref[1] {
+                    2
+                } else {
+                    4
+                }
+            } else if vrfa == vrfl {
+                4
+            } else {
+                2
+            }
+        }
+    } else if avail_u {
+        if above_intra {
+            2
+        } else if above_single {
+            3 * usize::from(above.ref_frames[0] != comp_var_ref[1])
+        } else {
+            4 * usize::from(above.ref_frames[var_ref_idx] != comp_var_ref[1])
+        }
+    } else if avail_l {
+        if left_intra {
+            2
+        } else if left_single {
+            3 * usize::from(left.ref_frames[0] != comp_var_ref[1])
+        } else {
+            4 * usize::from(left.ref_frames[var_ref_idx] != comp_var_ref[1])
+        }
+    } else {
+        2
+    };
+    Ok(ctx)
+}
+
+fn get_sub_block_mv(
+    info: CandidateModeInfo,
+    ref_list: usize,
+    delta_col: i8,
+    block: i8,
+) -> Result<MotionVector, TileSyntaxError> {
+    let idx = if block >= 0 {
+        let block = usize::try_from(block).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        *IDX_N_COLUMN_TO_SUBBLOCK
+            .get(block)
+            .and_then(|row| row.get(usize::from(delta_col == 0)))
+            .ok_or(TileSyntaxError::InvalidBitstream)?
+    } else {
+        3
+    };
+    // Parse-only shortcut: compact neighbor storage keeps the block MV, not all
+    // four sub-block MVs, so sub-8x8 candidates use the block representative.
+    let _ = idx;
+    info.mvs
+        .get(ref_list)
+        .copied()
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+fn if_same_ref_frame_add_mv(state: &mut MvRefState, info: CandidateModeInfo, ref_frame: u8) {
+    for ref_list in 0..REF_LISTS {
+        if info.ref_frames[ref_list] == ref_frame {
+            state.add_mv_ref(info.mvs[ref_list]);
+            return;
+        }
+    }
+}
+
+fn if_diff_ref_frame_add_mv(
+    state: &mut MvRefState,
+    info: CandidateModeInfo,
+    ref_frame: u8,
+    sign_biases: [bool; 4],
+) -> Result<(), TileSyntaxError> {
+    let same_mvs = info.mvs[0] == info.mvs[1];
+    for ref_list in 0..REF_LISTS {
+        let candidate_frame = info.ref_frames[ref_list];
+        if candidate_frame > INTRA_FRAME
+            && candidate_frame != ref_frame
+            && (ref_list == 0 || !same_mvs)
+        {
+            let mut mv = info.mvs[ref_list];
+            let candidate_bias = *sign_biases
+                .get(usize::from(candidate_frame))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let target_bias = *sign_biases
+                .get(usize::from(ref_frame))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if candidate_bias != target_bias {
+                mv.row = mv
+                    .row
+                    .checked_neg()
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                mv.col = mv
+                    .col
+                    .checked_neg()
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+            state.add_mv_ref(mv);
+        }
+    }
+    Ok(())
+}
+
+fn lower_mv_precision(component: i32) -> i32 {
+    if component & 1 != 0 {
+        component + if component > 0 { -1 } else { 1 }
+    } else {
+        component
+    }
+}
+
+fn use_mv_hp(mv: MotionVector) -> bool {
+    (i32::from(mv.row).abs() >> 3) < COMPANDED_MVREF_THRESH
+        && (i32::from(mv.col).abs() >> 3) < COMPANDED_MVREF_THRESH
+}
+
+fn clip3(min_value: i32, max_value: i32, value: i32) -> i32 {
+    core::cmp::min(core::cmp::max(value, min_value), max_value)
 }
 
 fn scan_pos(tx_size: TxSize, tx_type: TxType, c: usize) -> Result<usize, TileSyntaxError> {
@@ -1481,6 +2892,25 @@ const TX_SIZE_32_TREE: [i8; 6] = [
 const TX_SIZE_16_TREE: [i8; 4] = [0, 2, -(TxSize::Tx8x8 as i8), -(TxSize::Tx16x16 as i8)];
 const TX_SIZE_8_TREE: [i8; 2] = [0, -(TxSize::Tx8x8 as i8)];
 
+const INTER_MODE_TREE: [i8; 6] = [
+    -(InterMode::Zero as i8),
+    2,
+    -(InterMode::Nearest as i8),
+    4,
+    -(InterMode::Near as i8),
+    -(InterMode::New as i8),
+];
+
+const INTERP_FILTER_TREE: [i8; 4] = [0, 2, -1, -2];
+
+const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+
+const MV_CLASS_TREE: [i8; 20] = [
+    0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
+];
+
+const MV_FR_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+
 const B_WIDTH_LOG2_LOOKUP: [u8; BLOCK_SIZES] = [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4];
 const B_HEIGHT_LOG2_LOOKUP: [u8; BLOCK_SIZES] = [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4];
 const NUM_4X4_BLOCKS_WIDE_LOOKUP: [u8; BLOCK_SIZES] = [1, 1, 2, 2, 2, 4, 4, 4, 8, 8, 8, 16, 16];
@@ -1488,6 +2918,7 @@ const NUM_4X4_BLOCKS_HIGH_LOOKUP: [u8; BLOCK_SIZES] = [1, 2, 1, 2, 4, 2, 4, 8, 4
 const MI_WIDTH_LOG2_LOOKUP: [u8; BLOCK_SIZES] = [0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3];
 const NUM_8X8_BLOCKS_WIDE_LOOKUP: [u8; BLOCK_SIZES] = [1, 1, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8];
 const NUM_8X8_BLOCKS_HIGH_LOOKUP: [u8; BLOCK_SIZES] = [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8];
+const SIZE_GROUP_LOOKUP: [usize; BLOCK_SIZES] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
 const MAX_TXSIZE_LOOKUP: [TxSize; BLOCK_SIZES] = [
     TxSize::Tx4x4,
     TxSize::Tx4x4,
@@ -1616,6 +3047,145 @@ const SS_SIZE_LOOKUP: [[[Option<BlockSize>; 2]; 2]; BLOCK_SIZES] = [
     [
         [Some(BlockSize::Block64x64), Some(BlockSize::Block64x32)],
         [Some(BlockSize::Block32x64), Some(BlockSize::Block32x32)],
+    ],
+];
+
+const MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
+
+const COUNTER_TO_CONTEXT: [u8; 19] = [2, 3, 4, 1, 3, 9, 0, 9, 9, 5, 5, 9, 5, 9, 9, 9, 9, 9, 6];
+
+const IDX_N_COLUMN_TO_SUBBLOCK: [[usize; 2]; SUB_BLOCKS] = [[1, 2], [1, 3], [3, 2], [3, 3]];
+
+const MV_REF_BLOCKS: [[[i8; 2]; MVREF_NEIGHBOURS]; BLOCK_SIZES] = [
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, -1],
+        [-2, 0],
+        [0, -2],
+        [-2, -1],
+        [-1, -2],
+        [-2, -2],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, -1],
+        [-2, 0],
+        [0, -2],
+        [-2, -1],
+        [-1, -2],
+        [-2, -2],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, -1],
+        [-2, 0],
+        [0, -2],
+        [-2, -1],
+        [-1, -2],
+        [-2, -2],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, -1],
+        [-2, 0],
+        [0, -2],
+        [-2, -1],
+        [-1, -2],
+        [-2, -2],
+    ],
+    [
+        [0, -1],
+        [-1, 0],
+        [1, -1],
+        [-1, -1],
+        [0, -2],
+        [-2, 0],
+        [-2, -1],
+        [-1, -2],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, 1],
+        [-1, -1],
+        [-2, 0],
+        [0, -2],
+        [-1, -2],
+        [-2, -1],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, 1],
+        [1, -1],
+        [-1, -1],
+        [-3, 0],
+        [0, -3],
+        [-3, -3],
+    ],
+    [
+        [0, -1],
+        [-1, 0],
+        [2, -1],
+        [-1, -1],
+        [-1, 1],
+        [0, -3],
+        [-3, 0],
+        [-3, -3],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, 2],
+        [-1, -1],
+        [1, -1],
+        [-3, 0],
+        [0, -3],
+        [-3, -3],
+    ],
+    [
+        [-1, 1],
+        [1, -1],
+        [-1, 2],
+        [2, -1],
+        [-1, -1],
+        [-3, 0],
+        [0, -3],
+        [-3, -3],
+    ],
+    [
+        [0, -1],
+        [-1, 0],
+        [4, -1],
+        [-1, 2],
+        [-1, -1],
+        [0, -3],
+        [-3, 0],
+        [2, -1],
+    ],
+    [
+        [-1, 0],
+        [0, -1],
+        [-1, 4],
+        [2, -1],
+        [-1, -1],
+        [-3, 0],
+        [0, -3],
+        [-1, 2],
+    ],
+    [
+        [-1, 3],
+        [3, -1],
+        [-1, 4],
+        [4, -1],
+        [-1, -1],
+        [-1, 0],
+        [0, -1],
+        [-1, 6],
     ],
 ];
 
@@ -1780,11 +3350,12 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockSize, CoefToken, DecodedBlockInfo, IntraMode, TileModeContexts, TileParser,
+        BlockSize, CoefToken, DecodedBlockInfo, INTRA_FRAME, IntraMode, MotionVector, NONE_FRAME,
+        REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, TileModeContexts, TileParser,
         TileSyntaxError, TxSize, parse_intra_tiles,
     };
     use crate::boolcoder::BoolDecoder;
-    use crate::compressed_header::{CompressedHeader, TxMode};
+    use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
     use crate::header::{FrameType, UncompressedFrameHeader};
     use crate::probability::FrameContext;
     use crate::tile::parse_tile_layout;
@@ -1825,16 +3396,25 @@ mod tests {
                 probabilities: &probabilities,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
+                frame_is_intra: true,
+                reference_mode: ReferenceMode::Single,
+                compound_reference: None,
+                interpolation_filter: None,
+                allow_high_precision_mv: false,
+                ref_frame_sign_bias: [false; 4],
                 lossless: true,
                 mi_rows: 1,
                 mi_cols: 1,
                 tile_col_start: 0,
+                tile_col_end: 1,
                 left_row_base: 0,
             };
 
-            parser
-                .decode_residual(0, 0, BlockSize::Block8x8, test_block(true))
-                .unwrap();
+            assert!(
+                !parser
+                    .decode_residual(0, 0, BlockSize::Block8x8, test_block(true))
+                    .unwrap()
+            );
             assert_eq!(parser.decoder.bit_offset(), bit_offset);
         }
 
@@ -1853,10 +3433,17 @@ mod tests {
             probabilities: &probabilities,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
+            frame_is_intra: true,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: None,
+            allow_high_precision_mv: false,
+            ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
+            tile_col_end: 1,
             left_row_base: 0,
         };
 
@@ -1885,10 +3472,17 @@ mod tests {
             probabilities: &probabilities,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
+            frame_is_intra: true,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: None,
+            allow_high_precision_mv: false,
+            ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
+            tile_col_end: 1,
             left_row_base: 0,
         };
 
@@ -1902,10 +3496,17 @@ mod tests {
             probabilities: &probabilities,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
+            frame_is_intra: true,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: None,
+            allow_high_precision_mv: false,
+            ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
+            tile_col_end: 1,
             left_row_base: 0,
         };
 
@@ -1976,10 +3577,14 @@ mod tests {
         DecodedBlockInfo {
             skip,
             tx_size: TxSize::Tx4x4,
-            y_mode: IntraMode::Dc,
+            y_mode: IntraMode::Dc.raw(),
             uv_mode: IntraMode::Dc,
             sub_modes: [IntraMode::Dc; 4],
             segment_id: 0,
+            is_inter: false,
+            ref_frames: [INTRA_FRAME, NONE_FRAME],
+            interp_filter: SWITCHABLE_FILTER_SENTINEL,
+            block_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
         }
     }
 }

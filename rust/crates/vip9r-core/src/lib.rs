@@ -15,7 +15,7 @@ use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_he
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::ProbabilityState;
 use tile::parse_tile_layout;
-use tile_syntax::parse_intra_tiles;
+use tile_syntax::{parse_inter_tiles, parse_intra_tiles};
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
 
@@ -414,12 +414,6 @@ impl Decoder {
                 .map_err(|err| err.into_decode_error())?
             };
 
-            if header.refresh_frame_context {
-                self.probability_state
-                    .save_probs(header.frame_context_idx)
-                    .map_err(|err| err.into_decode_error())?;
-            }
-
             let tile_layout =
                 parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
             if header.frame_is_intra {
@@ -431,11 +425,22 @@ impl Decoder {
                     &tile_layout,
                 )
                 .map_err(|err| err.into_decode_error())?;
+            } else {
+                parse_inter_tiles(
+                    coded_frame,
+                    &header,
+                    &compressed_header,
+                    self.probability_state.current(),
+                    &tile_layout,
+                )
+                .map_err(|err| err.into_decode_error())?;
             }
+
+            self.refresh_probability_state(&header)?;
         }
 
         self.header_state.update_references(&header);
-        Err(DecodeError::Unimplemented)
+        Ok(DecodeOutcome::NoOutput)
     }
 
     fn validate_frame_limits(
@@ -473,6 +478,39 @@ impl Decoder {
                 .map_err(|err| err.into_decode_error())?;
         }
         Ok(())
+    }
+
+    fn refresh_probability_state(
+        &mut self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Result<(), DecodeError> {
+        if !header.refresh_frame_context {
+            return Ok(());
+        }
+
+        if !header.frame_is_intra
+            && !header.error_resilient_mode
+            && !header.frame_parallel_decoding_mode
+        {
+            // Inter-frame probability adaptation depends on syntax counts that
+            // are not accumulated by the current parse-only tile path.
+            return Err(DecodeError::Unimplemented);
+        }
+
+        if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
+            self.probability_state
+                .load_probs(header.frame_context_idx)
+                .map_err(|err| err.into_decode_error())?;
+            if !header.frame_is_intra {
+                self.probability_state
+                    .load_probs2(header.frame_context_idx)
+                    .map_err(|err| err.into_decode_error())?;
+            }
+        }
+
+        self.probability_state
+            .save_probs(header.frame_context_idx)
+            .map_err(|err| err.into_decode_error())
     }
 }
 
@@ -578,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_coded_frame_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
+    fn decode_coded_frame_returns_no_output_after_valid_intra_tile_parse() {
         let frame = minimal_lossless_key_frame();
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
@@ -587,12 +625,12 @@ mod tests {
 
         assert_eq!(
             decoder.decode_coded_frame(&frame, &mut workspace),
-            Err(DecodeError::Unimplemented)
+            Ok(super::DecodeOutcome::NoOutput)
         );
     }
 
     #[test]
-    fn decode_coded_frame_parses_inter_compressed_header_before_unimplemented_boundary() {
+    fn decode_coded_frame_parses_inter_tiles_before_adaptation_boundary() {
         let key_frame = minimal_lossless_key_frame();
         let inter_frame = minimal_lossless_inter_frame();
         let layout = WorkspaceLayout::new(16, 16).unwrap();
@@ -602,7 +640,7 @@ mod tests {
 
         assert_eq!(
             decoder.decode_coded_frame(&key_frame, &mut workspace),
-            Err(DecodeError::Unimplemented)
+            Ok(super::DecodeOutcome::NoOutput)
         );
         assert_eq!(
             decoder.decode_coded_frame(&inter_frame, &mut workspace),

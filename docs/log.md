@@ -106,3 +106,18 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   before the still-unimplemented inter tile syntax boundary.
 - Golden smoke on `bear-vp9.ivf` still stops at
   `decode packet 0 timestamp 0: Unimplemented`.
+
+## 2026-06-27 — VP9 inter tile syntax
+
+- rev: jj `tpsrpqpp`
+- Added parse-only inter-frame tile traversal: inter partition probabilities,
+  mode-info syntax, reference-frame selection, interpolation filters, motion
+  vector syntax/prediction scaffolding, intra blocks inside inter frames, and
+  residual token parsing with the inter coefficient context.
+- `Decoder::decode_coded_frame` now parses the first `bear-vp9.ivf` key frame
+  and first inter frame tile syntax before stopping at the next honest boundary:
+  non-frame-parallel inter probability adaptation needs syntax counts. Pixel
+  prediction, reconstruction, loop filtering, reference pixels, and shown-frame
+  output remain unwired.
+- Golden smoke and strict runs on `bear-vp9.ivf` now stop at
+  `decode packet 1 coded frame 0: Unimplemented`.
