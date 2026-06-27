@@ -167,3 +167,14 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 - Host and wasm smoke runs on `bear-vp9.ivf` now both parse all 82 coded frames
   and exit at the expected M1 boundary: no shown frames are output yet, so both
   report 82 missing frames.
+
+## 2026-06-27 — VP9 shaped frame output plumbing
+
+- rev: jj `trsuoxlz`
+- Added neutral I420 output plumbing backed by the existing workspace frame
+  pool: current-frame fill, reference-slot refresh/copy, `show_existing_frame`
+  output, and visible plane descriptors for host and wasm consumers.
+- Host and wasm smoke runs on `bear-vp9.ivf` now emit all 82 shown frames.
+  `--allow-mismatch` passes with 82 md5 mismatches and no missing/extra frames;
+  strict md5 still fails because prediction, inverse transform, reconstruction,
+  and loop filtering remain unimplemented.
