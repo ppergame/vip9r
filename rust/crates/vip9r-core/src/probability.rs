@@ -38,6 +38,70 @@ pub(crate) type CompRefProb = [u8; REF_CONTEXTS];
 pub(crate) type YModeProbs = [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS];
 pub(crate) type UvModeProbs = [[u8; INTRA_MODES - 1]; INTRA_MODES];
 pub(crate) type PartitionProbs = [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
+pub(crate) type CoefTokenCounts = [[[[[[u32; UNCONSTRAINED_NODES]; PREV_COEF_CONTEXTS]; COEF_BANDS];
+    REF_TYPES]; BLOCK_TYPES]; TX_SIZES];
+pub(crate) type MoreCoefCounts =
+    [[[[[[u32; 2]; PREV_COEF_CONTEXTS]; COEF_BANDS]; REF_TYPES]; BLOCK_TYPES]; TX_SIZES];
+
+const COUNT_SAT: u32 = 20;
+const MAX_UPDATE_FACTOR: u32 = 128;
+const COEF_COUNT_SAT: u32 = 24;
+
+const BINARY_TREE: [i8; 2] = [0, -1];
+const SMALL_TOKEN_TREE: [i8; 6] = [0, 0, 0, 4, -1, -2];
+const INTRA_MODE_TREE: [i8; 18] = [
+    0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7,
+];
+const PARTITION_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+const INTER_MODE_TREE: [i8; 6] = [-2, 2, 0, 4, -1, -3];
+const INTERP_FILTER_TREE: [i8; 4] = [0, 2, -1, -2];
+const TX_SIZE_8_TREE: [i8; 2] = [0, -1];
+const TX_SIZE_16_TREE: [i8; 4] = [0, 2, -1, -2];
+const TX_SIZE_32_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+const MV_CLASS_TREE: [i8; 20] = [
+    0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10,
+];
+const MV_FR_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SyntaxCounts {
+    pub(crate) counts_intra_mode: [[u32; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+    pub(crate) counts_uv_mode: [[u32; INTRA_MODES]; INTRA_MODES],
+    pub(crate) counts_partition: [[u32; PARTITION_TYPES]; PARTITION_CONTEXTS],
+    pub(crate) counts_interp_filter: [[u32; SWITCHABLE_FILTERS]; INTERP_FILTER_CONTEXTS],
+    pub(crate) counts_inter_mode: [[u32; INTER_MODES]; INTER_MODE_CONTEXTS],
+    pub(crate) counts_tx_size: [[[u32; TX_SIZES]; TX_SIZE_CONTEXTS]; TX_SIZES],
+    pub(crate) counts_is_inter: [[u32; 2]; IS_INTER_CONTEXTS],
+    pub(crate) counts_comp_mode: [[u32; 2]; COMP_MODE_CONTEXTS],
+    pub(crate) counts_single_ref: [[[u32; 2]; 2]; REF_CONTEXTS],
+    pub(crate) counts_comp_ref: [[u32; 2]; REF_CONTEXTS],
+    pub(crate) counts_skip: [[u32; 2]; SKIP_CONTEXTS],
+    pub(crate) counts_mv_joint: [u32; MV_JOINTS],
+    pub(crate) counts_mv_sign: [[u32; 2]; 2],
+    pub(crate) counts_mv_class: [[u32; MV_CLASSES]; 2],
+    pub(crate) counts_mv_class0_bit: [[u32; CLASS0_SIZE]; 2],
+    pub(crate) counts_mv_class0_fr: [[[u32; MV_FR_SIZE]; CLASS0_SIZE]; 2],
+    pub(crate) counts_mv_class0_hp: [[u32; 2]; 2],
+    pub(crate) counts_mv_bits: [[[u32; 2]; MV_OFFSET_BITS]; 2],
+    pub(crate) counts_mv_fr: [[u32; MV_FR_SIZE]; 2],
+    pub(crate) counts_mv_hp: [[u32; 2]; 2],
+    pub(crate) counts_token: CoefTokenCounts,
+    pub(crate) counts_more_coefs: MoreCoefCounts,
+}
+
+impl SyntaxCounts {
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NonCoefAdaptationConfig {
+    pub(crate) tx_mode_select: bool,
+    pub(crate) interpolation_filter_switchable: bool,
+    pub(crate) allow_high_precision_mv: bool,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MvProbs {
@@ -161,6 +225,18 @@ impl ProbabilityState {
         &self.current
     }
 
+    pub(crate) fn adapt_coef_probs(&mut self, counts: &SyntaxCounts, update_factor: u32) {
+        self.current.adapt_coef_probs(counts, update_factor);
+    }
+
+    pub(crate) fn adapt_noncoef_probs(
+        &mut self,
+        counts: &SyntaxCounts,
+        config: NonCoefAdaptationConfig,
+    ) {
+        self.current.adapt_noncoef_probs(counts, config);
+    }
+
     fn context(&self, ctx: u8) -> Result<FrameContext, ParserError> {
         self.contexts
             .get(usize::from(ctx))
@@ -173,6 +249,227 @@ impl ProbabilityState {
             .get_mut(usize::from(ctx))
             .ok_or(ParserError::InvalidBitstream)
     }
+}
+
+impl FrameContext {
+    fn adapt_coef_probs(&mut self, counts: &SyntaxCounts, update_factor: u32) {
+        for tx_size in 0..TX_SIZES {
+            for block_type in 0..BLOCK_TYPES {
+                for ref_type in 0..REF_TYPES {
+                    for band in 0..COEF_BANDS {
+                        let max_l = if band == 0 { 3 } else { PREV_COEF_CONTEXTS };
+                        for context in 0..max_l {
+                            merge_probs(
+                                &SMALL_TOKEN_TREE,
+                                2,
+                                &mut self.coef_probs[tx_size][block_type][ref_type][band][context],
+                                &counts.counts_token[tx_size][block_type][ref_type][band][context],
+                                COEF_COUNT_SAT,
+                                update_factor,
+                            );
+                            merge_probs(
+                                &BINARY_TREE,
+                                0,
+                                &mut self.coef_probs[tx_size][block_type][ref_type][band][context],
+                                &counts.counts_more_coefs[tx_size][block_type][ref_type][band]
+                                    [context],
+                                COEF_COUNT_SAT,
+                                update_factor,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn adapt_noncoef_probs(&mut self, counts: &SyntaxCounts, config: NonCoefAdaptationConfig) {
+        for i in 0..IS_INTER_CONTEXTS {
+            self.is_inter_prob[i] = adapt_prob(self.is_inter_prob[i], &counts.counts_is_inter[i]);
+        }
+        for i in 0..COMP_MODE_CONTEXTS {
+            self.comp_mode_prob[i] =
+                adapt_prob(self.comp_mode_prob[i], &counts.counts_comp_mode[i]);
+        }
+        for i in 0..REF_CONTEXTS {
+            self.comp_ref_prob[i] = adapt_prob(self.comp_ref_prob[i], &counts.counts_comp_ref[i]);
+        }
+        for i in 0..REF_CONTEXTS {
+            for j in 0..2 {
+                self.single_ref_prob[i][j] =
+                    adapt_prob(self.single_ref_prob[i][j], &counts.counts_single_ref[i][j]);
+            }
+        }
+        for i in 0..INTER_MODE_CONTEXTS {
+            adapt_probs(
+                &INTER_MODE_TREE,
+                &mut self.inter_mode_probs[i],
+                &counts.counts_inter_mode[i],
+            );
+        }
+        for i in 0..BLOCK_SIZE_GROUPS {
+            adapt_probs(
+                &INTRA_MODE_TREE,
+                &mut self.y_mode_probs[i],
+                &counts.counts_intra_mode[i],
+            );
+        }
+        for i in 0..INTRA_MODES {
+            adapt_probs(
+                &INTRA_MODE_TREE,
+                &mut self.uv_mode_probs[i],
+                &counts.counts_uv_mode[i],
+            );
+        }
+        for i in 0..PARTITION_CONTEXTS {
+            adapt_probs(
+                &PARTITION_TREE,
+                &mut self.partition_probs[i],
+                &counts.counts_partition[i],
+            );
+        }
+        for i in 0..SKIP_CONTEXTS {
+            self.skip_prob[i] = adapt_prob(self.skip_prob[i], &counts.counts_skip[i]);
+        }
+        if config.interpolation_filter_switchable {
+            for i in 0..INTERP_FILTER_CONTEXTS {
+                adapt_probs(
+                    &INTERP_FILTER_TREE,
+                    &mut self.interp_filter_probs[i],
+                    &counts.counts_interp_filter[i],
+                );
+            }
+        }
+        if config.tx_mode_select {
+            for i in 0..TX_SIZE_CONTEXTS {
+                adapt_probs(
+                    &TX_SIZE_8_TREE,
+                    &mut self.tx_probs[1][i],
+                    &counts.counts_tx_size[1][i],
+                );
+                adapt_probs(
+                    &TX_SIZE_16_TREE,
+                    &mut self.tx_probs[2][i],
+                    &counts.counts_tx_size[2][i],
+                );
+                adapt_probs(
+                    &TX_SIZE_32_TREE,
+                    &mut self.tx_probs[3][i],
+                    &counts.counts_tx_size[3][i],
+                );
+            }
+        }
+        adapt_probs(
+            &MV_JOINT_TREE,
+            &mut self.mv_probs.joint,
+            &counts.counts_mv_joint,
+        );
+        for comp in 0..2 {
+            self.mv_probs.sign[comp] =
+                adapt_prob(self.mv_probs.sign[comp], &counts.counts_mv_sign[comp]);
+            adapt_probs(
+                &MV_CLASS_TREE,
+                &mut self.mv_probs.class[comp],
+                &counts.counts_mv_class[comp],
+            );
+            self.mv_probs.class0_bit[comp] = adapt_prob(
+                self.mv_probs.class0_bit[comp],
+                &counts.counts_mv_class0_bit[comp],
+            );
+            for i in 0..MV_OFFSET_BITS {
+                self.mv_probs.bits[comp][i] =
+                    adapt_prob(self.mv_probs.bits[comp][i], &counts.counts_mv_bits[comp][i]);
+            }
+            for i in 0..CLASS0_SIZE {
+                adapt_probs(
+                    &MV_FR_TREE,
+                    &mut self.mv_probs.class0_fr[comp][i],
+                    &counts.counts_mv_class0_fr[comp][i],
+                );
+            }
+            adapt_probs(
+                &MV_FR_TREE,
+                &mut self.mv_probs.fr[comp],
+                &counts.counts_mv_fr[comp],
+            );
+            if config.allow_high_precision_mv {
+                self.mv_probs.class0_hp[comp] = adapt_prob(
+                    self.mv_probs.class0_hp[comp],
+                    &counts.counts_mv_class0_hp[comp],
+                );
+                self.mv_probs.hp[comp] =
+                    adapt_prob(self.mv_probs.hp[comp], &counts.counts_mv_hp[comp]);
+            }
+        }
+    }
+}
+
+fn adapt_probs(tree: &[i8], probs: &mut [u8], counts: &[u32]) {
+    merge_probs(tree, 0, probs, counts, COUNT_SAT, MAX_UPDATE_FACTOR);
+}
+
+fn adapt_prob(prob: u8, counts: &[u32; 2]) -> u8 {
+    merge_prob(prob, counts[0], counts[1], COUNT_SAT, MAX_UPDATE_FACTOR)
+}
+
+fn merge_probs(
+    tree: &[i8],
+    index: usize,
+    probs: &mut [u8],
+    counts: &[u32],
+    count_sat: u32,
+    max_update_factor: u32,
+) -> u32 {
+    let left = tree[index];
+    let left_count = if left <= 0 {
+        counts[usize::from(left.unsigned_abs())]
+    } else {
+        merge_probs(
+            tree,
+            usize::from(left as u8),
+            probs,
+            counts,
+            count_sat,
+            max_update_factor,
+        )
+    };
+
+    let right = tree[index + 1];
+    let right_count = if right <= 0 {
+        counts[usize::from(right.unsigned_abs())]
+    } else {
+        merge_probs(
+            tree,
+            usize::from(right as u8),
+            probs,
+            counts,
+            count_sat,
+            max_update_factor,
+        )
+    };
+
+    probs[index >> 1] = merge_prob(
+        probs[index >> 1],
+        left_count,
+        right_count,
+        count_sat,
+        max_update_factor,
+    );
+    left_count.saturating_add(right_count)
+}
+
+fn merge_prob(pre_prob: u8, ct0: u32, ct1: u32, count_sat: u32, max_update_factor: u32) -> u8 {
+    let den = ct0.saturating_add(ct1);
+    let prob = if den == 0 {
+        128
+    } else {
+        let estimate = (u64::from(ct0) * 256 + u64::from(den >> 1)) / u64::from(den);
+        estimate.clamp(1, 255) as u32
+    };
+    let count = core::cmp::min(den, count_sat);
+    let factor = max_update_factor * count / count_sat;
+    let merged = u32::from(pre_prob) * (256 - factor) + prob * factor;
+    ((merged + 128) >> 8) as u8
 }
 
 const DEFAULT_SKIP_PROB: [u8; SKIP_CONTEXTS] = [192, 128, 64];
@@ -1097,3 +1394,16 @@ const DEFAULT_COEF_PROBS: CoefProbs = [
         ],
     ],
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::{COUNT_SAT, MAX_UPDATE_FACTOR, merge_prob};
+
+    #[test]
+    fn merge_prob_matches_spec_integer_arithmetic() {
+        assert_eq!(merge_prob(128, 0, 0, COUNT_SAT, MAX_UPDATE_FACTOR), 128);
+        assert_eq!(merge_prob(128, 20, 0, COUNT_SAT, MAX_UPDATE_FACTOR), 192);
+        assert_eq!(merge_prob(200, 0, 20, COUNT_SAT, MAX_UPDATE_FACTOR), 101);
+        assert_eq!(merge_prob(128, 1, 1, COUNT_SAT, MAX_UPDATE_FACTOR), 128);
+    }
+}

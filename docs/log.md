@@ -121,3 +121,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   output remain unwired.
 - Golden smoke and strict runs on `bear-vp9.ivf` now stop at
   `decode packet 1 coded frame 0: Unimplemented`.
+
+## 2026-06-27 — VP9 syntax counts and probability refresh
+
+- rev: jj `zoyuowll`
+- Added syntax count accumulation for the parse-only tile path and VP9 backward
+  probability refresh for coefficient, non-coefficient, and MV probability
+  state.
+- `Decoder::decode_coded_frame` now removes the prior non-frame-parallel inter
+  adaptation `Unimplemented` boundary, tracks previous frame type for the
+  coefficient update factor, and refreshes frame contexts after tile parsing.
+- Golden smoke on `bear-vp9.ivf` advances past packet 1 and now stops at
+  `decode packet 17 coded frame 0: InvalidBitstream`.

@@ -11,9 +11,11 @@ mod superframe;
 mod tile;
 mod tile_syntax;
 
-use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
+use compressed_header::{
+    CompressedHeader, TxMode, parse_inter_compressed_header, parse_intra_compressed_header,
+};
 use header::{HeaderParserState, parse_uncompressed_frame_header};
-use probability::ProbabilityState;
+use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
 use tile_syntax::{parse_inter_tiles, parse_intra_tiles};
 
@@ -365,6 +367,8 @@ pub struct Decoder {
     layout: WorkspaceLayout,
     header_state: HeaderParserState,
     probability_state: ProbabilityState,
+    syntax_counts: SyntaxCounts,
+    last_frame_type: header::FrameType,
 }
 
 impl Decoder {
@@ -373,6 +377,8 @@ impl Decoder {
             layout,
             header_state: HeaderParserState::new(),
             probability_state: ProbabilityState::new(),
+            syntax_counts: SyntaxCounts::default(),
+            last_frame_type: header::FrameType::Key,
         }
     }
 
@@ -416,12 +422,14 @@ impl Decoder {
 
             let tile_layout =
                 parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
+            self.syntax_counts.clear();
             if header.frame_is_intra {
                 parse_intra_tiles(
                     coded_frame,
                     &header,
                     &compressed_header,
                     self.probability_state.current(),
+                    &mut self.syntax_counts,
                     &tile_layout,
                 )
                 .map_err(|err| err.into_decode_error())?;
@@ -431,15 +439,19 @@ impl Decoder {
                     &header,
                     &compressed_header,
                     self.probability_state.current(),
+                    &mut self.syntax_counts,
                     &tile_layout,
                 )
                 .map_err(|err| err.into_decode_error())?;
             }
 
-            self.refresh_probability_state(&header)?;
+            self.refresh_probability_state(&header, &compressed_header)?;
         }
 
         self.header_state.update_references(&header);
+        if !header.show_existing_frame {
+            self.last_frame_type = header.frame_type;
+        }
         Ok(DecodeOutcome::NoOutput)
     }
 
@@ -483,34 +495,45 @@ impl Decoder {
     fn refresh_probability_state(
         &mut self,
         header: &header::UncompressedFrameHeader,
+        compressed_header: &CompressedHeader,
     ) -> Result<(), DecodeError> {
-        if !header.refresh_frame_context {
-            return Ok(());
-        }
-
-        if !header.frame_is_intra
-            && !header.error_resilient_mode
-            && !header.frame_parallel_decoding_mode
-        {
-            // Inter-frame probability adaptation depends on syntax counts that
-            // are not accumulated by the current parse-only tile path.
-            return Err(DecodeError::Unimplemented);
-        }
-
         if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
             self.probability_state
                 .load_probs(header.frame_context_idx)
                 .map_err(|err| err.into_decode_error())?;
+            let coef_update_factor = if header.frame_is_intra {
+                112
+            } else if self.last_frame_type == header::FrameType::Key {
+                128
+            } else {
+                112
+            };
+            self.probability_state
+                .adapt_coef_probs(&self.syntax_counts, coef_update_factor);
             if !header.frame_is_intra {
                 self.probability_state
                     .load_probs2(header.frame_context_idx)
                     .map_err(|err| err.into_decode_error())?;
+                self.probability_state.adapt_noncoef_probs(
+                    &self.syntax_counts,
+                    NonCoefAdaptationConfig {
+                        tx_mode_select: compressed_header.tx_mode == TxMode::Select,
+                        interpolation_filter_switchable: matches!(
+                            header.interpolation_filter,
+                            Some(header::InterpolationFilter::Switchable)
+                        ),
+                        allow_high_precision_mv: header.allow_high_precision_mv,
+                    },
+                );
             }
         }
 
-        self.probability_state
-            .save_probs(header.frame_context_idx)
-            .map_err(|err| err.into_decode_error())
+        if header.refresh_frame_context {
+            self.probability_state
+                .save_probs(header.frame_context_idx)
+                .map_err(|err| err.into_decode_error())?;
+        }
+        Ok(())
     }
 }
 
@@ -630,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_coded_frame_parses_inter_tiles_before_adaptation_boundary() {
+    fn decode_coded_frame_refreshes_inter_frame_probabilities_after_tile_parse() {
         let key_frame = minimal_lossless_key_frame();
         let inter_frame = minimal_lossless_inter_frame();
         let layout = WorkspaceLayout::new(16, 16).unwrap();
@@ -644,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             decoder.decode_coded_frame(&inter_frame, &mut workspace),
-            Err(DecodeError::Unimplemented)
+            Ok(super::DecodeOutcome::NoOutput)
         );
     }
 

@@ -52,7 +52,9 @@ harness.
 - [x] key/intra residual traversal and coefficient token syntax parse-only
 - [x] inter compressed-header parser and default non-coef/MV probability state
 - [x] inter tile partition/mode-info/MV syntax and residual parse-only
-- [ ] syntax counts and adaptive probability refresh
+- [x] syntax counts and adaptive probability refresh
+- [ ] resolve `bear-vp9.ivf` packet 17 inter tile syntax
+      `InvalidBitstream` after probability refresh
 - [ ] decompose the remaining decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 

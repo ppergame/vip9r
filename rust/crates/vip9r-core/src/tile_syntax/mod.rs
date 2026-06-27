@@ -5,7 +5,9 @@ use crate::compressed_header::{
 };
 use crate::error::ParserError;
 use crate::header::{InterpolationFilter, UncompressedFrameHeader};
-use crate::probability::{CLASS0_SIZE, FrameContext, MV_OFFSET_BITS};
+use crate::probability::{
+    CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
+};
 use crate::tile::{TileDescriptor, TileLayout};
 
 mod tables;
@@ -74,6 +76,7 @@ pub(crate) fn parse_intra_tiles(
     header: &UncompressedFrameHeader,
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
+    counts: &mut SyntaxCounts,
     layout: &TileLayout,
 ) -> Result<(), TileSyntaxError> {
     if !header.frame_is_intra || header.show_existing_frame {
@@ -100,7 +103,7 @@ pub(crate) fn parse_intra_tiles(
             lossless: header.lossless,
             frame_mis: (mi_rows, mi_cols),
         };
-        parse_tile(frame, tile, config, probabilities, &mut contexts)?;
+        parse_tile(frame, tile, config, probabilities, counts, &mut contexts)?;
     }
 
     Ok(())
@@ -111,6 +114,7 @@ pub(crate) fn parse_inter_tiles(
     header: &UncompressedFrameHeader,
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
+    counts: &mut SyntaxCounts,
     layout: &TileLayout,
 ) -> Result<(), TileSyntaxError> {
     if header.frame_is_intra || header.show_existing_frame {
@@ -141,7 +145,7 @@ pub(crate) fn parse_inter_tiles(
             lossless: header.lossless,
             frame_mis: (mi_rows, mi_cols),
         };
-        parse_tile(frame, tile, config, probabilities, &mut contexts)?;
+        parse_tile(frame, tile, config, probabilities, counts, &mut contexts)?;
     }
 
     Ok(())
@@ -165,6 +169,7 @@ fn parse_tile(
     tile: &TileDescriptor,
     config: TileParserConfig,
     probabilities: &FrameContext,
+    counts: &mut SyntaxCounts,
     contexts: &mut TileModeContexts,
 ) -> Result<(), TileSyntaxError> {
     let (mi_rows, mi_cols) = config.frame_mis;
@@ -192,6 +197,7 @@ fn parse_tile(
     let mut parser = TileParser {
         decoder,
         probabilities,
+        counts,
         contexts,
         tx_mode: config.tx_mode,
         frame_is_intra: config.frame_is_intra,
@@ -233,6 +239,7 @@ fn parse_tile(
 struct TileParser<'a, 'b> {
     decoder: BoolDecoder<'a>,
     probabilities: &'b FrameContext,
+    counts: &'b mut SyntaxCounts,
     contexts: &'b mut TileModeContexts,
     tx_mode: TxMode,
     frame_is_intra: bool,
@@ -335,10 +342,6 @@ impl TileParser<'_, '_> {
         has_rows: bool,
         has_cols: bool,
     ) -> Result<PartitionType, TileSyntaxError> {
-        if !has_rows && !has_cols {
-            return Ok(PartitionType::Split);
-        }
-
         let ctx = self
             .contexts
             .partition_context(self.left_row_base, row, col, block_size)?;
@@ -351,11 +354,15 @@ impl TileParser<'_, '_> {
             self.decoder.read_tree(&PARTITION_TREE, probs)?
         } else if has_cols {
             self.decoder.read_tree(&COLS_PARTITION_TREE, &probs[1..2])?
-        } else {
+        } else if has_rows {
             self.decoder.read_tree(&ROWS_PARTITION_TREE, &probs[2..3])?
+        } else {
+            PartitionType::Split as u8
         };
 
-        PartitionType::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+        let partition = PartitionType::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+        increment_count(&mut self.counts.counts_partition[ctx][partition.index()]);
+        Ok(partition)
     }
 
     fn decode_block(
@@ -469,9 +476,11 @@ impl TileParser<'_, '_> {
         } else {
             0
         };
-        Ok(self
+        let is_inter = self
             .decoder
-            .read_bool(self.probabilities.is_inter_prob[ctx])?)
+            .read_bool(self.probabilities.is_inter_prob[ctx])?;
+        increment_count(&mut self.counts.counts_is_inter[ctx][bool_index(is_inter)]);
+        Ok(is_inter)
     }
 
     fn intra_block_mode_info(
@@ -615,7 +624,9 @@ impl TileParser<'_, '_> {
         let ctx = self
             .contexts
             .skip_context(self.left_row_base, row, col, avail_u, avail_l)?;
-        Ok(self.decoder.read_bool(self.probabilities.skip_prob[ctx])?)
+        let skip = self.decoder.read_bool(self.probabilities.skip_prob[ctx])?;
+        increment_count(&mut self.counts.counts_skip[ctx][bool_index(skip)]);
+        Ok(skip)
     }
 
     fn read_tx_size(
@@ -644,7 +655,11 @@ impl TileParser<'_, '_> {
                 TxSize::Tx8x8 => self.decoder.read_tree(&TX_SIZE_8_TREE, &probs[..1])?,
                 TxSize::Tx4x4 => 0,
             };
-            TxSize::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+            let tx_size = TxSize::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+            increment_count(
+                &mut self.counts.counts_tx_size[max_tx_size.index()][ctx][tx_size.index()],
+            );
+            Ok(tx_size)
         } else {
             Ok(TxSize::from_index(core::cmp::min(
                 max_tx_size.index(),
@@ -776,7 +791,9 @@ impl TileParser<'_, '_> {
             .get(ctx)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
-        IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+        let mode = IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+        increment_count(&mut self.counts.counts_intra_mode[ctx][mode.index()]);
+        Ok(mode)
     }
 
     fn read_default_uv_mode(&mut self, y_mode: IntraMode) -> Result<IntraMode, TileSyntaxError> {
@@ -788,7 +805,9 @@ impl TileParser<'_, '_> {
     fn read_uv_mode(&mut self, y_mode: IntraMode) -> Result<IntraMode, TileSyntaxError> {
         let probs = &self.probabilities.uv_mode_probs[y_mode.index()];
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
-        IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+        let mode = IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+        increment_count(&mut self.counts.counts_uv_mode[y_mode.index()][mode.index()]);
+        Ok(mode)
     }
 
     fn read_ref_frames(
@@ -803,6 +822,7 @@ impl TileParser<'_, '_> {
             let compound = self
                 .decoder
                 .read_bool(self.probabilities.comp_mode_prob[ctx])?;
+            increment_count(&mut self.counts.counts_comp_mode[ctx][bool_index(compound)]);
             if compound {
                 return self.read_compound_ref_frames(left, above, avail_l, avail_u);
             }
@@ -814,12 +834,14 @@ impl TileParser<'_, '_> {
         let single_ref_p1 = self
             .decoder
             .read_bool(self.probabilities.single_ref_prob[ctx][0])?;
+        increment_count(&mut self.counts.counts_single_ref[ctx][0][bool_index(single_ref_p1)]);
         let ref_frame = if single_ref_p1 {
             let ctx = single_ref_p2_context(left, above, avail_l, avail_u);
-            if self
+            let single_ref_p2 = self
                 .decoder
-                .read_bool(self.probabilities.single_ref_prob[ctx][1])?
-            {
+                .read_bool(self.probabilities.single_ref_prob[ctx][1])?;
+            increment_count(&mut self.counts.counts_single_ref[ctx][1][bool_index(single_ref_p2)]);
+            if single_ref_p2 {
                 ALTREF_FRAME
             } else {
                 GOLDEN_FRAME
@@ -852,6 +874,7 @@ impl TileParser<'_, '_> {
             self.decoder
                 .read_bool(self.probabilities.comp_ref_prob[ctx])?,
         );
+        increment_count(&mut self.counts.counts_comp_ref[ctx][comp_ref]);
         let fixed_ref = reference_frame_raw(compound.comp_fixed_ref);
         let variable_ref = reference_frame_raw(compound.comp_var_ref[comp_ref]);
         let fixed_index = usize::from(self.sign_bias(fixed_ref)?);
@@ -911,7 +934,9 @@ impl TileParser<'_, '_> {
             .get(ctx)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
         let raw = self.decoder.read_tree(&INTER_MODE_TREE, probs)?;
-        InterMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)
+        let mode = InterMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+        increment_count(&mut self.counts.counts_inter_mode[ctx][mode.index()]);
+        Ok(mode)
     }
 
     fn read_block_interp_filter(
@@ -950,9 +975,15 @@ impl TileParser<'_, '_> {
                     SWITCHABLE_FILTER_SENTINEL
                 };
                 let probs = &self.probabilities.interp_filter_probs[usize::from(ctx)];
-                self.decoder
-                    .read_tree(&INTERP_FILTER_TREE, probs)
-                    .map_err(TileSyntaxError::from)
+                let filter = self.decoder.read_tree(&INTERP_FILTER_TREE, probs)?;
+                let filter_index = usize::from(filter);
+                if filter_index >= SWITCHABLE_FILTERS {
+                    return Err(TileSyntaxError::InvalidBitstream);
+                }
+                increment_count(
+                    &mut self.counts.counts_interp_filter[usize::from(ctx)][filter_index],
+                );
+                Ok(filter)
             }
             filter => fixed_interp_filter(filter),
         }
@@ -981,6 +1012,7 @@ impl TileParser<'_, '_> {
         let joint = self
             .decoder
             .read_tree(&MV_JOINT_TREE, &self.probabilities.mv_probs.joint)?;
+        increment_count(&mut self.counts.counts_mv_joint[usize::from(joint)]);
         let mut diff_row = 0i32;
         let mut diff_col = 0i32;
         if matches!(joint, 2 | 3) {
@@ -996,18 +1028,23 @@ impl TileParser<'_, '_> {
     fn read_mv_component(&mut self, comp: usize, use_hp: bool) -> Result<i32, TileSyntaxError> {
         let probs = &self.probabilities.mv_probs;
         let sign = self.decoder.read_bool(probs.sign[comp])?;
+        increment_count(&mut self.counts.counts_mv_sign[comp][bool_index(sign)]);
         let mv_class = usize::from(self.decoder.read_tree(&MV_CLASS_TREE, &probs.class[comp])?);
+        increment_count(&mut self.counts.counts_mv_class[comp][mv_class]);
         let mag = if mv_class == 0 {
             let class0_bit = usize::from(self.decoder.read_bool(probs.class0_bit[comp])?);
+            increment_count(&mut self.counts.counts_mv_class0_bit[comp][class0_bit]);
             let class0_fr = usize::from(
                 self.decoder
                     .read_tree(&MV_FR_TREE, &probs.class0_fr[comp][class0_bit])?,
             );
+            increment_count(&mut self.counts.counts_mv_class0_fr[comp][class0_bit][class0_fr]);
             let class0_hp = if use_hp {
                 usize::from(self.decoder.read_bool(probs.class0_hp[comp])?)
             } else {
                 1
             };
+            increment_count(&mut self.counts.counts_mv_class0_hp[comp][class0_hp]);
             ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
         } else {
             let mut d = 0usize;
@@ -1015,16 +1052,20 @@ impl TileParser<'_, '_> {
                 if i >= MV_OFFSET_BITS {
                     return Err(TileSyntaxError::InvalidBitstream);
                 }
-                if self.decoder.read_bool(probs.bits[comp][i])? {
+                let mv_bit = self.decoder.read_bool(probs.bits[comp][i])?;
+                increment_count(&mut self.counts.counts_mv_bits[comp][i][bool_index(mv_bit)]);
+                if mv_bit {
                     d |= 1usize << i;
                 }
             }
             let mv_fr = usize::from(self.decoder.read_tree(&MV_FR_TREE, &probs.fr[comp])?);
+            increment_count(&mut self.counts.counts_mv_fr[comp][mv_fr]);
             let mv_hp = if use_hp {
                 usize::from(self.decoder.read_bool(probs.hp[comp])?)
             } else {
                 1
             };
+            increment_count(&mut self.counts.counts_mv_hp[comp][mv_hp]);
             (CLASS0_SIZE << (mv_class + 2)) + ((d << 3) | (mv_fr << 1) | mv_hp) + 1
         };
         let mag = i32::try_from(mag).map_err(|_| TileSyntaxError::InvalidBitstream)?;
@@ -1454,7 +1495,12 @@ impl TileParser<'_, '_> {
     ) -> Result<bool, TileSyntaxError> {
         let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)]
             [usize::from(block.is_inter)][band][ctx][0];
-        Ok(self.decoder.read_bool(prob)?)
+        let more_coefs = self.decoder.read_bool(prob)?;
+        increment_count(
+            &mut self.counts.counts_more_coefs[tx_size.index()][usize::from(plane > 0)]
+                [usize::from(block.is_inter)][band][ctx][bool_index(more_coefs)],
+        );
+        Ok(more_coefs)
     }
 
     fn read_token(
@@ -1479,7 +1525,12 @@ impl TileParser<'_, '_> {
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
             if next <= 0 {
                 let raw = u8::try_from(-next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-                return CoefToken::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream);
+                let token = CoefToken::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
+                increment_count(
+                    &mut self.counts.counts_token[tx_size.index()][usize::from(plane > 0)]
+                        [usize::from(block.is_inter)][band][ctx][core::cmp::min(2, token.index())],
+                );
+                return Ok(token);
             }
             index = usize::try_from(next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
         }
@@ -2113,6 +2164,10 @@ impl InterMode {
     const fn y_mode(self) -> u8 {
         NEARESTMV + self as u8
     }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2203,6 +2258,14 @@ fn mi_size(pixels: u32) -> Result<usize, TileSyntaxError> {
         .map(|value| value / MI_SIZE_PIXELS)
         .ok_or(TileSyntaxError::InvalidBitstream)?;
     usize::try_from(mis).map_err(|_| TileSyntaxError::InvalidBitstream)
+}
+
+const fn bool_index(value: bool) -> usize {
+    if value { 1 } else { 0 }
+}
+
+fn increment_count(count: &mut u32) {
+    *count = count.saturating_add(1);
 }
 
 fn row_offset(left_row_base: usize, row: usize) -> Result<usize, TileSyntaxError> {
@@ -3357,7 +3420,7 @@ mod tests {
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
     use crate::header::{FrameType, UncompressedFrameHeader};
-    use crate::probability::FrameContext;
+    use crate::probability::{FrameContext, SyntaxCounts};
     use crate::tile::parse_tile_layout;
 
     #[test]
@@ -3366,6 +3429,7 @@ mod tests {
         let header = test_header(false);
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
+        let mut counts = SyntaxCounts::default();
 
         assert_eq!(
             parse_intra_tiles(
@@ -3373,6 +3437,7 @@ mod tests {
                 &header,
                 &compressed_header,
                 &FrameContext::DEFAULT,
+                &mut counts,
                 &layout
             ),
             Ok(())
@@ -3391,9 +3456,11 @@ mod tests {
         {
             let decoder = BoolDecoder::new(&[0x00, 0x00]).unwrap();
             let bit_offset = decoder.bit_offset();
+            let mut counts = SyntaxCounts::default();
             let mut parser = TileParser {
                 decoder,
                 probabilities: &probabilities,
+                counts: &mut counts,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: true,
@@ -3428,9 +3495,11 @@ mod tests {
     fn all_zero_token_block_takes_immediate_more_coefs_zero_path() {
         let probabilities = FrameContext::DEFAULT;
         let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut counts = SyntaxCounts::default();
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
             probabilities: &probabilities,
+            counts: &mut counts,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -3467,9 +3536,11 @@ mod tests {
     fn category_token_extra_bits_are_parsed() {
         let probabilities = FrameContext::DEFAULT;
         let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut counts = SyntaxCounts::default();
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
             probabilities: &probabilities,
+            counts: &mut counts,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -3491,9 +3562,11 @@ mod tests {
         assert_eq!(parser.decoder.finish(), Ok(()));
 
         let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut counts = SyntaxCounts::default();
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x50, 0x00]).unwrap(),
             probabilities: &probabilities,
+            counts: &mut counts,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -3520,6 +3593,7 @@ mod tests {
         let header = test_header(true);
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
+        let mut counts = SyntaxCounts::default();
 
         assert_eq!(
             parse_intra_tiles(
@@ -3527,6 +3601,7 @@ mod tests {
                 &header,
                 &compressed_header,
                 &FrameContext::DEFAULT,
+                &mut counts,
                 &layout
             ),
             Err(TileSyntaxError::Unimplemented)
