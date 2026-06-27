@@ -64,22 +64,26 @@
         alias npm='${npmUnavailable}/bin/npm'
       '';
 
-      packages = with pkgs; [
-        npmUnavailable
-        binaryen
-        bubblewrap
-        cacert
-        git
-        grinder
-        libvpx
-        nodejs
-        pnpm
-        ripgrep
-        rustToolchain
-        wabt
-        wasm-tools
-        which
-      ];
+      packages = with pkgs;
+        [
+          android-tools
+          binaryen
+          bubblewrap
+          cacert
+          git
+          grinder
+          libvpx
+          nodejs
+          pnpm
+          ripgrep
+          rustToolchain
+          wabt
+          wasm-tools
+          which
+        ]
+        ++ [
+          npmUnavailable
+        ];
     };
   };
 }
