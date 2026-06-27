@@ -5,7 +5,7 @@
 use core::panic::PanicInfo;
 
 use vip9r_core::{
-    DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, Plane, WorkspaceRequirements,
+    DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, Plane, WorkspaceLayout,
     split_packet,
 };
 
@@ -149,6 +149,8 @@ impl ActivePacket {
 struct Session {
     phase: Phase,
     decoder: Option<Decoder>,
+    layout: Option<WorkspaceLayout>,
+    workspace: Region,
     input_base: u32,
     input_capacity: u32,
     packet: ActivePacket,
@@ -160,6 +162,8 @@ impl Session {
         Self {
             phase: Phase::Uninit,
             decoder: None,
+            layout: None,
+            workspace: Region::empty(),
             input_base: 0,
             input_capacity: 0,
             packet: ActivePacket::new(),
@@ -172,18 +176,28 @@ impl Session {
             return INVALID_STATE;
         }
 
-        let decoder = match Decoder::new(max_width, max_height) {
-            Ok(decoder) => decoder,
+        let layout = match WorkspaceLayout::new(max_width, max_height) {
+            Ok(layout) => layout,
             Err(err) => return err.code(),
         };
-        if let Err(err) = WorkspaceRequirements::new(max_width, max_height) {
-            return err.code();
-        }
+        let decoder = Decoder::new(layout);
 
-        let input_base = match heap_base().and_then(|base| align_up(base, ARENA_ALIGN)) {
+        let workspace_base = match heap_base().and_then(|base| align_up(base, ARENA_ALIGN)) {
             Ok(base) => base,
             Err(code) => return code,
         };
+        let workspace_len = layout.total_bytes();
+        let workspace_end = match workspace_base.checked_add(workspace_len) {
+            Some(end) => end,
+            None => return RESOURCE_LIMIT,
+        };
+        let input_base = match align_up(workspace_end, ARENA_ALIGN) {
+            Ok(base) => base,
+            Err(code) => return code,
+        };
+        if let Err(code) = ensure_memory(input_base) {
+            return code;
+        }
         let memory_len = match memory_len() {
             Ok(len) => len,
             Err(code) => return code,
@@ -192,6 +206,14 @@ impl Session {
             return RESOURCE_LIMIT;
         }
 
+        let workspace_base_u32 = match u32::try_from(workspace_base) {
+            Ok(base) => base,
+            Err(_) => return RESOURCE_LIMIT,
+        };
+        let workspace_len_u32 = match u32::try_from(workspace_len) {
+            Ok(len) => len,
+            Err(_) => return RESOURCE_LIMIT,
+        };
         let input_base_u32 = match u32::try_from(input_base) {
             Ok(base) => base,
             Err(_) => return RESOURCE_LIMIT,
@@ -202,6 +224,11 @@ impl Session {
         };
 
         self.decoder = Some(decoder);
+        self.layout = Some(layout);
+        self.workspace = Region {
+            offset: workspace_base_u32,
+            len: workspace_len_u32,
+        };
         self.input_base = input_base_u32;
         self.input_capacity = input_capacity;
         self.packet.clear();
@@ -317,7 +344,17 @@ impl Session {
         let Some(decoder) = self.decoder.as_mut() else {
             return INVALID_STATE;
         };
-        let mut workspace = DecodeWorkspace::placeholder();
+        let Some(layout) = self.layout else {
+            return INVALID_STATE;
+        };
+        let workspace_bytes = match bytes_mut(self.workspace) {
+            Ok(bytes) => bytes,
+            Err(code) => return code,
+        };
+        let mut workspace = match DecodeWorkspace::new(layout, workspace_bytes) {
+            Ok(workspace) => workspace,
+            Err(err) => return err.code(),
+        };
         let outcome = match decoder.decode_coded_frame(coded_frame, &mut workspace) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -450,6 +487,17 @@ fn bytes(region: Region) -> Result<&'static [u8], i32> {
     let ptr = region.offset as *const u8;
     let len = usize::try_from(region.len).map_err(|_| RESOURCE_LIMIT)?;
     Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+fn bytes_mut(region: Region) -> Result<&'static mut [u8], i32> {
+    let end = region.end()?;
+    let end = usize::try_from(end).map_err(|_| RESOURCE_LIMIT)?;
+    if end > memory_len()? {
+        return Err(RESOURCE_LIMIT);
+    }
+    let ptr = region.offset as *mut u8;
+    let len = usize::try_from(region.len).map_err(|_| RESOURCE_LIMIT)?;
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -98,8 +98,11 @@ ranges. `Decoder::decode_coded_frame` consumes one range with an explicit
 helpers are adapters, not the architecture.
 
 `Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to
-the supplied workspace; current placeholder workspace storage exists only until
-reconstruction needs real buffers.
+the supplied workspace. `WorkspaceLayout` currently defines a fixed arena with
+one current reconstruction frame slot plus 8 reference frame slots, each using a
+compact I420 capacity derived from instance max dimensions. Additional maps and
+scratch should enter the layout only when implementation code actually consumes
+them.
 
 Shown-frame output borrows from the supplied workspace and is invalid after the
 next decode or packet transition. Public output is compact I420 in libvpx-md5

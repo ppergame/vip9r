@@ -11,8 +11,6 @@ mod superframe;
 mod tile;
 mod tile_syntax;
 
-use core::marker::PhantomData;
-
 use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::ProbabilityState;
@@ -20,6 +18,9 @@ use tile::parse_tile_layout;
 use tile_syntax::parse_intra_tiles;
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
+
+const REFERENCE_FRAME_SLOTS: usize = 8;
+const FRAME_POOL_SLOTS: usize = 1 + REFERENCE_FRAME_SLOTS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodedFrameRange {
@@ -64,59 +65,208 @@ pub fn split_packet(packet: &[u8]) -> Result<CodedFrameRanges, DecodeError> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WorkspaceRequirements {
-    pub max_width: u32,
-    pub max_height: u32,
-    pub pixel_bytes: usize,
-    pub mi_count: usize,
+pub struct WorkspaceLayout {
+    max_width: u32,
+    max_height: u32,
+    frame_pool: FramePoolLayout,
 }
 
-impl WorkspaceRequirements {
+impl WorkspaceLayout {
     pub fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
         validate_limits(max_width, max_height)?;
-        let i420 = required_i420_len(max_width, max_height).ok_or(DecodeError::InvalidConfig)?;
-        let pixel_bytes = i420.checked_mul(9).ok_or(DecodeError::InvalidConfig)?;
-        let mi_w = max_width.div_ceil(8);
-        let mi_h = max_height.div_ceil(8);
-        let mi_count = usize::try_from(mi_w)
-            .ok()
-            .and_then(|w| usize::try_from(mi_h).ok().and_then(|h| w.checked_mul(h)))
-            .ok_or(DecodeError::InvalidConfig)?;
+        let frame_pool = FramePoolLayout::new(FrameLayout::new(max_width, max_height)?)?;
 
         Ok(Self {
             max_width,
             max_height,
-            pixel_bytes,
-            mi_count,
+            frame_pool,
         })
+    }
+
+    pub const fn max_width(self) -> u32 {
+        self.max_width
+    }
+
+    pub const fn max_height(self) -> u32 {
+        self.max_height
+    }
+
+    pub fn total_bytes(self) -> usize {
+        self.frame_pool.total_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FramePoolLayout {
+    frame: FrameLayout,
+    current: ByteRange,
+    references: [ByteRange; REFERENCE_FRAME_SLOTS],
+}
+
+impl FramePoolLayout {
+    fn new(frame: FrameLayout) -> Result<Self, DecodeError> {
+        let frame_bytes = frame.bytes();
+        let current = ByteRange::new(0, frame_bytes)?;
+        let mut references = [ByteRange::empty(); REFERENCE_FRAME_SLOTS];
+        let mut next_start = current.end()?;
+        for reference in &mut references {
+            *reference = ByteRange::new(next_start, frame_bytes)?;
+            next_start = reference.end()?;
+        }
+        Ok(Self {
+            frame,
+            current,
+            references,
+        })
+    }
+
+    fn total_bytes(self) -> usize {
+        debug_assert_eq!(self.current.start, 0);
+        debug_assert_eq!(self.current.len, self.frame.bytes());
+        debug_assert_eq!(self.references[0].start, self.current.end().unwrap());
+        self.references[REFERENCE_FRAME_SLOTS - 1]
+            .end()
+            .expect("frame-pool layout was checked at construction")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ByteRange {
+    start: usize,
+    len: usize,
+}
+
+impl ByteRange {
+    const fn empty() -> Self {
+        Self { start: 0, len: 0 }
+    }
+
+    fn new(start: usize, len: usize) -> Result<Self, DecodeError> {
+        start.checked_add(len).ok_or(DecodeError::InvalidConfig)?;
+        Ok(Self { start, len })
+    }
+
+    fn end(self) -> Result<usize, DecodeError> {
+        self.start
+            .checked_add(self.len)
+            .ok_or(DecodeError::InvalidConfig)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameLayout {
+    y: PlaneLayout,
+    u: PlaneLayout,
+    v: PlaneLayout,
+}
+
+impl FrameLayout {
+    fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
+        let y_stride = usize::try_from(max_width).map_err(|_| DecodeError::InvalidConfig)?;
+        let y_height = usize::try_from(max_height).map_err(|_| DecodeError::InvalidConfig)?;
+        let uv_width =
+            usize::try_from(max_width.div_ceil(2)).map_err(|_| DecodeError::InvalidConfig)?;
+        let uv_height =
+            usize::try_from(max_height.div_ceil(2)).map_err(|_| DecodeError::InvalidConfig)?;
+
+        let y = PlaneLayout::new(0, y_stride, y_height)?;
+        let u = PlaneLayout::new(y.end()?, uv_width, uv_height)?;
+        let v = PlaneLayout::new(u.end()?, uv_width, uv_height)?;
+        let frame = Self { y, u, v };
+        frame
+            .bytes()
+            .checked_mul(FRAME_POOL_SLOTS)
+            .ok_or(DecodeError::InvalidConfig)?;
+        Ok(frame)
+    }
+
+    fn bytes(self) -> usize {
+        debug_assert_eq!(self.y.end().ok(), Some(self.u.offset));
+        debug_assert_eq!(self.u.end().ok(), Some(self.v.offset));
+        self.v
+            .end()
+            .expect("frame layout was checked at construction")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlaneLayout {
+    offset: usize,
+    len: usize,
+    stride: usize,
+}
+
+impl PlaneLayout {
+    fn new(offset: usize, stride: usize, height: usize) -> Result<Self, DecodeError> {
+        let len = stride
+            .checked_mul(height)
+            .ok_or(DecodeError::InvalidConfig)?;
+        offset.checked_add(len).ok_or(DecodeError::InvalidConfig)?;
+        Ok(Self {
+            offset,
+            len,
+            stride,
+        })
+    }
+
+    fn end(self) -> Result<usize, DecodeError> {
+        debug_assert!(self.stride <= self.len || self.len == 0);
+        self.offset
+            .checked_add(self.len)
+            .ok_or(DecodeError::InvalidConfig)
     }
 }
 
 #[derive(Debug)]
 pub struct DecodeWorkspace<'a> {
-    _marker: PhantomData<&'a mut ()>,
+    layout: WorkspaceLayout,
+    memory: &'a mut [u8],
 }
 
-impl DecodeWorkspace<'_> {
-    pub const fn placeholder() -> Self {
-        Self {
-            _marker: PhantomData,
+impl<'a> DecodeWorkspace<'a> {
+    pub fn new(layout: WorkspaceLayout, memory: &'a mut [u8]) -> Result<Self, DecodeError> {
+        let total_bytes = layout.total_bytes();
+        if memory.len() < total_bytes {
+            return Err(DecodeError::ResourceLimit);
         }
+        Ok(Self {
+            layout,
+            memory: &mut memory[..total_bytes],
+        })
+    }
+
+    fn require_layout(&self, expected: WorkspaceLayout) -> Result<(), DecodeError> {
+        if self.layout != expected {
+            return Err(DecodeError::InvalidConfig);
+        }
+        if self.memory.len() < self.layout.total_bytes() {
+            return Err(DecodeError::ResourceLimit);
+        }
+        Ok(())
     }
 }
 
 #[cfg(feature = "std")]
 #[derive(Debug)]
-pub struct OwnedWorkspace;
+pub struct OwnedWorkspace {
+    layout: WorkspaceLayout,
+    memory: Vec<u8>,
+}
 
 #[cfg(feature = "std")]
 impl OwnedWorkspace {
-    pub fn new(_requirements: WorkspaceRequirements) -> Result<Self, DecodeError> {
-        Ok(Self)
+    pub fn new(layout: WorkspaceLayout) -> Result<Self, DecodeError> {
+        let mut memory = Vec::new();
+        memory
+            .try_reserve_exact(layout.total_bytes())
+            .map_err(|_| DecodeError::ResourceLimit)?;
+        memory.resize(layout.total_bytes(), 0);
+        Ok(Self { memory, layout })
     }
 
     pub fn as_workspace(&mut self) -> DecodeWorkspace<'_> {
-        DecodeWorkspace::placeholder()
+        DecodeWorkspace::new(self.layout, &mut self.memory)
+            .expect("owned workspace was allocated from its layout")
     }
 }
 
@@ -236,29 +386,26 @@ impl DecodeError {
 
 #[derive(Debug)]
 pub struct Decoder {
-    max_width: u32,
-    max_height: u32,
+    layout: WorkspaceLayout,
     header_state: HeaderParserState,
     probability_state: ProbabilityState,
 }
 
 impl Decoder {
-    pub fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
-        validate_limits(max_width, max_height)?;
-
-        Ok(Self {
-            max_width,
-            max_height,
+    pub fn new(layout: WorkspaceLayout) -> Self {
+        Self {
+            layout,
             header_state: HeaderParserState::new(),
             probability_state: ProbabilityState::new(),
-        })
+        }
     }
 
     pub fn decode_coded_frame<'w>(
         &mut self,
         coded_frame: &[u8],
-        _workspace: &'w mut DecodeWorkspace<'_>,
+        workspace: &'w mut DecodeWorkspace<'_>,
     ) -> Result<DecodeOutcome<'w>, DecodeError> {
+        workspace.require_layout(self.layout)?;
         let header = parse_uncompressed_frame_header(coded_frame, &self.header_state)
             .map_err(|err| err.into_decode_error())?;
         self.validate_frame_limits(&header)?;
@@ -319,8 +466,8 @@ impl Decoder {
         &self,
         header: &header::UncompressedFrameHeader,
     ) -> Result<(), DecodeError> {
-        if header.frame_width > self.max_width
-            || header.frame_height > self.max_height
+        if header.frame_width > self.layout.max_width()
+            || header.frame_height > self.layout.max_height()
             || header.render_width == 0
             || header.render_height == 0
             || required_i420_len(header.frame_width, header.frame_height).is_none()
@@ -422,8 +569,8 @@ fn copy_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, FrameCopyErr
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, DecodeWorkspace, Decoder, FrameInfo, I420Frame, Plane, WorkspaceRequirements,
-        required_i420_len,
+        DecodeError, DecodeWorkspace, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane,
+        WorkspaceLayout, required_i420_len,
     };
 
     #[test]
@@ -443,23 +590,60 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_zero_max_dimensions() {
+    fn workspace_layout_rejects_zero_max_dimensions() {
         assert_eq!(
-            Decoder::new(0, 720).unwrap_err(),
+            WorkspaceLayout::new(0, 720).unwrap_err(),
             super::DecodeError::InvalidConfig
         );
     }
 
     #[test]
-    fn workspace_requirements_are_sized_from_max_dimensions() {
+    fn workspace_layout_is_current_plus_eight_compact_i420_frame_slots() {
+        let layout = WorkspaceLayout::new(16, 16).unwrap();
+
+        assert_eq!(layout.max_width(), 16);
+        assert_eq!(layout.max_height(), 16);
+        assert_eq!(layout.total_bytes(), 16 * 16 * 3 / 2 * 9);
+        assert_eq!(layout.frame_pool.current.start, 0);
+        assert_eq!(layout.frame_pool.current.len, 16 * 16 * 3 / 2);
+        assert_eq!(layout.frame_pool.references[0].start, 16 * 16 * 3 / 2);
         assert_eq!(
-            WorkspaceRequirements::new(16, 16).unwrap(),
-            WorkspaceRequirements {
-                max_width: 16,
-                max_height: 16,
-                pixel_bytes: 16 * 16 * 3 / 2 * 9,
-                mi_count: 4,
-            }
+            layout.frame_pool.references[7].end().unwrap(),
+            layout.total_bytes()
+        );
+        assert_eq!(layout.frame_pool.frame.y.offset, 0);
+        assert_eq!(layout.frame_pool.frame.y.stride, 16);
+        assert_eq!(layout.frame_pool.frame.y.len, 16 * 16);
+        assert_eq!(layout.frame_pool.frame.u.offset, 16 * 16);
+        assert_eq!(layout.frame_pool.frame.u.stride, 8);
+        assert_eq!(layout.frame_pool.frame.u.len, 8 * 8);
+        assert_eq!(layout.frame_pool.frame.v.offset, 16 * 16 + 8 * 8);
+        assert_eq!(layout.frame_pool.frame.v.stride, 8);
+        assert_eq!(layout.frame_pool.frame.v.len, 8 * 8);
+    }
+
+    #[test]
+    fn decode_workspace_rejects_undersized_arena() {
+        let layout = WorkspaceLayout::new(16, 16).unwrap();
+        let mut memory = vec![0; layout.total_bytes() - 1];
+
+        assert_eq!(
+            DecodeWorkspace::new(layout, &mut memory).unwrap_err(),
+            DecodeError::ResourceLimit
+        );
+    }
+
+    #[test]
+    fn decode_coded_frame_rejects_workspace_for_other_layout() {
+        let decoder_layout = WorkspaceLayout::new(16, 16).unwrap();
+        let workspace_layout = WorkspaceLayout::new(32, 16).unwrap();
+        let mut decoder = Decoder::new(decoder_layout);
+        let mut owned_workspace = OwnedWorkspace::new(workspace_layout).unwrap();
+        let mut workspace = owned_workspace.as_workspace();
+
+        assert_eq!(
+            decoder.decode_coded_frame(&[], &mut workspace),
+            Err(DecodeError::InvalidConfig)
         );
     }
 
@@ -559,8 +743,10 @@ mod tests {
     #[test]
     fn decode_coded_frame_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
         let frame = minimal_lossless_key_frame();
-        let mut decoder = Decoder::new(16, 16).unwrap();
-        let mut workspace = DecodeWorkspace::placeholder();
+        let layout = WorkspaceLayout::new(16, 16).unwrap();
+        let mut decoder = Decoder::new(layout);
+        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
+        let mut workspace = owned_workspace.as_workspace();
 
         assert_eq!(
             decoder.decode_coded_frame(&frame, &mut workspace),
@@ -572,8 +758,10 @@ mod tests {
     fn decode_coded_frame_parses_inter_compressed_header_before_unimplemented_boundary() {
         let key_frame = minimal_lossless_key_frame();
         let inter_frame = minimal_lossless_inter_frame();
-        let mut decoder = Decoder::new(16, 16).unwrap();
-        let mut workspace = DecodeWorkspace::placeholder();
+        let layout = WorkspaceLayout::new(16, 16).unwrap();
+        let mut decoder = Decoder::new(layout);
+        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
+        let mut workspace = owned_workspace.as_workspace();
 
         assert_eq!(
             decoder.decode_coded_frame(&key_frame, &mut workspace),

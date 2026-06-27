@@ -132,8 +132,10 @@ Target model:
 
 - `vip9r_core::Decoder`: VP9 semantic session state such as reference metadata,
   probability contexts, segmentation state, and counters.
-- `DecodeWorkspace`: a borrowed view over geometry-sized storage such as frame
-  buffers, maps, and scratch.
+- `WorkspaceLayout`: core-owned byte layout for geometry-sized storage. The
+  current layout is one current reconstruction frame slot plus 8 reference frame
+  slots, each with compact I420 capacity derived from instance max dimensions.
+- `DecodeWorkspace`: a checked borrowed arena view over a `WorkspaceLayout`.
 - Native owned workspace: `std`/test convenience that owns host allocations and
   yields a `DecodeWorkspace`.
 - `vip9r_wasm` state: wasm boundary state such as workspace layout, packet
@@ -148,7 +150,7 @@ Primary core operations:
 - split one demuxed VP9 packet into 1 to 8 coded-frame ranges;
 - apply VP9 semantic state transitions, including keyframe/intra-only state
   clearing;
-- compute workspace requirements from decoder limits;
+- compute the workspace layout from decoder limits;
 - decode one coded frame with a supplied workspace and return either no output
   or one shown frame.
 
@@ -205,8 +207,9 @@ loops and output. Reference prediction and `show_existing_frame` use
 per-reference dimensions. Allocation must reject dimensions above instance
 limits before trusting bitstream-derived offsets or sizes.
 
-Pixels are only one large allocation class. Metadata and scratch are also sized
-from frame or MI dimensions:
+Pixels are only the first large allocation class. Metadata and scratch are also
+sized from frame or MI dimensions, but should enter `WorkspaceLayout` only when
+implementation code actually consumes them:
 
 ```text
 mi_w = ceil(width / 8)
@@ -214,7 +217,7 @@ mi_h = ceil(height / 8)
 mi = mi_w * mi_h
 ```
 
-Geometry-sized workspace requirements must account for:
+Eventually, geometry-sized workspace layout must account for:
 
 - current and previous segmentation maps;
 - current and previous MV/ref maps for inter prediction;
@@ -228,23 +231,24 @@ Geometry-sized workspace requirements must account for:
 Fixed decoder state and packet state include per-frame probability counts and
 the packet/superframe cursor. They are not part of the geometry-sized workspace.
 
-Exact byte layout belongs in `WorkspaceRequirements` and wasm workspace-layout
-code, not in this design doc. Exact spec constants belong in implementation code
-with nearby spec citations and tests, not as a second shadow copy here.
+Exact byte layout belongs in `WorkspaceLayout` and wasm workspace-layout code,
+not in this design doc. Exact spec constants belong in implementation code with
+nearby spec citations and tests, not as a second shadow copy here.
 
 ## Linear-memory ownership
 
 JS can hold `Uint8Array` views onto wasm linear memory, but wasm can only
 dereference its own memory. Decode internals are not JS-owned buffers.
 
-Use a persistent workspace sized from instance limits:
+Use a persistent workspace sized from instance limits. Current implementation
+only reserves the frame pool; the later regions below are added when consumed:
 
 ```text
 instance header/static state
-reference frame pool, capacity = max_width/max_height
 current frame, capacity = max_width/max_height
-metadata maps, capacity = ceil(max_width/8) * ceil(max_height/8)
-fixed scratch
+reference frame pool, capacity = max_width/max_height
+metadata maps, capacity = ceil(max_width/8) * ceil(max_height/8) [future]
+fixed scratch [future]
 packet staging tail, growable
 ```
 
@@ -253,10 +257,10 @@ memory, currently using the linker-provided heap base aligned up to the largest
 workspace-region alignment. Keep verifying the exported data/heap boundary when
 link settings change.
 
-`init(max_width, max_height)` lays out the fixed workspace once: reference
-frames, current frame, metadata maps, and scratch first; the packet staging tail
-starts after that fixed workspace. Changing `max_width` or `max_height` means
-constructing a new `WebAssembly.Instance`.
+`init(max_width, max_height)` lays out the fixed workspace once: current frame
+and reference frames first; metadata maps and scratch follow when they exist.
+The packet staging tail starts after the fixed workspace. Changing `max_width`
+or `max_height` means constructing a new `WebAssembly.Instance`.
 
 Mid-GOP resize reshapes active views inside this capacity. Each frame recomputes
 active dimensions, plane slices, MI rectangles, tile bounds, and per-slot
@@ -276,10 +280,10 @@ move or change capacity after `init`; only the tail capacity may increase.
 
 - Static/stack wasm memory: control state, `Decoder`, small fixed tables, and
   the result block. No large frame-sized objects.
-- Manually managed linear memory: fixed workspace regions for reference frames,
-  the current frame, metadata maps, and large scratch, followed by the packet
-  tail. Fixed ranges are computed by `init`; the packet tail keeps a fixed base
-  with growable capacity.
+- Manually managed linear memory: fixed workspace regions for the current frame
+  and reference frames, eventually metadata maps and large scratch, followed by
+  the packet tail. Fixed ranges are computed by `init`; the packet tail keeps a
+  fixed base with growable capacity.
 - JS views: packet copy source/sink and output readers. JS gets offsets only,
   never ownership.
 
@@ -357,8 +361,8 @@ lifetime and avoids queue/pinning/release APIs.
 
 ## Core/wasm responsibility split
 
-- Core owns VP9 semantics, validation, workspace requirements, packet splitting,
-  and typed workspace interpretation.
+- Core owns VP9 semantics, validation, workspace layout, packet splitting, and
+  typed workspace interpretation.
 - Wasm owns linear-memory allocation, growth, workspace layout, packet cursor,
   exported entry points, result payloads, and resource limits.
 - Native tests may use ordinary Rust allocations through core-owned test/helper
