@@ -14,9 +14,10 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 
-const TEXT_LIMIT = 140;
-const OUTPUT_LIMIT = 180;
 const FOLLOW_SNAPSHOT_EVENTS = 30;
+const COMMAND_LIMIT = 220;
+const OUTPUT_TAIL_LINES = 8;
+const OUTPUT_TAIL_CHARS = 3000;
 
 function usage(exitCode = 2) {
 	const out = exitCode === 0 ? process.stdout : process.stderr;
@@ -27,7 +28,7 @@ function usage(exitCode = 2) {
 
 Options:
   -f, --follow     Follow appended events.
-      --verbose    Print full message and command-output blocks.
+      --verbose    Also print successful command output and full unknown-event blocks.
       --repo DIR   Repository root for auto-discovery.
   -h, --help       Show this help.
 
@@ -39,10 +40,95 @@ function isObject(value) {
 	return typeof value === "object" && value !== null;
 }
 
-function firstLine(value, limit = TEXT_LIMIT) {
-	const text = String(value ?? "").replace(/\s+/g, " ").trim();
+function inlineText(value) {
+	return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function limitedInlineText(value, limit) {
+	const text = inlineText(value);
 	if (text.length <= limit) return text;
 	return `${text.slice(0, Math.max(0, limit - 1))}…`;
+}
+
+function blockText(value) {
+	return String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+}
+
+function writeIndentedText(out, label, value) {
+	const text = blockText(value);
+	if (!text) return;
+	const lines = text.split("\n");
+	if (lines.length === 1) {
+		out.write(`  ${label}: ${lines[0]}\n`);
+		return;
+	}
+	out.write(`  ${label}:\n`);
+	for (const line of lines) out.write(`    ${line}\n`);
+}
+
+function trimmed(value) {
+	return String(value ?? "").trim();
+}
+
+function parseJsonString(value) {
+	if (typeof value !== "string") return undefined;
+	const text = value.trim();
+	if (!text.startsWith("{") && !text.startsWith("[")) return undefined;
+	try {
+		return JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+}
+
+function compactErrorText(value, depth = 0) {
+	if (depth > 4) return inlineText(value);
+	if (typeof value === "string") {
+		const parsed = parseJsonString(value);
+		return simplifyErrorText(parsed ? compactErrorText(parsed, depth + 1) : value);
+	}
+	if (!isObject(value)) return simplifyErrorText(String(value ?? ""));
+
+	const labels = [];
+	for (const key of ["type", "code", "status"]) {
+		const label = value[key];
+		if (typeof label === "string" || typeof label === "number") labels.push(String(label));
+	}
+	const nested = value.error ?? value.message ?? value.param;
+	const message = nested === undefined ? JSON.stringify(value) : compactErrorText(nested, depth + 1);
+	return simplifyErrorText(`${labels.length > 0 ? `${labels.join("/")}: ` : ""}${message}`);
+}
+
+function simplifyErrorText(value) {
+	const text = inlineText(value);
+	if (text.includes("property_name_above_max_length") || text.includes("Invalid property name")) {
+		const length = text.match(/got a string with length ([0-9]+)/i)?.[1];
+		const expected = text.match(/maximum length ([0-9]+)/i)?.[1];
+		const suffix = length && expected ? ` (${length}/${expected})` : "";
+		return `property_name_above_max_length: tool-call argument property name too long${suffix}`;
+	}
+	return text;
+}
+
+function displayCommand(value) {
+	return limitedInlineText(value ?? "command", COMMAND_LIMIT);
+}
+
+function outputTail(value) {
+	const text = blockText(value);
+	if (!text) return "";
+
+	const lines = text.split("\n");
+	const omittedLines = Math.max(0, lines.length - OUTPUT_TAIL_LINES);
+	let tail = lines.slice(-OUTPUT_TAIL_LINES).join("\n");
+	const omittedChars = Math.max(0, tail.length - OUTPUT_TAIL_CHARS);
+	if (omittedChars > 0) tail = tail.slice(-OUTPUT_TAIL_CHARS);
+
+	const markers = [];
+	if (omittedLines > 0) markers.push(`… ${omittedLines} earlier lines omitted`);
+	if (omittedChars > 0) markers.push(`… ${omittedChars} earlier chars omitted from tail`);
+	if (markers.length === 0) return tail;
+	return `${markers.join("\n")}\n${tail}`;
 }
 
 function compactNumber(value) {
@@ -71,11 +157,18 @@ function itemKeys(item) {
 }
 
 class CompactRenderer {
-	constructor({ out, suppressFinalAgent, verbose = false }) {
+	constructor({
+		out,
+		showCommandStarts = true,
+		showReasoning = false,
+		verbose = false,
+	}) {
 		this.out = out;
-		this.suppressFinalAgent = suppressFinalAgent;
+		this.showCommandStarts = showCommandStarts;
+		this.showReasoning = showReasoning;
 		this.verbose = verbose;
 		this.pendingAgent = undefined;
+		this.pendingFileChanges = new Map();
 		this.lastTodo = undefined;
 	}
 
@@ -85,29 +178,37 @@ class CompactRenderer {
 
 	flushAgent() {
 		if (!this.pendingAgent) return;
-		if (this.suppressFinalAgent) {
-			this.discardAgent();
-			return;
-		}
-		if (this.verbose) this.writeBlock("agent", this.pendingAgent);
-		else this.write(`  agent: ${firstLine(this.pendingAgent)}`);
+		this.flushFileChanges();
+		this.writeText("agent", this.pendingAgent);
 		this.pendingAgent = undefined;
 	}
 
-	discardAgent() {
-		this.pendingAgent = undefined;
+	flushFileChanges() {
+		if (this.pendingFileChanges.size === 0) return;
+		const parts = [];
+		for (const [key, count] of this.pendingFileChanges) {
+			const [kind, path] = key.split("\t");
+			parts.push(`${kind} ${path}${count > 1 ? ` ×${count}` : ""}`);
+		}
+		this.pendingFileChanges.clear();
+		this.write(`  ✎ ${parts.join(", ")}`);
 	}
 
 	writeBlock(label, value) {
-		const text = String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+		const text = blockText(value);
 		if (!text) return;
 		this.write(`  ${label}:`);
 		for (const line of text.split("\n")) this.write(`    ${line}`);
 	}
 
+	writeText(label, value) {
+		writeIndentedText(this.out, label, value);
+	}
+
 	renderEvent(event) {
 		if (!isObject(event) || typeof event.type !== "string") {
 			this.flushAgent();
+			this.flushFileChanges();
 			this.write("? malformed event");
 			return;
 		}
@@ -115,31 +216,37 @@ class CompactRenderer {
 		switch (event.type) {
 			case "thread.started":
 				this.flushAgent();
+				this.flushFileChanges();
 				this.write(`codex ${typeof event.thread_id === "string" ? event.thread_id : "unknown-thread"}`);
 				break;
 			case "turn.started":
 				this.flushAgent();
+				this.flushFileChanges();
 				this.write("· turn");
 				break;
 			case "turn.completed":
-				if (this.suppressFinalAgent) this.discardAgent();
-				else this.flushAgent();
+				this.flushAgent();
+				this.flushFileChanges();
 				this.renderUsage(event.usage);
 				break;
 			case "turn.failed":
 				this.flushAgent();
-				this.write(`  turn failed: ${firstLine(event.error ?? event.message ?? JSON.stringify(event), OUTPUT_LIMIT)}`);
+				this.flushFileChanges();
+				this.writeText("turn failed", compactErrorText(event.error ?? event.message ?? event));
 				break;
 			case "error":
 				this.flushAgent();
-				this.write(`  error: ${firstLine(event.message ?? event.error ?? JSON.stringify(event), OUTPUT_LIMIT)}`);
+				this.flushFileChanges();
+				this.writeText("error", compactErrorText(event.message ?? event.error ?? event));
 				break;
 			case "item.started":
+			case "item.updated":
 			case "item.completed":
 				this.renderItem(event.type, event.item);
 				break;
 			default:
 				this.flushAgent();
+				this.flushFileChanges();
 				if (this.verbose) this.writeBlock(`? ${event.type}`, JSON.stringify(event, null, 2));
 				else this.write(`? ${event.type}`);
 				break;
@@ -158,55 +265,76 @@ class CompactRenderer {
 	renderItem(eventType, item) {
 		if (!isObject(item) || typeof item.type !== "string") {
 			this.flushAgent();
+			this.flushFileChanges();
 			this.write(`  ? ${eventType}`);
 			return;
 		}
 
 		if (item.type === "agent_message") {
 			if (typeof item.text === "string" && item.text.trim()) {
-				this.flushAgent();
-				this.pendingAgent = item.text;
+				this.renderAgent(item.text);
 			}
 			return;
 		}
 
 		if (item.type === "command_execution") {
 			this.flushAgent();
+			this.flushFileChanges();
 			this.renderCommand(eventType, item);
 			return;
 		}
 
 		if (item.type === "file_change") {
 			this.flushAgent();
-			if (eventType === "item.completed") this.renderFileChange(item);
+			if (eventType === "item.completed") this.recordFileChange(item);
 			return;
 		}
 
 		if (item.type === "todo_list") {
 			this.flushAgent();
+			this.flushFileChanges();
 			this.renderTodoList(item);
 			return;
 		}
 
 		if (item.type === "reasoning") {
-			if (typeof item.text === "string" && item.text.trim()) {
+			if (this.showReasoning && typeof item.text === "string" && item.text.trim()) {
 				this.flushAgent();
-				if (this.verbose) this.writeBlock("think", item.text);
-				else this.write(`  think: ${firstLine(item.text)}`);
+				this.flushFileChanges();
+				this.writeText("think", item.text);
 			}
 			return;
 		}
 
+		if (item.type === "error") {
+			this.flushAgent();
+			this.flushFileChanges();
+			this.writeText("error", compactErrorText(item.message ?? item.error ?? item));
+			return;
+		}
+
 		this.flushAgent();
+		this.flushFileChanges();
 		const keys = itemKeys(item);
 		if (this.verbose) this.writeBlock(`? ${item.type}${keys ? ` {${keys}}` : ""}`, JSON.stringify(item, null, 2));
 		else this.write(`  ? ${item.type}${keys ? ` {${keys}}` : ""}`);
 	}
 
+	renderAgent(text) {
+		const body = trimmed(text);
+		if (!body) return;
+		this.flushAgent();
+		this.flushFileChanges();
+		this.pendingAgent = body;
+	}
+
 	renderCommand(eventType, item) {
-		const command = firstLine(item.command ?? "command", this.verbose ? 240 : 120);
+		const command = displayCommand(item.command ?? "command");
 		if (eventType === "item.started") {
-			this.write(`  ▸ ${command}`);
+			if (this.showCommandStarts) this.write(`  ▸ ${command}`);
+			return;
+		}
+		if (eventType === "item.updated") {
 			return;
 		}
 
@@ -217,20 +345,22 @@ class CompactRenderer {
 		if (this.verbose && typeof item.aggregated_output === "string" && item.aggregated_output.trim()) {
 			this.writeBlock("output", item.aggregated_output);
 		} else if (mark !== "✓" && typeof item.aggregated_output === "string" && item.aggregated_output.trim()) {
-			this.write(`    ${firstLine(item.aggregated_output, OUTPUT_LIMIT)}`);
+			this.writeBlock("output tail", outputTail(item.aggregated_output));
 		}
 	}
 
-	renderFileChange(item) {
+	recordFileChange(item) {
 		const changes = Array.isArray(item.changes) ? item.changes : [];
 		if (changes.length === 0) {
-			this.write("  ✎ file change");
+			this.pendingFileChanges.set("change\tfile change", (this.pendingFileChanges.get("change\tfile change") ?? 0) + 1);
 			return;
 		}
 		for (const change of changes) {
 			if (!isObject(change)) continue;
 			const kind = typeof change.kind === "string" ? change.kind : "change";
-			this.write(`  ✎ ${kind} ${relativeSandboxPath(change.path)}`);
+			const path = relativeSandboxPath(change.path);
+			const key = `${kind}\t${path}`;
+			this.pendingFileChanges.set(key, (this.pendingFileChanges.get(key) ?? 0) + 1);
 		}
 	}
 
@@ -239,7 +369,7 @@ class CompactRenderer {
 		const total = items.length;
 		const done = items.filter((entry) => isObject(entry) && entry.completed === true).length;
 		const active = items.find((entry) => isObject(entry) && entry.completed !== true);
-		const activeText = isObject(active) && typeof active.text === "string" ? firstLine(active.text, 90) : "";
+		const activeText = isObject(active) && typeof active.text === "string" ? inlineText(active.text) : "";
 		const line = `plan: ${done}/${total} done${activeText ? ` — ${activeText}` : ""}`;
 		if (line === this.lastTodo) return;
 		this.lastTodo = line;
@@ -258,7 +388,10 @@ class CompactRenderer {
 async function streamJsonl(outPath) {
 	if (!outPath) usage();
 	const raw = createWriteStream(outPath, { flags: "w" });
-	const renderer = new CompactRenderer({ out: process.stderr, suppressFinalAgent: true });
+	const renderer = new CompactRenderer({
+		out: process.stderr,
+		showCommandStarts: true,
+	});
 	const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 	for await (const line of lines) {
@@ -271,7 +404,8 @@ async function streamJsonl(outPath) {
 		}
 	}
 
-	renderer.discardAgent();
+	renderer.flushAgent();
+	renderer.flushFileChanges();
 	await new Promise((resolveStream, rejectStream) => {
 		raw.end((error) => (error ? rejectStream(error) : resolveStream()));
 	});
@@ -382,14 +516,38 @@ function discoverSessionFiles(repo) {
 	return sessions;
 }
 
+function grinderRunName(path) {
+	return String(path).match(/grinder\.[^/\\]+/)?.[0];
+}
+
+function traceSiblingPaths(jsonlPath, filename) {
+	const paths = [join(dirname(jsonlPath), filename)];
+	const name = grinderRunName(jsonlPath);
+	const tempMarker = "/temp/";
+	const tempIndex = jsonlPath.indexOf(tempMarker);
+	if (!name || tempIndex === -1) return paths;
+
+	const tempRoot = jsonlPath.slice(0, tempIndex + "/temp".length);
+	paths.push(join(tempRoot, name, "trace", filename));
+	for (const entry of listDir(join(tempRoot, "traces"))) {
+		if (entry.isDirectory() && entry.name.endsWith(`-${name}`)) {
+			paths.push(join(tempRoot, "traces", entry.name, filename));
+		}
+	}
+
+	return [...new Set(paths)];
+}
+
 function finalTextFor(jsonlPath) {
-	const sibling = readOptional(join(dirname(jsonlPath), "final.md"));
-	if (sibling) return sibling;
+	for (const path of traceSiblingPaths(jsonlPath, "final.md")) {
+		const sibling = readOptional(path);
+		if (sibling) return sibling;
+	}
 	return undefined;
 }
 
 function isTerminalEvent(event) {
-	return isObject(event) && ["turn.completed", "turn.failed", "error"].includes(event.type);
+	return isObject(event) && ["turn.completed", "turn.failed"].includes(event.type);
 }
 
 function threadIdFor(events) {
@@ -398,7 +556,11 @@ function threadIdFor(events) {
 }
 
 function statusFor(jsonlPath) {
-	return readOptional(join(dirname(jsonlPath), "exit-status"));
+	for (const path of traceSiblingPaths(jsonlPath, "exit-status")) {
+		const status = readOptional(path);
+		if (status !== undefined) return status;
+	}
+	return undefined;
 }
 
 function tokenCountSample(event) {
@@ -442,7 +604,11 @@ function contextSummaryForFile(path) {
 }
 
 function contextSummaryForTrace(jsonlPath) {
-	return contextSummaryForFile(join(dirname(jsonlPath), "rollout.jsonl"));
+	for (const path of traceSiblingPaths(jsonlPath, "rollout.jsonl")) {
+		const summary = contextSummaryForFile(path);
+		if (summary) return summary;
+	}
+	return undefined;
 }
 
 function inspectJsonl(jsonlPath, options) {
@@ -456,12 +622,13 @@ function inspectJsonl(jsonlPath, options) {
 
 	const renderer = new CompactRenderer({
 		out: process.stdout,
-		suppressFinalAgent: Boolean(finalText) && !options.verbose,
+		showCommandStarts: options.follow,
+		showReasoning: true,
 		verbose: options.verbose,
 	});
 	for (const event of events) renderer.renderEvent(event);
-	if (finalText && !options.verbose) renderer.discardAgent();
-	else renderer.flushAgent();
+	renderer.flushAgent();
+	renderer.flushFileChanges();
 
 	process.stdout.write("\n── grinder ──\n");
 	if (status) process.stdout.write(`status: ${status}\n`);
@@ -469,7 +636,7 @@ function inspectJsonl(jsonlPath, options) {
 	if (contextSummary) process.stdout.write(`context: ${contextSummary}\n`);
 	process.stdout.write(`file: ${jsonlPath}\n`);
 	if (threadId) process.stdout.write(`thread: ${threadId}\n`);
-	if (finalText) process.stdout.write(`final: ${firstLine(finalText, 180)}\n`);
+	if (finalText) process.stdout.write(`final: ${limitedInlineText(finalText, 220)}\n`);
 	if (malformed > 0) process.stdout.write(`malformed lines skipped: ${malformed}\n`);
 }
 
@@ -524,6 +691,7 @@ function renderFollowLine(path, line, renderer) {
 	try {
 		renderer.renderEvent(JSON.parse(line));
 		renderer.flushAgent();
+		renderer.flushFileChanges();
 	} catch {
 		process.stderr.write(`skipping malformed codex jsonl line from ${path}\n`);
 	}
@@ -536,6 +704,7 @@ function printFollowSnapshot(path, renderer) {
 	const { events, malformed } = parseJsonlText(bytes.subarray(0, completeBytes).toString("utf8"));
 	for (const event of events.slice(-FOLLOW_SNAPSHOT_EVENTS)) renderer.renderEvent(event);
 	renderer.flushAgent();
+	renderer.flushFileChanges();
 	if (malformed > 0) process.stderr.write(`skipping ${malformed} malformed codex jsonl lines from ${path}\n`);
 	return completeBytes;
 }
@@ -566,7 +735,12 @@ async function follow(options) {
 			current = next;
 			buffered = "";
 			decoder = new StringDecoder("utf8");
-			renderer = new CompactRenderer({ out: process.stdout, suppressFinalAgent: false, verbose: options.verbose });
+			renderer = new CompactRenderer({
+				out: process.stdout,
+				showCommandStarts: true,
+				showReasoning: true,
+				verbose: options.verbose,
+			});
 			process.stderr.write(`==> ${current.path} <==\n`);
 			offset = existsSync(current.path) ? printFollowSnapshot(current.path, renderer) : 0;
 			warnedWaiting = false;
@@ -586,7 +760,12 @@ async function follow(options) {
 			offset = 0;
 			buffered = "";
 			decoder = new StringDecoder("utf8");
-			renderer = new CompactRenderer({ out: process.stdout, suppressFinalAgent: false, verbose: options.verbose });
+			renderer = new CompactRenderer({
+				out: process.stdout,
+				showCommandStarts: true,
+				showReasoning: true,
+				verbose: options.verbose,
+			});
 		}
 
 		if (stat.size > offset) {
