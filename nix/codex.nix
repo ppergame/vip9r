@@ -1,12 +1,12 @@
 {pkgs}: let
   inherit (pkgs) lib;
 
-  version = "0.141.0";
+  version = "0.142.3";
 
   target = {
     platformTag = "linux-x64";
     targetTriple = "x86_64-unknown-linux-musl";
-    hash = "sha256-ejjRlbwE4tLg5Eepfz5S+vm3mDbVJ+6CxfaVvw1/Zjw=";
+    hash = "sha256-WsKyW4BPu7Mf7iEVFqEwxJS2r3owUKGOoQpmXMGEjeA=";
   };
 
   codexNpm = pkgs.fetchzip {
