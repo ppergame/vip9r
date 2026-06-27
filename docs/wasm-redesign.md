@@ -5,18 +5,17 @@ implemented decisions into `docs/design.md`.
 
 ## Current baseline
 
-- `vip9r-core` exposes stateful packet decode:
-  `Decoder::decode_packet(packet, sink)`.
-- Shown frames are pushed synchronously through `FrameSink`; frame borrows are
-  valid only during the callback.
-- That callback packet API is current implementation shape, not a wasm-boundary
-  constraint.
-- Public core output is compact I420 in libvpx-md5 order: visible Y, then U,
-  then V. Internal storage may use stride or padding.
-- `vip9r-wasm` still exports placeholder helpers plus
-  `vip9r_decode_frame(input_ptr, input_len, output_ptr, output_len)`, which
-  ignores its pointers and returns `Unimplemented`.
-- JS wasm bindings are empty.
+- `vip9r-core` exposes packet splitting plus one-coded-frame decode:
+  `split_packet(packet)` and
+  `Decoder::decode_coded_frame(coded_frame, workspace)`.
+- Host packet-level md5 tooling wraps that step API.
+- Public core output remains compact I420 in libvpx-md5 order: visible Y, then
+  U, then V. Internal storage may use stride or padding.
+- `vip9r-wasm` exports the first boundary shape:
+  `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
+  `vip9r_begin_packet`, and `vip9r_decode_next`.
+- JS wasm bindings and a d8 IVF/md5 driver exist. With current decode coverage,
+  valid packets reach `vip9r_decode_next` and fail with `Unimplemented`.
 
 ## First boundary scope
 
@@ -156,9 +155,8 @@ Primary core operations:
 Core output borrows are tied to the supplied workspace and are invalid after the
 next decode or packet transition.
 
-`FrameSink` is a packet-level adapter that may emit multiple shown frames. The
-wasm step API emits at most one shown frame per call. Packet-level host decode
-wraps packet splitting and one-frame decode.
+Packet-level host decode is an adapter over packet splitting and one-frame
+decode. The wasm step API emits at most one shown frame per call.
 
 Storage placement follows semantics, not byte count:
 

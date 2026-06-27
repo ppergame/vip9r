@@ -72,6 +72,23 @@ errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
 permits wrong frame hashes for code-complete smoke runs. The current decoder is
 still expected to stop at `Unimplemented`.
 
+The d8 wasm path exercises the manual boundary and the same md5 protocol:
+
+```sh
+cd rust
+cargo build -p vip9r-wasm --target wasm32-unknown-unknown
+cd ../js
+pnpm build:d8
+$D8_LINUX64 dist/d8/main.js -- \
+  ../rust/target/wasm32-unknown-unknown/debug/vip9r_wasm.wasm \
+  /bulk/vip9r/chromium/bear-vp9.ivf
+```
+
+Until reconstruction exists, the expected d8 failure is
+`vip9r_decode_next: unimplemented (-8)`. A failure earlier than
+`decode_next` is a wasm boundary regression, not an ordinary decoder
+incompleteness.
+
 ### Decode API
 
 The primary core API is packet splitting plus one-coded-frame decode. A demuxed
