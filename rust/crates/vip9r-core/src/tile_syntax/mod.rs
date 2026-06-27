@@ -6,9 +6,8 @@ use crate::header::UncompressedFrameHeader;
 use crate::probability::{FrameContext, TX_SIZE_CONTEXTS};
 use crate::tile::{TileDescriptor, TileLayout};
 
-#[path = "tile_syntax_tables.rs"]
-mod tile_syntax_tables;
-use tile_syntax_tables::*;
+mod tables;
+use tables::*;
 
 const MAX_MIS: usize = 8192;
 const MAX_4X4S: usize = MAX_MIS * 2;

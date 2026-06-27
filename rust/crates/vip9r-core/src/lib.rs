@@ -1,24 +1,23 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+mod bitstream;
+mod boolcoder;
+mod compressed_header;
+mod error;
+mod header;
+mod probability;
+mod superframe;
+mod tile;
+mod tile_syntax;
+
 use core::marker::PhantomData;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecoderLimits {
-    pub max_width: u32,
-    pub max_height: u32,
-}
-
-impl DecoderLimits {
-    pub const fn new(max_width: u32, max_height: u32) -> Self {
-        Self {
-            max_width,
-            max_height,
-        }
-    }
-}
+use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
+use header::{HeaderParserState, parse_uncompressed_frame_header};
+use probability::ProbabilityState;
+use tile::parse_tile_layout;
+use tile_syntax::parse_intra_tiles;
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
 
@@ -66,26 +65,27 @@ pub fn split_packet(packet: &[u8]) -> Result<CodedFrameRanges, DecodeError> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkspaceRequirements {
-    pub limits: DecoderLimits,
+    pub max_width: u32,
+    pub max_height: u32,
     pub pixel_bytes: usize,
     pub mi_count: usize,
 }
 
 impl WorkspaceRequirements {
-    pub fn new(limits: DecoderLimits) -> Result<Self, DecodeError> {
-        validate_limits(limits)?;
-        let i420 = required_i420_len(limits.max_width, limits.max_height)
-            .ok_or(DecodeError::InvalidConfig)?;
+    pub fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
+        validate_limits(max_width, max_height)?;
+        let i420 = required_i420_len(max_width, max_height).ok_or(DecodeError::InvalidConfig)?;
         let pixel_bytes = i420.checked_mul(9).ok_or(DecodeError::InvalidConfig)?;
-        let mi_w = limits.max_width.div_ceil(8);
-        let mi_h = limits.max_height.div_ceil(8);
+        let mi_w = max_width.div_ceil(8);
+        let mi_h = max_height.div_ceil(8);
         let mi_count = usize::try_from(mi_w)
             .ok()
             .and_then(|w| usize::try_from(mi_h).ok().and_then(|h| w.checked_mul(h)))
             .ok_or(DecodeError::InvalidConfig)?;
 
         Ok(Self {
-            limits,
+            max_width,
+            max_height,
             pixel_bytes,
             mi_count,
         })
@@ -234,48 +234,24 @@ impl DecodeError {
     }
 }
 
-mod bitstream;
-mod boolcoder;
-mod compressed_header;
-mod error;
-mod header;
-mod probability;
-mod superframe;
-mod tile;
-mod tile_syntax;
-
-use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
-use header::{HeaderParserState, parse_uncompressed_frame_header};
-use probability::ProbabilityState;
-use tile::parse_tile_layout;
-use tile_syntax::parse_intra_tiles;
-
 #[derive(Debug)]
 pub struct Decoder {
-    limits: DecoderLimits,
+    max_width: u32,
+    max_height: u32,
     header_state: HeaderParserState,
     probability_state: ProbabilityState,
 }
 
 impl Decoder {
-    pub fn new(limits: DecoderLimits) -> Result<Self, DecodeError> {
-        validate_limits(limits)?;
+    pub fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
+        validate_limits(max_width, max_height)?;
 
         Ok(Self {
-            limits,
+            max_width,
+            max_height,
             header_state: HeaderParserState::new(),
             probability_state: ProbabilityState::new(),
         })
-    }
-
-    pub const fn limits(&self) -> DecoderLimits {
-        self.limits
-    }
-
-    pub fn workspace_requirements(
-        limits: DecoderLimits,
-    ) -> Result<WorkspaceRequirements, DecodeError> {
-        WorkspaceRequirements::new(limits)
     }
 
     pub fn decode_coded_frame<'w>(
@@ -343,8 +319,8 @@ impl Decoder {
         &self,
         header: &header::UncompressedFrameHeader,
     ) -> Result<(), DecodeError> {
-        if header.frame_width > self.limits.max_width
-            || header.frame_height > self.limits.max_height
+        if header.frame_width > self.max_width
+            || header.frame_height > self.max_height
             || header.render_width == 0
             || header.render_height == 0
             || required_i420_len(header.frame_width, header.frame_height).is_none()
@@ -391,11 +367,8 @@ pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {
     luma.checked_add(chroma_plane.checked_mul(2)?)
 }
 
-fn validate_limits(limits: DecoderLimits) -> Result<(), DecodeError> {
-    if limits.max_width == 0
-        || limits.max_height == 0
-        || required_i420_len(limits.max_width, limits.max_height).is_none()
-    {
+fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
+    if max_width == 0 || max_height == 0 || required_i420_len(max_width, max_height).is_none() {
         return Err(DecodeError::InvalidConfig);
     }
     Ok(())
@@ -449,8 +422,8 @@ fn copy_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, FrameCopyErr
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, DecodeWorkspace, Decoder, DecoderLimits, FrameInfo, I420Frame, Plane,
-        WorkspaceRequirements, required_i420_len,
+        DecodeError, DecodeWorkspace, Decoder, FrameInfo, I420Frame, Plane, WorkspaceRequirements,
+        required_i420_len,
     };
 
     #[test]
@@ -470,19 +443,20 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_zero_limits() {
+    fn decoder_rejects_zero_max_dimensions() {
         assert_eq!(
-            Decoder::new(DecoderLimits::new(0, 720)).unwrap_err(),
+            Decoder::new(0, 720).unwrap_err(),
             super::DecodeError::InvalidConfig
         );
     }
 
     #[test]
-    fn workspace_requirements_are_sized_from_limits() {
+    fn workspace_requirements_are_sized_from_max_dimensions() {
         assert_eq!(
-            WorkspaceRequirements::new(DecoderLimits::new(16, 16)).unwrap(),
+            WorkspaceRequirements::new(16, 16).unwrap(),
             WorkspaceRequirements {
-                limits: DecoderLimits::new(16, 16),
+                max_width: 16,
+                max_height: 16,
                 pixel_bytes: 16 * 16 * 3 / 2 * 9,
                 mi_count: 4,
             }
@@ -585,7 +559,7 @@ mod tests {
     #[test]
     fn decode_coded_frame_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
         let frame = minimal_lossless_key_frame();
-        let mut decoder = Decoder::new(DecoderLimits::new(16, 16)).unwrap();
+        let mut decoder = Decoder::new(16, 16).unwrap();
         let mut workspace = DecodeWorkspace::placeholder();
 
         assert_eq!(
@@ -598,7 +572,7 @@ mod tests {
     fn decode_coded_frame_parses_inter_compressed_header_before_unimplemented_boundary() {
         let key_frame = minimal_lossless_key_frame();
         let inter_frame = minimal_lossless_inter_frame();
-        let mut decoder = Decoder::new(DecoderLimits::new(16, 16)).unwrap();
+        let mut decoder = Decoder::new(16, 16).unwrap();
         let mut workspace = DecodeWorkspace::placeholder();
 
         assert_eq!(

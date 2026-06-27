@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use md5::{Digest, Md5};
 use vip9r_core::{
-    DecodeError, DecodeOutcome, Decoder, DecoderLimits, FrameInfo, I420Frame, OwnedWorkspace,
-    split_packet,
+    DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace,
+    WorkspaceRequirements, split_packet,
 };
 
 const DEFAULT_MEDIA_ROOT_ENV: &str = "VIP9R_MEDIA_ROOT";
@@ -152,9 +152,11 @@ fn compare_ivf_to_golden(input_path: &Path, golden_path: &Path) -> Result<Compar
     let golden =
         parse_golden(&golden_text).with_context(|| format!("parse {}", golden_path.display()))?;
 
-    let limits = DecoderLimits::new(ivf.header.width.into(), ivf.header.height.into());
-    let mut decoder = Decoder::new(limits).map_err(|err| anyhow!("create decoder: {err:?}"))?;
-    let requirements = Decoder::workspace_requirements(limits)
+    let max_width = ivf.header.width.into();
+    let max_height = ivf.header.height.into();
+    let mut decoder =
+        Decoder::new(max_width, max_height).map_err(|err| anyhow!("create decoder: {err:?}"))?;
+    let requirements = WorkspaceRequirements::new(max_width, max_height)
         .map_err(|err| anyhow!("workspace requirements: {err:?}"))?;
     let mut workspace =
         OwnedWorkspace::new(requirements).map_err(|err| anyhow!("create workspace: {err:?}"))?;

@@ -5,7 +5,7 @@
 use core::panic::PanicInfo;
 
 use vip9r_core::{
-    DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, DecoderLimits, I420Frame, Plane,
+    DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, Plane, WorkspaceRequirements,
     split_packet,
 };
 
@@ -172,12 +172,11 @@ impl Session {
             return INVALID_STATE;
         }
 
-        let limits = DecoderLimits::new(max_width, max_height);
-        let decoder = match Decoder::new(limits) {
+        let decoder = match Decoder::new(max_width, max_height) {
             Ok(decoder) => decoder,
             Err(err) => return err.code(),
         };
-        if let Err(err) = Decoder::workspace_requirements(limits) {
+        if let Err(err) = WorkspaceRequirements::new(max_width, max_height) {
             return err.code();
         }
 
