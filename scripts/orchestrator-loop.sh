@@ -82,9 +82,9 @@ end your normal final report with a line containing only:
 $signal
 
 The next run will be a fresh session in this working directory. Leave durable
-handoff state in files, VCS, or project docs. Do not add the signal when the
-objective is complete, user attention is needed, or automatic continuation is
-unsafe.
+handoff state in files, VCS, or project docs. Use temp/loop_state.md to
+communicate retry state. Do not add the signal when the objective is complete,
+user attention is needed, or automatic continuation is unsafe.
 EOF
 )"
 prompt="$base_prompt

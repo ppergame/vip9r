@@ -122,7 +122,7 @@ maximum allowed interval.
 
 Previous orchestrator infra failures:
 - grinder fails on turn one: malformed `tool_search` arguments with a garbage 1255-character property name; API rejected the turn
-  - verdict: try again
+  - verdict: retry three times
 
 ### Codex implementor
 
