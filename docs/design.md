@@ -61,7 +61,7 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
 needed to begin.
 
-The host harness runs `vip9r-core` directly. It is the cheap core bring-up and
+The host harness runs `vip9r` directly. It is the cheap core bring-up and
 debug loop, not the final shipping-path gate:
 
 ```sh
@@ -83,11 +83,11 @@ not get it by default while current tasks are Rust/core-focused:
 
 ```sh
 cd rust
-cargo build -p vip9r-wasm --target wasm32-unknown-unknown
+cargo build -p vip9r --target wasm32-unknown-unknown
 cd ../js
 pnpm build:wasm-driver
 $D8_LINUX64 dist/wasm-driver/main.js -- \
-  ../rust/target/wasm32-unknown-unknown/debug/vip9r_wasm.wasm \
+  ../rust/target/wasm32-unknown-unknown/debug/vip9r.wasm \
   /bulk/vip9r/chromium/bear-vp9.ivf
 ```
 
@@ -130,7 +130,7 @@ or decode errors.
 
 ### Wasm boundary
 
-`vip9r-wasm` exposes the manual integer ABI used by the paired JS binding:
+The `vip9r` wasm module exposes the manual integer ABI used by the paired JS binding:
 `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
 `vip9r_begin_packet`, and `vip9r_decode_next`. Mutating exports return `0` for
 success or a negative error code; those codes are binding details, not a stable

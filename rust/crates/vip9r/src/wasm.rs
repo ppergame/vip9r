@@ -1,10 +1,6 @@
-#![cfg_attr(target_arch = "wasm32", no_std)]
-#![deny(unsafe_op_in_unsafe_fn)]
-
-#[cfg(target_arch = "wasm32")]
 use core::panic::PanicInfo;
 
-use vip9r_core::{
+use crate::{
     DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, Plane, WorkspaceLayout,
     split_packet,
 };
@@ -15,7 +11,7 @@ const RESOURCE_LIMIT: i32 = -3;
 #[cfg(target_arch = "wasm32")]
 const WASM_PAGE: usize = 64 * 1024;
 const ARENA_ALIGN: usize = 16;
-const MAX_CODED_FRAMES: usize = vip9r_core::MAX_CODED_FRAMES_PER_PACKET;
+const MAX_CODED_FRAMES: usize = crate::MAX_CODED_FRAMES_PER_PACKET;
 
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
@@ -449,10 +445,7 @@ fn session() -> &'static mut Session {
     unsafe { &mut *core::ptr::addr_of_mut!(SESSION) }
 }
 
-fn range_from_packet_frame(
-    packet_base: u32,
-    frame: vip9r_core::CodedFrameRange,
-) -> Result<Region, i32> {
+fn range_from_packet_frame(packet_base: u32, frame: crate::CodedFrameRange) -> Result<Region, i32> {
     let start = u32::try_from(frame.start).map_err(|_| RESOURCE_LIMIT)?;
     let len = u32::try_from(frame.len).map_err(|_| RESOURCE_LIMIT)?;
     let offset = packet_base.checked_add(start).ok_or(RESOURCE_LIMIT)?;

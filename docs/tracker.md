@@ -68,9 +68,32 @@ harness.
 - [x] inter prediction from reference frame slots
 - [x] loop filter and final reconstructed reference/output pixel path
 
+### M2R — Runner engineering
+
+Make wasm/d8 the canonical correctness and unit-test frontend before expanding
+M2 beyond `bear-vp9.ivf`. Gated on M1; gates M2.
+
+- [x] collapse the Rust decode implementation and wasm ABI into one implementation
+      crate; keep boundaries as modules, not a native-vs-wasm crate split
+- [ ] add a d8 wasm unit-test runner that discovers specially named test exports,
+      runs tests under fresh-enough wasm instances, and reports pass/fail/ignored
+      results without wasmtime
+- [ ] add a `wasm-tests` feature and test-export macro shape; prefer `macro_rules!`
+      first, add a proc-macro crate only if attribute syntax earns its cost
+- [ ] add wasm-test print support: static bounded formatting buffer, imported JS
+      sink function, `test_println!`, and a panic handler that prints `PanicInfo`
+      before trapping
+- [ ] migrate the `bear-vp9.ivf` strict md5 check to the wasm/d8 frontend as the
+      canonical golden path
+- [ ] remove `vip9r-tools`; do not add WebM or new correctness surface area to the
+      native runner
+- [ ] update `docs/design.md` and `scripts/grinder-system-prompt.md` so future
+      tasks use wasm/d8 for full-decode correctness and wasm unit tests for
+      target-exact implementation checks
+
 ### M2 — Decode, correct (bring-up campaign)
 
-Drive frame-md5 correctness green. Gated on M1.
+Drive frame-md5 correctness green. Gated on M2R.
 
 - [x] first bit-exact frame
 - [x] `bear-vp9.ivf` strict md5 green on host and wasm

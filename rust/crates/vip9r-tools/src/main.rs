@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use md5::{Digest, Md5};
-use vip9r_core::{
+use vip9r::{
     DecodeError, DecodeOutcome, Decoder, FrameInfo, I420Frame, OwnedWorkspace, Plane,
     WorkspaceLayout, split_packet,
 };
@@ -617,7 +617,7 @@ impl ComparisonReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vip9r_core::FrameInfo;
+    use vip9r::FrameInfo;
 
     #[test]
     fn parses_ivf_header_and_packets() {
@@ -848,7 +848,7 @@ mod tests {
     fn plane(data: &[u8], width: u32, height: u32, stride: usize) -> Plane<'_> {
         Plane {
             data,
-            shape: vip9r_core::PlaneShape::new(width, height, stride),
+            shape: vip9r::PlaneShape::new(width, height, stride),
         }
     }
 }

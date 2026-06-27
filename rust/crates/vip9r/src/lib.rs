@@ -1,5 +1,6 @@
-#![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+#![cfg_attr(any(target_arch = "wasm32", not(feature = "std")), no_std)]
+#![cfg_attr(not(target_arch = "wasm32"), forbid(unsafe_code))]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 mod bitstream;
 mod boolcoder;
@@ -10,6 +11,8 @@ mod probability;
 mod superframe;
 mod tile;
 mod tile_syntax;
+#[cfg(target_arch = "wasm32")]
+mod wasm;
 
 use compressed_header::{
     CompressedHeader, TxMode, parse_inter_compressed_header, parse_intra_compressed_header,
@@ -724,14 +727,14 @@ fn frame_plane(
     Ok(Plane { data, shape })
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 #[derive(Debug)]
 pub struct OwnedWorkspace {
     layout: WorkspaceLayout,
     memory: Vec<u8>,
 }
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 impl OwnedWorkspace {
     pub fn new(layout: WorkspaceLayout) -> Result<Self, DecodeError> {
         let mut memory = Vec::new();

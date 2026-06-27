@@ -1,11 +1,10 @@
 [workspace]
 members = [
-  "crates/vip9r-core",
+  "crates/vip9r",
   "crates/vip9r-tools",
-  "crates/vip9r-wasm",
 ]
 default-members = [
-  "crates/vip9r-core",
+  "crates/vip9r",
   "crates/vip9r-tools",
 ]
 resolver = "2"
