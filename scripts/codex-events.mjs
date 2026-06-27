@@ -22,12 +22,13 @@ const OUTPUT_TAIL_CHARS = 3000;
 function usage(exitCode = 2) {
 	const out = exitCode === 0 ? process.stdout : process.stderr;
 	out.write(`usage:
-  grinder-codex-events stream CODEX_JSONL
-  grinder-codex-events context ROLLOUT_JSONL
-  grinder-codex-events inspect [options] [CODEX_JSONL_OR_TRACE_DIR]
+  codex-events stream [options] CODEX_JSONL
+  codex-events context ROLLOUT_JSONL
+  codex-events inspect [options] [CODEX_JSONL_OR_TRACE_DIR]
 
 Options:
   -f, --follow     Follow appended events.
+      --reasoning  Show reasoning summary events.
       --verbose    Also print successful command output and full unknown-event blocks.
       --repo DIR   Repository root for auto-discovery.
   -h, --help       Show this help.
@@ -385,12 +386,32 @@ class CompactRenderer {
 	}
 }
 
-async function streamJsonl(outPath) {
+function parseStreamArgs(argv) {
+	const options = { outPath: undefined, showReasoning: false };
+	const paths = [];
+	for (const arg of argv) {
+		if (arg === "-h" || arg === "--help") usage(0);
+		else if (arg === "--reasoning") options.showReasoning = true;
+		else if (arg.startsWith("-")) {
+			process.stderr.write(`unknown option: ${arg}\n`);
+			usage();
+		} else {
+			paths.push(arg);
+		}
+	}
+	if (paths.length !== 1) usage();
+	options.outPath = paths[0];
+	return options;
+}
+
+async function streamJsonl(options) {
+	const { outPath, showReasoning } = options;
 	if (!outPath) usage();
 	const raw = createWriteStream(outPath, { flags: "w" });
 	const renderer = new CompactRenderer({
 		out: process.stderr,
 		showCommandStarts: true,
+		showReasoning,
 	});
 	const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
@@ -804,7 +825,7 @@ function context(argv) {
 async function main() {
 	const [mode, ...args] = process.argv.slice(2);
 	if (mode === "stream") {
-		await streamJsonl(args[0]);
+		await streamJsonl(parseStreamArgs(args));
 		return;
 	}
 	if (mode === "context") {

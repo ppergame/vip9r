@@ -120,7 +120,7 @@ in
       esac
 
       if [[ "$mode" == inspect ]]; then
-        exec node "$repo/scripts/grinder-codex-events.mjs" inspect --repo "$repo" "$@"
+        exec node "$repo/scripts/codex-events.mjs" inspect --repo "$repo" "$@"
       fi
 
       task_file=""
@@ -149,7 +149,7 @@ in
 
       system_prompt="$repo/scripts/grinder-system-prompt.md"
       codex_config="$repo/scripts/grinder-codex-config.toml"
-      codex_events="$repo/scripts/grinder-codex-events.mjs"
+      codex_events="$repo/scripts/codex-events.mjs"
 
       temp_dir="$repo/temp"
       codex_home="$temp_dir/codex-home"

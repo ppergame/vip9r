@@ -29,6 +29,7 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/.." && pwd)"
+codex_events="$repo/scripts/codex-events.mjs"
 
 require_gptpod_sandbox() {
   local project_marker="/run/claudepod-project"
@@ -101,31 +102,35 @@ while :; do
   echo "── orchestrator-loop: codex exec run $run ──" >&2
 
   final_message="$(mktemp -t vip9r-orchestrator-final.XXXXXX)"
+  codex_jsonl="$(mktemp -t vip9r-orchestrator-codex.XXXXXX)"
   set +e
   npx -y @openai/codex exec \
+    --json \
+    -o "$final_message" \
     --sandbox "$sandbox" \
     -c "approval_policy=\"$approval_policy\"" \
     -C "$repo" \
     -- \
     "$prompt" \
-    | tee "$final_message"
+    | node "$codex_events" stream --reasoning "$codex_jsonl"
   pipeline_status=("${PIPESTATUS[@]}")
   status="${pipeline_status[0]}"
-  tee_status="${pipeline_status[1]:-0}"
+  renderer_status="${pipeline_status[1]:-0}"
   set -e
 
-  if [[ "$status" -eq 0 && "$tee_status" -ne 0 ]]; then
-    status="$tee_status"
+  if [[ "$status" -eq 0 && "$renderer_status" -ne 0 ]]; then
+    status="$renderer_status"
   fi
 
   if [[ "$status" -ne 0 ]]; then
     echo "orchestrator-loop: codex exec failed with status $status" >&2
-    rm -f "$final_message"
+    rm -f "$final_message" "$codex_jsonl"
     exit "$status"
   fi
 
+  cat "$final_message"
   last_line="$(awk 'NF { line = $0 } END { sub(/\r$/, "", line); print line }' "$final_message")"
-  rm -f "$final_message"
+  rm -f "$final_message" "$codex_jsonl"
 
   if [[ "$last_line" == "$signal" ]]; then
     echo "orchestrator-loop: continue signal received" >&2
