@@ -11,15 +11,15 @@ an ordered backlog, not an architecture commitment.
 
 ## Now
 
-M0 — decode API and the host golden harness.
+M0 — decode API and the fast host golden harness.
 
 - [x] user: VP9 profile 0 / 8-bit spec source
 - [x] user: conformance vectors for the profile 0 / 8-bit subset
 - [x] prebuilt d8 binaries for host and ARM
 - [x] freestanding `no_std` wasm skeleton with a minimal decode API
 - [x] finalize the core decode API for host harness frame output
-- [x] host golden harness: IVF demux, per-frame md5 vs the `.md5` golden, on
-      `bear-vp9.ivf`
+- [x] fast host golden harness: IVF demux, per-frame md5 vs the `.md5` golden,
+      on `bear-vp9.ivf`
 - [x] first implementor handoff packet
 
 ## Waiting
@@ -56,7 +56,7 @@ harness.
 
 ### M2 — Decode, correct (bring-up campaign)
 
-Drive the golden harness green. Gated on M1.
+Drive frame-md5 correctness green. Gated on M1.
 
 - [ ] first bit-exact frame
 - [ ] conformance subset green on full frames

@@ -4,8 +4,8 @@
   "type": "module",
   "packageManager": "pnpm@11.4.0",
   "scripts": {
-    "build": "pnpm typecheck && pnpm build:d8 && pnpm build:web",
-    "build:d8": "vite build --config vite.d8.config.ts",
+    "build": "pnpm typecheck && pnpm build:wasm-driver && pnpm build:web",
+    "build:wasm-driver": "vite build --config vite.wasm-driver.config.ts",
     "build:web": "vite build",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json"

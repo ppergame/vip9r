@@ -26,10 +26,12 @@ two phases rather than gated incrementally:
   pipeline (entropy → dequant → inverse transform → prediction → reconstruction
   → loop filter) exists, so per-frame goldens cannot gate early work. M1
   verification is builds, `clippy`, targeted unit tests, engineering judgment,
-  and the golden harness running end to end with output allowed to be wrong.
-- **Bring-up second (M2).** Drive the golden harness green. The first frame
-  whose md5 matches is the first-bit-exact milestone; from there it is
-  debugging.
+  and the host golden harness running end to end with output allowed to be
+  wrong.
+- **Bring-up second (M2).** Drive frame-md5 correctness green. The fast host
+  harness is the primary debugging loop; the wasm driver is the shipping-path
+  parity check. The first frame whose md5 matches is the first-bit-exact
+  milestone; from there it is debugging.
 
 libvpx-generated outputs are useful when the spec or test vectors are not
 enough. Intermediate checks may be added when they make failures easier to
@@ -42,9 +44,9 @@ reverse the `FrameIsIntra` condition. The decoder uses the fixed
 `kf_partition_probs` table for key/intra frame partition syntax, matching the
 table naming and key-frame syntax context.
 
-### Golden harness
+### Golden harnesses
 
-A host-side harness decodes a vector frame by frame and compares per-frame md5
+Golden harnesses decode a vector frame by frame and compare per-frame md5
 against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 
 - The hash is over the raw I420 frame: Y (visible `d_w`×`d_h`), then U, then V
@@ -59,7 +61,8 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
 needed to begin.
 
-Harness command on the host:
+The host harness runs `vip9r-core` directly. It is the cheap core bring-up and
+debug loop, not the final shipping-path gate:
 
 ```sh
 cd rust
@@ -72,22 +75,26 @@ errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
 permits wrong frame hashes for code-complete smoke runs. The current decoder is
 still expected to stop at `Unimplemented`.
 
-The d8 wasm path exercises the manual boundary and the same md5 protocol:
+The wasm driver exercises the manual boundary under d8 with the same md5
+protocol. It is the wasm/shipping-path parity gate, but grinder implementors do
+not get it by default while current tasks are Rust/core-focused:
 
 ```sh
 cd rust
 cargo build -p vip9r-wasm --target wasm32-unknown-unknown
 cd ../js
-pnpm build:d8
-$D8_LINUX64 dist/d8/main.js -- \
+pnpm build:wasm-driver
+$D8_LINUX64 dist/wasm-driver/main.js -- \
   ../rust/target/wasm32-unknown-unknown/debug/vip9r_wasm.wasm \
   /bulk/vip9r/chromium/bear-vp9.ivf
 ```
 
-Until reconstruction exists, the expected d8 failure is
+Until reconstruction exists, the expected wasm-driver failure is
 `vip9r_decode_next: unimplemented (-8)`. A failure earlier than
-`decode_next` is a wasm boundary regression, not an ordinary decoder
-incompleteness.
+`decode_next` means the JS/wasm wrapper, exported ABI, input copying, or packet
+setup regressed. The driver also accepts `--allow-mismatch`; like the host
+harness, this only permits wrong frame hashes, not missing or extra shown
+frames.
 
 ### Decode API
 
@@ -122,12 +129,13 @@ The trusted harness answers two questions:
 - does this revision decode correctly?
 - is this revision faster on the target path?
 
-Correctness runs natively against the core's host `std` build — the cheapest
-loop. d8 covers the wasm build: host d8 for cheap parity and smoke, device d8 as
-the performance ground truth, run A/B interleaved against the current baseline
-with enough repetition to report a credible delta. Targeted microbenchmarks are
-allowed when a full-decode result points at a hotspot; their wins only count
-after reconfirming full-decode wall time.
+Correctness bring-up runs natively against the core's host `std` build because
+that is the cheapest debugging loop. Wasm/d8 runs cover the exported ABI and the
+shipping build: host d8 for cheap parity and smoke, device d8 as the performance
+ground truth, run A/B interleaved against the current baseline with enough
+repetition to report a credible delta. Targeted microbenchmarks are allowed when
+a full-decode result points at a hotspot; their wins only count after
+reconfirming full-decode wall time.
 
 Only rev-built runs — built by the trusted harness from a VCS revision — are
 citable in `docs/log.md`. Ad-hoc blobs are for exploration.
@@ -191,7 +199,7 @@ sandbox). Each vector has a `.md5` golden.
 
 ## Open design questions
 
-- Minimal wasm export surface and JS bindings for the d8 parity check and the
+- Minimal wasm export surface and JS bindings for the wasm parity check and the
   demo.
 - Which intermediate checks, if any, are worth adding after the first failures.
 - Device-time and token budget per optimization pass.

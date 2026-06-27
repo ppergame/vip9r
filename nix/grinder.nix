@@ -10,58 +10,59 @@
   caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
-  sandboxPackages = (with pkgs; [
-    # Shell and baseline userland.
-    bashInteractive
-    bc
-    coreutils
-    curl
-    diffutils
-    dnsutils
-    fd
-    file
-    findutils
-    gawk
-    gnugrep
-    gnused
-    gnupatch
-    gnutar
-    gzip
-    jq
-    less
-    lsof
-    procps
-    psmisc
-    rsync
-    time
-    tree
-    unzip
-    util-linux
-    wget
-    which
-    xz
-    zip
-    zstd
+  sandboxPackages =
+    (with pkgs; [
+      # Shell and baseline userland.
+      bashInteractive
+      bc
+      coreutils
+      curl
+      diffutils
+      dnsutils
+      fd
+      file
+      findutils
+      gawk
+      gnugrep
+      gnused
+      gnupatch
+      gnutar
+      gzip
+      jq
+      less
+      lsof
+      procps
+      psmisc
+      rsync
+      time
+      tree
+      unzip
+      util-linux
+      wget
+      which
+      xz
+      zip
+      zstd
 
-    # Build, source control, and project-specific tooling.
-    binaryen
-    clang
-    gnumake
-    git
-    libvpx
-    nodejs
-    pkg-config
-    pnpm
-    python3
-    ripgrep
-    rustToolchain
-    wabt
-    wasm-tools
+      # Build, source control, and project-specific tooling.
+      binaryen
+      clang
+      gnumake
+      git
+      libvpx
+      nodejs
+      pkg-config
+      pnpm
+      python3
+      ripgrep
+      rustToolchain
+      wabt
+      wasm-tools
 
-    # Debugging and host inspection.
-    strace
-  ])
-  ++ [codex];
+      # Debugging and host inspection.
+      strace
+    ])
+    ++ [codex];
   sandboxEnv = pkgs.buildEnv {
     name = "vip9r-grinder-env";
     paths = sandboxPackages;
@@ -91,7 +92,6 @@ in
       pkgs.git
       pkgs.nodejs
       pkgs.podman
-      pkgs.rsync
     ];
 
     text = ''
@@ -165,10 +165,18 @@ in
       ln -s "${bash}" "$run/rootfs/bin/sh"
       ln -s "${env}" "$run/rootfs/usr/bin/env"
 
-      rsync -a --exclude=/target "$repo/rust/" "$run/rust/"
-      cp "$system_prompt" "$run/system.md"
+      mkdir -p "$run/rust"
+      shopt -s dotglob nullglob
+      rust_entries=("$repo/rust"/*)
+      shopt -u dotglob nullglob
+      for entry in "''${rust_entries[@]}"; do
+        [[ "$(basename "$entry")" == target ]] && continue
+        cp -a "$entry" "$run/rust/"
+      done
+
+      cp -a "$system_prompt" "$run/system.md"
       if [[ -n "$task_file" ]]; then
-        cp "$task_file" "$run/task.md"
+        cp -a "$task_file" "$run/task.md"
       else
         printf 'Sandbox shell.\n' > "$run/task.md"
       fi
@@ -225,7 +233,7 @@ in
             rollout_matches=("$codex_home"/sessions/*/*/*/rollout-*-"$thread_id".jsonl)
             shopt -u nullglob
             if [[ ''${#rollout_matches[@]} -eq 1 ]]; then
-              cp "''${rollout_matches[0]}" "$run/trace/rollout.jsonl" || echo "rollout: copy failed for $thread_id" >&2
+              cp -a "''${rollout_matches[0]}" "$run/trace/rollout.jsonl" || echo "rollout: copy failed for $thread_id" >&2
             else
               echo "rollout: expected 1 match for $thread_id, found ''${#rollout_matches[@]}" >&2
             fi
@@ -240,9 +248,9 @@ in
             cat "$run/trace/final.md"
           fi
           mkdir -p "$preserve"
-          rsync -a "$run/trace/" "$preserve/"
-          cp "$run/task.md" "$preserve/task.md"
-          cp "$run/system.md" "$preserve/system.md"
+          cp -a "$run/trace/." "$preserve/"
+          cp -a "$run/task.md" "$preserve/task.md"
+          cp -a "$run/system.md" "$preserve/system.md"
           printf '%s\n' "$status" > "$preserve/exit-status"
           {
             echo

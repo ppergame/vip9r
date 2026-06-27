@@ -23,20 +23,38 @@ type IvfFile = {
   packets: IvfPacket[];
 };
 
-function main(args: string[]): void {
-  if (args.length < 2 || args.length > 3) {
-    print("usage: d8 dist/d8/main.js -- vip9r_wasm.wasm input.ivf [input.ivf.md5]");
-    quit(2);
-  }
+type GoldenFrame = {
+  md5: string;
+  name: string;
+};
 
-  const [wasmPath, inputPath, goldenPath = `${inputPath}.md5`] = args;
+type DriverArgs = {
+  allowMismatch: boolean;
+  wasmPath: string;
+  inputPath: string;
+  goldenPath: string;
+};
+
+type FrameComparison = {
+  frameNumber: number;
+  expectedMd5?: string;
+  expectedName?: string;
+  actualMd5: string;
+  decodedWidth: number;
+  decodedHeight: number;
+  renderWidth: number;
+  renderHeight: number;
+};
+
+function main(args: string[]): void {
+  const { allowMismatch, wasmPath, inputPath, goldenPath } = parseArgs(args);
   const wasm = new WebAssembly.Module(readbuffer(wasmPath));
   const instance = new WebAssembly.Instance(wasm, {});
   const ivf = parseIvf(new Uint8Array(readbuffer(inputPath)));
   const golden = parseGolden(read(goldenPath));
   const decoder = new Vp9Decoder(instance, ivf.width, ivf.height);
 
-  let shown = 0;
+  const comparisons: FrameComparison[] = [];
   let coded = 0;
   for (const packet of ivf.packets) {
     decoder.beginPacket(packet.payload);
@@ -45,13 +63,17 @@ function main(args: string[]): void {
       coded += 1;
       if (step.kind === "output") {
         const actual = md5Hex(compactI420(decoder, step.frame));
-        const expected = golden[shown];
-        if (actual !== expected) {
-          throw new Error(
-            `frame ${shown + 1} md5 mismatch: expected ${expected ?? "<missing>"} got ${actual}`,
-          );
-        }
-        shown += 1;
+        const expected = golden[comparisons.length];
+        comparisons.push({
+          frameNumber: comparisons.length + 1,
+          expectedMd5: expected?.md5,
+          expectedName: expected?.name,
+          actualMd5: actual,
+          decodedWidth: step.frame.decodedWidth,
+          decodedHeight: step.frame.decodedHeight,
+          renderWidth: step.frame.renderWidth,
+          renderHeight: step.frame.renderHeight,
+        });
       }
       if (step.packetDone) {
         break;
@@ -59,11 +81,47 @@ function main(args: string[]): void {
     }
   }
 
-  if (shown !== golden.length) {
-    throw new Error(`shown frame count mismatch: expected ${golden.length} got ${shown}`);
+  const report = makeReport(inputPath, goldenPath, ivf, coded, comparisons, golden.length);
+  printReport(report);
+
+  if (!passes(report, allowMismatch)) {
+    throw new Error(
+      `golden mismatch: ${matchedCount(report)} matched, ${mismatchCount(report)} mismatched, ${missingCount(report)} missing, ${extraCount(report)} extra`,
+    );
+  }
+}
+
+function parseArgs(args: string[]): DriverArgs {
+  let allowMismatch = false;
+  const paths: string[] = [];
+  for (const arg of args) {
+    if (arg === "-h" || arg === "--help") {
+      printUsage();
+      quit(0);
+    }
+    if (arg === "--allow-mismatch") {
+      allowMismatch = true;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      throw new Error(`unknown argument: ${arg}`);
+    }
+    paths.push(arg);
   }
 
-  print(`ok: ${shown} shown frames, ${coded} coded frames`);
+  if (paths.length < 2 || paths.length > 3) {
+    printUsage();
+    quit(2);
+  }
+
+  const [wasmPath, inputPath, goldenPath = `${inputPath}.md5`] = paths;
+  return { allowMismatch, wasmPath, inputPath, goldenPath };
+}
+
+function printUsage(): void {
+  print(
+    "usage: d8 dist/wasm-driver/main.js -- [--allow-mismatch] vip9r_wasm.wasm input.ivf [input.ivf.md5]",
+  );
 }
 
 function parseIvf(data: Uint8Array): IvfFile {
@@ -102,20 +160,102 @@ function parseIvf(data: Uint8Array): IvfFile {
   return { width, height, packets };
 }
 
-function parseGolden(text: string): string[] {
-  const hashes: string[] = [];
-  for (const line of text.split(/\r?\n/)) {
+function parseGolden(text: string): GoldenFrame[] {
+  const frames: GoldenFrame[] = [];
+  for (const [lineIndex, line] of text.split(/\r?\n/).entries()) {
+    const lineNumber = lineIndex + 1;
     const trimmed = line.trim();
     if (trimmed === "") {
       continue;
     }
-    const hash = trimmed.split(/\s+/, 1)[0];
-    if (!/^[0-9a-fA-F]{32}$/.test(hash)) {
-      throw new Error(`bad md5 line: ${line}`);
+    const fields = trimmed.split(/\s+/);
+    if (fields.length !== 2) {
+      throw new Error(`line ${lineNumber}: expected md5 and frame name`);
     }
-    hashes.push(hash.toLowerCase());
+    const [hash, name] = fields;
+    if (!/^[0-9a-fA-F]{32}$/.test(hash)) {
+      throw new Error(`line ${lineNumber}: invalid md5: ${hash}`);
+    }
+    frames.push({ md5: hash.toLowerCase(), name });
   }
-  return hashes;
+  if (frames.length === 0) {
+    throw new Error("golden contains no frames");
+  }
+  return frames;
+}
+
+type ComparisonReport = {
+  inputPath: string;
+  goldenPath: string;
+  width: number;
+  height: number;
+  packetCount: number;
+  codedFrames: number;
+  comparisons: FrameComparison[];
+  expectedCount: number;
+};
+
+function makeReport(
+  inputPath: string,
+  goldenPath: string,
+  ivf: IvfFile,
+  codedFrames: number,
+  comparisons: FrameComparison[],
+  expectedCount: number,
+): ComparisonReport {
+  return {
+    inputPath,
+    goldenPath,
+    width: ivf.width,
+    height: ivf.height,
+    packetCount: ivf.packets.length,
+    codedFrames,
+    comparisons,
+    expectedCount,
+  };
+}
+
+function isMatch(comparison: FrameComparison): boolean {
+  return comparison.expectedMd5 === comparison.actualMd5;
+}
+
+function matchedCount(report: ComparisonReport): number {
+  return report.comparisons.filter(isMatch).length;
+}
+
+function mismatchCount(report: ComparisonReport): number {
+  return report.comparisons.filter(
+    (comparison) => comparison.expectedMd5 !== undefined && !isMatch(comparison),
+  ).length;
+}
+
+function missingCount(report: ComparisonReport): number {
+  return Math.max(report.expectedCount - report.comparisons.length, 0);
+}
+
+function extraCount(report: ComparisonReport): number {
+  return Math.max(report.comparisons.length - report.expectedCount, 0);
+}
+
+function passes(report: ComparisonReport, allowMismatch: boolean): boolean {
+  const matches = mismatchCount(report) === 0 && missingCount(report) === 0 && extraCount(report) === 0;
+  return matches || (allowMismatch && missingCount(report) === 0 && extraCount(report) === 0);
+}
+
+function printReport(report: ComparisonReport): void {
+  print(`input: ${report.inputPath}`);
+  print(`golden: ${report.goldenPath}`);
+  print(`ivf: fourcc=VP90 size=${report.width}x${report.height} packets=${report.packetCount}`);
+  print(`decoder: coded_frames=${report.codedFrames} shown_frames=${report.comparisons.length}`);
+  print(
+    `frames: ${matchedCount(report)} matched, ${mismatchCount(report)} mismatched, ${missingCount(report)} missing, ${extraCount(report)} extra`,
+  );
+
+  for (const comparison of report.comparisons.filter((comparison) => !isMatch(comparison)).slice(0, 10)) {
+    print(
+      `mismatch frame ${comparison.frameNumber} ${comparison.expectedName ?? "<extra>"}: expected ${comparison.expectedMd5 ?? "<none>"}, actual ${comparison.actualMd5}, size=${comparison.decodedWidth}x${comparison.decodedHeight} render=${comparison.renderWidth}x${comparison.renderHeight}`,
+    );
+  }
 }
 
 function compactI420(decoder: Vp9Decoder, frame: NativeFrame): Uint8Array {

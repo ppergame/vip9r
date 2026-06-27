@@ -15,8 +15,9 @@ implemented decisions into `docs/design.md`.
 - `vip9r-wasm` exports the first boundary shape:
   `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
   `vip9r_begin_packet`, and `vip9r_decode_next`.
-- JS wasm bindings and a d8 IVF/md5 driver exist. With current decode coverage,
-  valid packets reach `vip9r_decode_next` and fail with `Unimplemented`.
+- JS wasm bindings and a wasm-driver IVF/md5 artifact exist for d8. With current
+  decode coverage, valid packets reach `vip9r_decode_next` and fail with
+  `Unimplemented`.
 
 ## First boundary scope
 

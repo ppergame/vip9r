@@ -4,5 +4,5 @@
     "lib": ["ES2022", "WebWorker"],
     "types": []
   },
-  "include": ["src/d8", "src/wasm", "src/web", "src/webm"]
+  "include": ["src/wasm", "src/wasm-driver", "src/web", "src/webm"]
 }

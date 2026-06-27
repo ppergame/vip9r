@@ -6,6 +6,6 @@
   },
   "include": [
     "vite.config.ts",
-    "vite.d8.config.ts"
+    "vite.wasm-driver.config.ts"
   ]
 }

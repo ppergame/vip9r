@@ -4,10 +4,10 @@ export default defineConfig({
   build: {
     target: "es2022",
     minify: false,
-    outDir: "dist/d8",
+    outDir: "dist/wasm-driver",
     emptyOutDir: true,
     lib: {
-      entry: "src/d8/main.ts",
+      entry: "src/wasm-driver/main.ts",
       formats: ["es"],
       fileName: () => "main.js",
     },
