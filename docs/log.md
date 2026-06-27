@@ -216,3 +216,17 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   prediction/reference-sampling block lands, so full-frame md5 remains wrong.
 - Host and wasm smoke pass with 82 shown frames and md5 mismatches only; strict
   host golden still fails with 82 md5 mismatches and no missing/extra frames.
+
+## 2026-06-27 — VP9 inter prediction from references
+
+- rev: jj `ylwlpmpo`
+- Added profile 0 / 8-bit inter prediction from workspace reference slots:
+  logical LAST/GOLDEN/ALTREF mapping through `ref_frame_idx`, read-only
+  reference-plane views, luma/chroma MV selection, MV clamping/scaling,
+  separable subpel filtering, compound averaging, and prediction before
+  residual reconstruction.
+- Inter-coded blocks now contribute reference-derived pixels instead of the
+  previous neutral fill. Loop filtering remains the final M1 pixel-path block,
+  so reference/output frames are still intentionally unfiltered.
+- Host and wasm smoke pass with 82 shown frames and md5 mismatches only; strict
+  host golden still fails with 82 md5 mismatches and no missing/extra frames.

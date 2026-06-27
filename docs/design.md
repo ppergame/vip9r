@@ -74,10 +74,10 @@ defaults the golden path to the `.md5` sidecar. It exits non-zero on decode
 errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
 permits wrong frame hashes for code-complete smoke runs. The current host
 decoder parses all 82 coded frames in `bear-vp9.ivf` and emits 82 shown frames.
-The pixel path now performs intra prediction/reconstruction for intra-coded
-transform blocks and leaves inter-coded blocks default-filled until inter
-prediction lands. Smoke mode passes with 82 md5 mismatches; strict mode fails
-with 82 mismatches and no missing/extra frames.
+The pixel path now performs intra and inter prediction/reconstruction from
+reference slots, but still stores unfiltered frames because loop filtering has
+not landed. Smoke mode passes with 82 md5 mismatches; strict mode fails with 82
+mismatches and no missing/extra frames.
 
 The wasm driver exercises the manual boundary under d8 with the same md5
 protocol. It is the wasm/shipping-path parity gate, but grinder implementors do
@@ -94,7 +94,7 @@ $D8_LINUX64 dist/wasm-driver/main.js -- \
 ```
 
 The current wasm driver also parses all 82 coded frames in `bear-vp9.ivf` and
-emits 82 shown frames with the same intra-reconstructed/default-inter pixel
+emits 82 shown frames with the same intra/inter-predicted, unfiltered pixel
 state as the host. Decode-path wasm failures are now expected to be real
 core/no-std parity issues unless they happen before
 `decode_next`, which still implicates the JS/wasm wrapper, exported ABI, input

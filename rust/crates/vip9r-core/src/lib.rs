@@ -19,7 +19,8 @@ use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
 use tile_syntax::{
     CurrentFrameMut, CurrentPlaneMut, FrameModeBuffers, ModeInfoView, ModeInfoViewMut,
-    TileParseBuffers, mode_info_byte_len, parse_inter_tiles, parse_intra_tiles,
+    ReferenceFrame, ReferenceFrames, ReferencePlane, TileParseBuffers, mode_info_byte_len,
+    parse_inter_tiles, parse_intra_tiles,
 };
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
@@ -273,6 +274,17 @@ pub struct DecodeWorkspace<'a> {
     memory: &'a mut [u8],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReconstructionBufferRequest {
+    frame_width: u32,
+    frame_height: u32,
+    reference_slots: Option<[InterReferenceSlot; 3]>,
+    use_prev_frame_mvs: bool,
+    previous_slot: Option<ModeHistorySlot>,
+    current_slot: ModeHistorySlot,
+    mi_count: usize,
+}
+
 impl<'a> DecodeWorkspace<'a> {
     pub fn new(layout: WorkspaceLayout, memory: &'a mut [u8]) -> Result<Self, DecodeError> {
         let total_bytes = layout.total_bytes();
@@ -303,13 +315,15 @@ impl<'a> DecodeWorkspace<'a> {
 
     fn reconstruction_buffers(
         &mut self,
-        frame_width: u32,
-        frame_height: u32,
-        use_prev_frame_mvs: bool,
-        previous_slot: Option<ModeHistorySlot>,
-        current_slot: ModeHistorySlot,
-        mi_count: usize,
-    ) -> Result<(CurrentFrameMut<'_>, FrameModeBuffers<'_>), DecodeError> {
+        request: ReconstructionBufferRequest,
+    ) -> Result<
+        (
+            CurrentFrameMut<'_>,
+            Option<ReferenceFrames<'_>>,
+            FrameModeBuffers<'_>,
+        ),
+        DecodeError,
+    > {
         self.fill_current_default_i420()?;
 
         let frame_pool_layout = self.layout.frame_pool;
@@ -328,11 +342,26 @@ impl<'a> DecodeWorkspace<'a> {
         let (frame_pool, history_and_after) = self.memory.split_at_mut(first_history.start);
         let current = frame_pool_layout.current;
         let current_end = current.end()?;
-        let current_frame_bytes = frame_pool
-            .get_mut(current.start..current_end)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let current_frame =
-            current_frame_view(current_frame_bytes, frame_layout, frame_width, frame_height)?;
+        if current.start != 0 || current_end > frame_pool.len() {
+            return Err(DecodeError::InvalidConfig);
+        }
+        let (current_frame_bytes, reference_bytes) = frame_pool.split_at_mut(current_end);
+        let current_frame = current_frame_view(
+            current_frame_bytes,
+            frame_layout,
+            request.frame_width,
+            request.frame_height,
+        )?;
+        let reference_frames = match request.reference_slots {
+            Some(reference_slots) => Some(reference_frame_views(
+                reference_bytes,
+                current_end,
+                frame_pool_layout,
+                frame_layout,
+                reference_slots,
+            )?),
+            None => None,
+        };
 
         let history = history_and_after
             .get_mut(..history_end - first_history.start)
@@ -340,13 +369,13 @@ impl<'a> DecodeWorkspace<'a> {
         let mode_buffers = Self::mode_history_buffers_from_slice(
             mode_history,
             history,
-            use_prev_frame_mvs,
-            previous_slot,
-            current_slot,
-            mi_count,
+            request.use_prev_frame_mvs,
+            request.previous_slot,
+            request.current_slot,
+            request.mi_count,
         )?;
 
-        Ok((current_frame, mode_buffers))
+        Ok((current_frame, reference_frames, mode_buffers))
     }
 
     fn refresh_references_from_current(
@@ -600,6 +629,85 @@ fn current_frame_view(
     Ok(CurrentFrameMut::new(y, u, v))
 }
 
+fn reference_frame_views<'a>(
+    reference_bytes: &'a [u8],
+    reference_base: usize,
+    frame_pool_layout: FramePoolLayout,
+    frame_layout: FrameLayout,
+    reference_slots: [InterReferenceSlot; 3],
+) -> Result<ReferenceFrames<'a>, DecodeError> {
+    let mut frames = [None; 4];
+    for (logical_index, reference_slot) in reference_slots.into_iter().enumerate() {
+        let range = frame_pool_layout
+            .references
+            .get(reference_slot.slot_index)
+            .copied()
+            .ok_or(DecodeError::InvalidBitstream)?;
+        let start = range
+            .start
+            .checked_sub(reference_base)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let end = start
+            .checked_add(range.len)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let frame = reference_bytes
+            .get(start..end)
+            .ok_or(DecodeError::InvalidConfig)?;
+        frames[logical_index + 1] = Some(reference_frame_view(
+            frame,
+            frame_layout,
+            reference_slot.info.visible_width,
+            reference_slot.info.visible_height,
+        )?);
+    }
+
+    Ok(ReferenceFrames::new(frames))
+}
+
+fn reference_frame_view(
+    frame: &[u8],
+    layout: FrameLayout,
+    width: u32,
+    height: u32,
+) -> Result<ReferenceFrame<'_>, DecodeError> {
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+
+    let y = reference_plane(
+        frame,
+        layout.y,
+        PlaneShape::new(width, height, layout.y.shape.stride),
+    )?;
+    let u = reference_plane(
+        frame,
+        layout.u,
+        PlaneShape::new(chroma_width, chroma_height, layout.u.shape.stride),
+    )?;
+    let v = reference_plane(
+        frame,
+        layout.v,
+        PlaneShape::new(chroma_width, chroma_height, layout.v.shape.stride),
+    )?;
+
+    Ok(ReferenceFrame::new(y, u, v))
+}
+
+fn reference_plane(
+    frame: &[u8],
+    layout: PlaneLayout,
+    shape: PlaneShape,
+) -> Result<ReferencePlane<'_>, DecodeError> {
+    let len = shape.byte_len().ok_or(DecodeError::ResourceLimit)?;
+    let end = layout
+        .offset
+        .checked_add(len)
+        .ok_or(DecodeError::InvalidConfig)?;
+    let data = frame
+        .get(layout.offset..end)
+        .ok_or(DecodeError::InvalidConfig)?;
+    ReferencePlane::new(data, shape).map_err(|_| DecodeError::InvalidConfig)
+}
+
 fn frame_plane(
     frame: &[u8],
     layout: PlaneLayout,
@@ -780,6 +888,12 @@ impl ReferenceSlotInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InterReferenceSlot {
+    slot_index: usize,
+    info: ReferenceSlotInfo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PreviousFrameForMvs {
     width: u32,
     height: u32,
@@ -868,15 +982,18 @@ impl Decoder {
             .previous_frame_for_mvs
             .map(|previous| previous.mode_history_slot.other())
             .unwrap_or(ModeHistorySlot::Slot0);
+        let reference_slots = self.inter_reference_slots(&header)?;
         {
-            let (mut current_frame, mode_buffers) = workspace.reconstruction_buffers(
-                header.frame_width,
-                header.frame_height,
-                previous_slot.is_some(),
-                previous_slot,
-                current_slot,
-                mi_count,
-            )?;
+            let (mut current_frame, reference_frames, mode_buffers) = workspace
+                .reconstruction_buffers(ReconstructionBufferRequest {
+                    frame_width: header.frame_width,
+                    frame_height: header.frame_height,
+                    reference_slots,
+                    use_prev_frame_mvs: previous_slot.is_some(),
+                    previous_slot,
+                    current_slot,
+                    mi_count,
+                })?;
 
             let tile_parse_result = if header.frame_is_intra {
                 parse_intra_tiles(
@@ -892,16 +1009,18 @@ impl Decoder {
                     ),
                 )
             } else {
+                let reference_frames = reference_frames.ok_or(DecodeError::InvalidBitstream)?;
                 parse_inter_tiles(
                     coded_frame,
                     &header,
                     &compressed_header,
                     self.probability_state.current(),
                     &tile_layout,
-                    TileParseBuffers::new(
+                    TileParseBuffers::with_references(
                         &mut self.syntax_counts,
                         mode_buffers,
                         &mut current_frame,
+                        reference_frames,
                     ),
                 )
             };
@@ -999,6 +1118,37 @@ impl Decoder {
             && previous.height == header.frame_height
             && previous.show_frame)
             .then_some(previous.mode_history_slot)
+    }
+
+    fn inter_reference_slots(
+        &self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Result<Option<[InterReferenceSlot; 3]>, DecodeError> {
+        if header.frame_is_intra || header.show_existing_frame {
+            return Ok(None);
+        }
+
+        let mut slots = [InterReferenceSlot {
+            slot_index: 0,
+            info: ReferenceSlotInfo {
+                visible_width: 0,
+                visible_height: 0,
+                render_width: 0,
+                render_height: 0,
+            },
+        }; 3];
+
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let slot_index = usize::from(header.ref_frame_idx[index]);
+            let info = self
+                .reference_frames
+                .get(slot_index)
+                .and_then(|reference| *reference)
+                .ok_or(DecodeError::InvalidBitstream)?;
+            *slot = InterReferenceSlot { slot_index, info };
+        }
+
+        Ok(Some(slots))
     }
 
     fn setup_frame_probability_state(

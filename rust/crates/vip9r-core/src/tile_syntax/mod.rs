@@ -52,6 +52,10 @@ const INTER_MODE_CONTEXTS_U8: u8 = 7;
 const MV_BORDER: i32 = 128;
 const BORDERINPIXELS: i32 = 160;
 const INTERP_EXTEND: i32 = 4;
+const SUBPEL_BITS: u8 = 4;
+const SUBPEL_SHIFTS: i32 = 1 << SUBPEL_BITS;
+const SUBPEL_MASK: i32 = SUBPEL_SHIFTS - 1;
+const REF_SCALE_SHIFT: u8 = 14;
 const COMPANDED_MVREF_THRESH: i32 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,13 +175,111 @@ impl<'a> CurrentPlaneMut<'a> {
     }
 }
 
-pub(crate) struct TileParseBuffers<'a, 'm, 'f> {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceFrames<'a> {
+    frames: [Option<ReferenceFrame<'a>>; 4],
+}
+
+impl<'a> ReferenceFrames<'a> {
+    pub(crate) const fn new(frames: [Option<ReferenceFrame<'a>>; 4]) -> Self {
+        Self { frames }
+    }
+
+    fn get(self, ref_frame: u8) -> Result<ReferenceFrame<'a>, TileSyntaxError> {
+        self.frames
+            .get(usize::from(ref_frame))
+            .copied()
+            .flatten()
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferenceFrame<'a> {
+    y: ReferencePlane<'a>,
+    u: ReferencePlane<'a>,
+    v: ReferencePlane<'a>,
+}
+
+impl<'a> ReferenceFrame<'a> {
+    pub(crate) const fn new(
+        y: ReferencePlane<'a>,
+        u: ReferencePlane<'a>,
+        v: ReferencePlane<'a>,
+    ) -> Self {
+        Self { y, u, v }
+    }
+
+    fn plane(self, plane: usize) -> Result<ReferencePlane<'a>, TileSyntaxError> {
+        match plane {
+            0 => Ok(self.y),
+            1 => Ok(self.u),
+            2 => Ok(self.v),
+            _ => Err(TileSyntaxError::InvalidBitstream),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReferencePlane<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+impl<'a> ReferencePlane<'a> {
+    pub(crate) fn new(data: &'a [u8], shape: PlaneShape) -> Result<Self, TileSyntaxError> {
+        let width = usize::try_from(shape.width).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let height =
+            usize::try_from(shape.height).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        if width == 0 || height == 0 || shape.stride < width {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let len = shape
+            .stride
+            .checked_mul(height)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if data.len() < len {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        Ok(Self {
+            data,
+            width,
+            height,
+            stride: shape.stride,
+        })
+    }
+
+    fn sample_clamped(&self, x: i32, y: i32) -> Result<u8, TileSyntaxError> {
+        let last_x =
+            i32::try_from(self.width - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let last_y =
+            i32::try_from(self.height - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let x =
+            usize::try_from(clip3(0, last_x, x)).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let y =
+            usize::try_from(clip3(0, last_y, y)).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let index = y
+            .checked_mul(self.stride)
+            .and_then(|row| row.checked_add(x))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        self.data
+            .get(index)
+            .copied()
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+}
+
+pub(crate) struct TileParseBuffers<'a, 'm, 'f, 'r> {
     counts: &'a mut SyntaxCounts,
     mode_buffers: FrameModeBuffers<'m>,
     current_frame: &'a mut CurrentFrameMut<'f>,
+    reference_frames: Option<ReferenceFrames<'r>>,
 }
 
-impl<'a, 'm, 'f> TileParseBuffers<'a, 'm, 'f> {
+impl<'a, 'm, 'f, 'r> TileParseBuffers<'a, 'm, 'f, 'r> {
     pub(crate) const fn new(
         counts: &'a mut SyntaxCounts,
         mode_buffers: FrameModeBuffers<'m>,
@@ -187,6 +289,21 @@ impl<'a, 'm, 'f> TileParseBuffers<'a, 'm, 'f> {
             counts,
             mode_buffers,
             current_frame,
+            reference_frames: None,
+        }
+    }
+
+    pub(crate) const fn with_references(
+        counts: &'a mut SyntaxCounts,
+        mode_buffers: FrameModeBuffers<'m>,
+        current_frame: &'a mut CurrentFrameMut<'f>,
+        reference_frames: ReferenceFrames<'r>,
+    ) -> Self {
+        Self {
+            counts,
+            mode_buffers,
+            current_frame,
+            reference_frames: Some(reference_frames),
         }
     }
 }
@@ -197,7 +314,7 @@ pub(crate) fn parse_intra_tiles(
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
     layout: &TileLayout,
-    mut buffers: TileParseBuffers<'_, '_, '_>,
+    mut buffers: TileParseBuffers<'_, '_, '_, '_>,
 ) -> Result<(), TileSyntaxError> {
     if !header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -214,6 +331,8 @@ pub(crate) fn parse_intra_tiles(
     for tile in layout.as_slice() {
         let config = TileParserConfig {
             frame_is_intra: true,
+            frame_width: header.frame_width,
+            frame_height: header.frame_height,
             tx_mode: compressed_header.tx_mode,
             reference_mode: ReferenceMode::Single,
             compound_reference: None,
@@ -235,6 +354,7 @@ pub(crate) fn parse_intra_tiles(
                 counts: &mut *buffers.counts,
                 contexts: &mut contexts,
                 current_frame: &mut *buffers.current_frame,
+                reference_frames: None,
             },
         )?;
     }
@@ -248,7 +368,7 @@ pub(crate) fn parse_inter_tiles(
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
     layout: &TileLayout,
-    mut buffers: TileParseBuffers<'_, '_, '_>,
+    mut buffers: TileParseBuffers<'_, '_, '_, '_>,
 ) -> Result<(), TileSyntaxError> {
     if header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -265,10 +385,15 @@ pub(crate) fn parse_inter_tiles(
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
     let mut contexts = TileModeContexts::new(mi_cols)?;
+    let reference_frames = buffers
+        .reference_frames
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
 
     for tile in layout.as_slice() {
         let config = TileParserConfig {
             frame_is_intra: false,
+            frame_width: header.frame_width,
+            frame_height: header.frame_height,
             tx_mode: compressed_header.tx_mode,
             reference_mode: compressed_header.reference_mode,
             compound_reference: compressed_header.compound_reference,
@@ -290,6 +415,7 @@ pub(crate) fn parse_inter_tiles(
                 counts: &mut *buffers.counts,
                 contexts: &mut contexts,
                 current_frame: &mut *buffers.current_frame,
+                reference_frames: Some(reference_frames),
             },
         )?;
     }
@@ -300,6 +426,8 @@ pub(crate) fn parse_inter_tiles(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TileParserConfig {
     frame_is_intra: bool,
+    frame_width: u32,
+    frame_height: u32,
     tx_mode: TxMode,
     reference_mode: ReferenceMode,
     compound_reference: Option<CompoundReferenceSetup>,
@@ -312,11 +440,12 @@ struct TileParserConfig {
     frame_mis: (usize, usize),
 }
 
-struct TileParseShared<'a, 'f> {
+struct TileParseShared<'a, 'f, 'r> {
     probabilities: &'a FrameContext,
     counts: &'a mut SyntaxCounts,
     contexts: &'a mut TileModeContexts,
     current_frame: &'a mut CurrentFrameMut<'f>,
+    reference_frames: Option<ReferenceFrames<'r>>,
 }
 
 fn parse_tile(
@@ -324,13 +453,14 @@ fn parse_tile(
     tile: &TileDescriptor,
     config: TileParserConfig,
     mode_buffers: FrameModeBuffers<'_>,
-    shared: TileParseShared<'_, '_>,
+    shared: TileParseShared<'_, '_, '_>,
 ) -> Result<(), TileSyntaxError> {
     let TileParseShared {
         probabilities,
         counts,
         contexts,
         current_frame,
+        reference_frames,
     } = shared;
     let (mi_rows, mi_cols) = config.frame_mis;
     let payload = frame
@@ -361,6 +491,8 @@ fn parse_tile(
         contexts,
         tx_mode: config.tx_mode,
         frame_is_intra: config.frame_is_intra,
+        frame_width: config.frame_width,
+        frame_height: config.frame_height,
         reference_mode: config.reference_mode,
         compound_reference: config.compound_reference,
         interpolation_filter: config.interpolation_filter,
@@ -376,6 +508,7 @@ fn parse_tile(
         left_row_base: tile_row_start,
         prev_frame_modes: mode_buffers.prev_frame_modes,
         current_frame_modes: mode_buffers.current_frame_modes,
+        reference_frames,
     };
 
     let mut row = tile_row_start;
@@ -400,13 +533,15 @@ fn parse_tile(
     Ok(())
 }
 
-struct TileParser<'a, 'b> {
+struct TileParser<'a, 'b, 'r> {
     decoder: BoolDecoder<'a>,
     probabilities: &'b FrameContext,
     counts: &'b mut SyntaxCounts,
     contexts: &'b mut TileModeContexts,
     tx_mode: TxMode,
     frame_is_intra: bool,
+    frame_width: u32,
+    frame_height: u32,
     reference_mode: ReferenceMode,
     compound_reference: Option<CompoundReferenceSetup>,
     interpolation_filter: Option<InterpolationFilter>,
@@ -422,6 +557,7 @@ struct TileParser<'a, 'b> {
     left_row_base: usize,
     prev_frame_modes: Option<ModeInfoView<'b>>,
     current_frame_modes: Option<ModeInfoViewMut<'b>>,
+    reference_frames: Option<ReferenceFrames<'r>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -469,13 +605,35 @@ struct IntraPredictionRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InterPredictionContext {
+    plane: usize,
+    mi_row: usize,
+    mi_col: usize,
+    start_x: usize,
+    start_y: usize,
+    width: usize,
+    height: usize,
+    block_idx: usize,
+    mi_size: BlockSize,
+    block: DecodedBlockInfo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScaledMotion {
+    start_x: i32,
+    start_y: i32,
+    step_x: i32,
+    step_y: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IntraPredictionEdges {
     above_left: u8,
     above_row: [u8; MAX_INTRA_ABOVE],
     left_col: [u8; MAX_TX_WIDTH],
 }
 
-impl TileParser<'_, '_> {
+impl TileParser<'_, '_, '_> {
     fn decode_partition(
         &mut self,
         row: usize,
@@ -1654,6 +1812,63 @@ impl TileParser<'_, '_> {
                 .map(|value| value >> sub_y)
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
 
+            if block.is_inter {
+                if mi_size < BlockSize::Block8x8 {
+                    for y in 0..num4x4h {
+                        for x in 0..num4x4w {
+                            self.predict_inter(
+                                current_frame,
+                                InterPredictionContext {
+                                    plane,
+                                    mi_row: row,
+                                    mi_col: col,
+                                    start_x: base_x
+                                        .checked_add(
+                                            x.checked_mul(4)
+                                                .ok_or(TileSyntaxError::InvalidBitstream)?,
+                                        )
+                                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                                    start_y: base_y
+                                        .checked_add(
+                                            y.checked_mul(4)
+                                                .ok_or(TileSyntaxError::InvalidBitstream)?,
+                                        )
+                                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                                    width: 4,
+                                    height: 4,
+                                    block_idx: y
+                                        .checked_mul(num4x4w)
+                                        .and_then(|value| value.checked_add(x))
+                                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                                    mi_size,
+                                    block,
+                                },
+                            )?;
+                        }
+                    }
+                } else {
+                    self.predict_inter(
+                        current_frame,
+                        InterPredictionContext {
+                            plane,
+                            mi_row: row,
+                            mi_col: col,
+                            start_x: base_x,
+                            start_y: base_y,
+                            width: num4x4w
+                                .checked_mul(4)
+                                .ok_or(TileSyntaxError::InvalidBitstream)?,
+                            height: num4x4h
+                                .checked_mul(4)
+                                .ok_or(TileSyntaxError::InvalidBitstream)?,
+                            block_idx: 0,
+                            mi_size,
+                            block,
+                        },
+                    )?;
+                }
+            }
+
             let mut block_idx = 0usize;
             let mut y = 0usize;
             while y < num4x4h {
@@ -1700,9 +1915,7 @@ impl TileParser<'_, '_> {
                             nonzero = coefficients.nonzero_context();
                             let mut dequantized = self.dequant.dequantize(&coefficients);
                             dequantized.inverse_transform(self.lossless)?;
-                            if !block.is_inter {
-                                reconstruct(current_frame, &dequantized)?;
-                            }
+                            reconstruct(current_frame, &dequantized)?;
                         }
                     }
 
@@ -1762,6 +1975,172 @@ impl TileParser<'_, '_> {
             &mut pred,
         )?;
         write_prediction_block(plane, context.start_x, context.start_y, size, &pred)
+    }
+
+    fn predict_inter(
+        &self,
+        current_frame: &mut CurrentFrameMut<'_>,
+        context: InterPredictionContext,
+    ) -> Result<(), TileSyntaxError> {
+        let reference_frames = self
+            .reference_frames
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let is_compound = context.block.ref_frames[1] > NONE_FRAME;
+        let ref_count = 1 + usize::from(is_compound);
+        let mut refs = [None; REF_LISTS];
+        let mut scaled = [ScaledMotion {
+            start_x: 0,
+            start_y: 0,
+            step_x: SUBPEL_SHIFTS,
+            step_y: SUBPEL_SHIFTS,
+        }; REF_LISTS];
+
+        for ref_list in 0..ref_count {
+            let ref_frame = context.block.ref_frames[ref_list];
+            let reference = reference_frames.get(ref_frame)?;
+            let mv = select_inter_mv(
+                context.plane,
+                ref_list,
+                context.block_idx,
+                context.mi_size,
+                context.block,
+            )?;
+            let clamped_mv = self.clamp_inter_mv(context, mv)?;
+            scaled[ref_list] = self.scale_inter_mv(
+                reference,
+                context.plane,
+                context.start_x,
+                context.start_y,
+                clamped_mv,
+            )?;
+            refs[ref_list] = Some(reference.plane(context.plane)?);
+        }
+
+        let interp_filter = usize::from(context.block.interp_filter);
+        if interp_filter >= SUBPEL_FILTERS.len() {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let plane = current_frame.plane_mut(context.plane)?;
+        for row in 0..context.height {
+            let y = context
+                .start_y
+                .checked_add(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            for col in 0..context.width {
+                let x = context
+                    .start_x
+                    .checked_add(col)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                let pred0 = inter_predict_sample(
+                    refs[0].ok_or(TileSyntaxError::InvalidBitstream)?,
+                    scaled[0],
+                    interp_filter,
+                    row,
+                    col,
+                )?;
+                let pred = if is_compound {
+                    let pred1 = inter_predict_sample(
+                        refs[1].ok_or(TileSyntaxError::InvalidBitstream)?,
+                        scaled[1],
+                        interp_filter,
+                        row,
+                        col,
+                    )?;
+                    avg2(pred0, pred1)
+                } else {
+                    pred0
+                };
+                plane.set_visible(x, y, pred)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn clamp_inter_mv(
+        &self,
+        context: InterPredictionContext,
+        mv: MotionVector,
+    ) -> Result<MotionVector, TileSyntaxError> {
+        let sx = subsampling_x(context.plane);
+        let sy = subsampling_y(context.plane);
+        let bh = i32::from(context.mi_size.num_8x8_high());
+        let bw = i32::from(context.mi_size.num_8x8_wide());
+        let row = i32::try_from(context.mi_row).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let col = i32::try_from(context.mi_col).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let mi_rows = i32::try_from(self.mi_rows).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let mi_cols = i32::try_from(self.mi_cols).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+
+        let mb_to_top_edge = -(((row * MI_SIZE_PIXELS as i32) * SUBPEL_SHIFTS) >> sy);
+        let mb_to_bottom_edge =
+            (((mi_rows - bh - row) * MI_SIZE_PIXELS as i32) * SUBPEL_SHIFTS) >> sy;
+        let mb_to_left_edge = -(((col * MI_SIZE_PIXELS as i32) * SUBPEL_SHIFTS) >> sx);
+        let mb_to_right_edge =
+            (((mi_cols - bw - col) * MI_SIZE_PIXELS as i32) * SUBPEL_SHIFTS) >> sx;
+        let spel_left = (INTERP_EXTEND + ((bw * MI_SIZE_PIXELS as i32) >> sx)) << SUBPEL_BITS;
+        let spel_right = spel_left - SUBPEL_SHIFTS;
+        let spel_top = (INTERP_EXTEND + ((bh * MI_SIZE_PIXELS as i32) >> sy)) << SUBPEL_BITS;
+        let spel_bottom = spel_top - SUBPEL_SHIFTS;
+
+        MotionVector::new(
+            clip3(
+                mb_to_top_edge - spel_top,
+                mb_to_bottom_edge + spel_bottom,
+                (2 * i32::from(mv.row)) >> sy,
+            ),
+            clip3(
+                mb_to_left_edge - spel_left,
+                mb_to_right_edge + spel_right,
+                (2 * i32::from(mv.col)) >> sx,
+            ),
+        )
+    }
+
+    fn scale_inter_mv(
+        &self,
+        reference: ReferenceFrame<'_>,
+        plane: usize,
+        x: usize,
+        y: usize,
+        clamped_mv: MotionVector,
+    ) -> Result<ScaledMotion, TileSyntaxError> {
+        reference.plane(plane)?;
+        let ref_width =
+            i64::try_from(reference.y.width).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let ref_height =
+            i64::try_from(reference.y.height).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let frame_width = i64::from(self.frame_width);
+        let frame_height = i64::from(self.frame_height);
+        if frame_width <= 0 || frame_height <= 0 {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let x_scale = (ref_width << REF_SCALE_SHIFT) / frame_width;
+        let y_scale = (ref_height << REF_SCALE_SHIFT) / frame_height;
+        let x = i64::try_from(x).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let y = i64::try_from(y).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let base_x = (x * x_scale) >> REF_SCALE_SHIFT;
+        let base_y = (y * y_scale) >> REF_SCALE_SHIFT;
+        let luma_x = if plane > 0 { x << SUBSAMPLING_X } else { x };
+        let luma_y = if plane > 0 { y << SUBSAMPLING_Y } else { y };
+        let frac_x =
+            ((SUBPEL_SHIFTS as i64 * luma_x * x_scale) >> REF_SCALE_SHIFT) & i64::from(SUBPEL_MASK);
+        let frac_y =
+            ((SUBPEL_SHIFTS as i64 * luma_y * y_scale) >> REF_SCALE_SHIFT) & i64::from(SUBPEL_MASK);
+        let dx = ((i64::from(clamped_mv.col) * x_scale) >> REF_SCALE_SHIFT) + frac_x;
+        let dy = ((i64::from(clamped_mv.row) * y_scale) >> REF_SCALE_SHIFT) + frac_y;
+        let step_x = (SUBPEL_SHIFTS as i64 * x_scale) >> REF_SCALE_SHIFT;
+        let step_y = (SUBPEL_SHIFTS as i64 * y_scale) >> REF_SCALE_SHIFT;
+
+        Ok(ScaledMotion {
+            start_x: i32::try_from((base_x << SUBPEL_BITS) + dx)
+                .map_err(|_| TileSyntaxError::InvalidBitstream)?,
+            start_y: i32::try_from((base_y << SUBPEL_BITS) + dy)
+                .map_err(|_| TileSyntaxError::InvalidBitstream)?,
+            step_x: i32::try_from(step_x).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+            step_y: i32::try_from(step_y).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        })
     }
 
     fn tokens(
@@ -1928,6 +2307,145 @@ impl TileParser<'_, '_> {
 
         Ok(coef)
     }
+}
+
+fn select_inter_mv(
+    plane: usize,
+    ref_list: usize,
+    block_idx: usize,
+    mi_size: BlockSize,
+    block: DecodedBlockInfo,
+) -> Result<MotionVector, TileSyntaxError> {
+    if ref_list >= REF_LISTS || block_idx >= SUB_BLOCKS {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let sx = subsampling_x(plane);
+    let sy = subsampling_y(plane);
+    if plane == 0 || mi_size.is_at_least_8x8() || (sx == 0 && sy == 0) {
+        return Ok(block.block_mvs[ref_list][block_idx]);
+    }
+
+    let component = |idx: usize, comp: usize| -> Result<i32, TileSyntaxError> {
+        let mv = *block
+            .block_mvs
+            .get(ref_list)
+            .and_then(|mvs| mvs.get(idx))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        Ok(if comp == 0 {
+            i32::from(mv.row)
+        } else {
+            i32::from(mv.col)
+        })
+    };
+
+    let (row, col) = if sx == 0 {
+        (
+            round_mv_comp_q2(component(block_idx, 0)? + component(block_idx + 2, 0)?),
+            round_mv_comp_q2(component(block_idx, 1)? + component(block_idx + 2, 1)?),
+        )
+    } else if sy == 0 {
+        (
+            round_mv_comp_q2(component(block_idx, 0)? + component(block_idx + 1, 0)?),
+            round_mv_comp_q2(component(block_idx, 1)? + component(block_idx + 1, 1)?),
+        )
+    } else {
+        let mut row = 0i32;
+        let mut col = 0i32;
+        for idx in 0..SUB_BLOCKS {
+            row += component(idx, 0)?;
+            col += component(idx, 1)?;
+        }
+        (round_mv_comp_q4(row), round_mv_comp_q4(col))
+    };
+    MotionVector::new(row, col)
+}
+
+fn round_mv_comp_q2(value: i32) -> i32 {
+    if value < 0 {
+        (value - 1) / 2
+    } else {
+        (value + 1) / 2
+    }
+}
+
+fn round_mv_comp_q4(value: i32) -> i32 {
+    if value < 0 {
+        (value - 2) / 4
+    } else {
+        (value + 2) / 4
+    }
+}
+
+fn inter_predict_sample(
+    reference: ReferencePlane<'_>,
+    scaled: ScaledMotion,
+    interp_filter: usize,
+    row: usize,
+    col: usize,
+) -> Result<u8, TileSyntaxError> {
+    let row = i32::try_from(row).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let col = i32::try_from(col).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let x = scaled
+        .start_x
+        .checked_add(
+            scaled
+                .step_x
+                .checked_mul(col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        )
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let y = scaled
+        .start_y
+        .checked_add(
+            scaled
+                .step_y
+                .checked_mul(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        )
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    if x & SUBPEL_MASK == 0 && y & SUBPEL_MASK == 0 {
+        return reference.sample_clamped(x >> SUBPEL_BITS, y >> SUBPEL_BITS);
+    }
+    let x_filter = subpel_filter(interp_filter, x)?;
+    let y_filter = subpel_filter(interp_filter, y)?;
+    let mut sum = 0i32;
+
+    for (t, &coeff) in y_filter.iter().enumerate() {
+        let t = i32::try_from(t).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let intermediate =
+            horizontal_intermediate_sample(reference, x, (y >> SUBPEL_BITS) + t - 3, x_filter)?;
+        sum += i32::from(coeff) * i32::from(intermediate);
+    }
+
+    Ok(clip1(round2_i32(sum, 7)))
+}
+
+fn horizontal_intermediate_sample(
+    reference: ReferencePlane<'_>,
+    x: i32,
+    y: i32,
+    filter: &[i16; 8],
+) -> Result<u8, TileSyntaxError> {
+    let mut sum = 0i32;
+    for (t, &coeff) in filter.iter().enumerate() {
+        let t = i32::try_from(t).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let sample = reference.sample_clamped((x >> SUBPEL_BITS) + t - 3, y)?;
+        sum += i32::from(coeff) * i32::from(sample);
+    }
+    Ok(clip1(round2_i32(sum, 7)))
+}
+
+fn subpel_filter(
+    interp_filter: usize,
+    position: i32,
+) -> Result<&'static [i16; 8], TileSyntaxError> {
+    let subpel =
+        usize::try_from(position & SUBPEL_MASK).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    SUBPEL_FILTERS
+        .get(interp_filter)
+        .and_then(|filters| filters.get(subpel))
+        .ok_or(TileSyntaxError::InvalidBitstream)
 }
 
 fn intra_prediction_edges(
@@ -2307,6 +2825,10 @@ fn avg3_last_weighted(a: u8, b: u8) -> u8 {
 
 fn clip1(value: i32) -> u8 {
     value.clamp(0, 255) as u8
+}
+
+fn round2_i32(value: i32, bits: u8) -> i32 {
+    (value + (1 << (bits - 1))) >> bits
 }
 
 const fn transform_width(tx_size: TxSize) -> usize {
@@ -3903,6 +4425,81 @@ const MODE_TO_TXFM_MAP: [TxType; INTRA_MODES] = [
     TxType::AdstAdst,
 ];
 
+const SUBPEL_FILTERS: [[[i16; 8]; 16]; 4] = [
+    [
+        [0, 0, 0, 128, 0, 0, 0, 0],
+        [0, 1, -5, 126, 8, -3, 1, 0],
+        [-1, 3, -10, 122, 18, -6, 2, 0],
+        [-1, 4, -13, 118, 27, -9, 3, -1],
+        [-1, 4, -16, 112, 37, -11, 4, -1],
+        [-1, 5, -18, 105, 48, -14, 4, -1],
+        [-1, 5, -19, 97, 58, -16, 5, -1],
+        [-1, 6, -19, 88, 68, -18, 5, -1],
+        [-1, 6, -19, 78, 78, -19, 6, -1],
+        [-1, 5, -18, 68, 88, -19, 6, -1],
+        [-1, 5, -16, 58, 97, -19, 5, -1],
+        [-1, 4, -14, 48, 105, -18, 5, -1],
+        [-1, 4, -11, 37, 112, -16, 4, -1],
+        [-1, 3, -9, 27, 118, -13, 4, -1],
+        [0, 2, -6, 18, 122, -10, 3, -1],
+        [0, 1, -3, 8, 126, -5, 1, 0],
+    ],
+    [
+        [0, 0, 0, 128, 0, 0, 0, 0],
+        [-3, -1, 32, 64, 38, 1, -3, 0],
+        [-2, -2, 29, 63, 41, 2, -3, 0],
+        [-2, -2, 26, 63, 43, 4, -4, 0],
+        [-2, -3, 24, 62, 46, 5, -4, 0],
+        [-2, -3, 21, 60, 49, 7, -4, 0],
+        [-1, -4, 18, 59, 51, 9, -4, 0],
+        [-1, -4, 16, 57, 53, 12, -4, -1],
+        [-1, -4, 14, 55, 55, 14, -4, -1],
+        [-1, -4, 12, 53, 57, 16, -4, -1],
+        [0, -4, 9, 51, 59, 18, -4, -1],
+        [0, -4, 7, 49, 60, 21, -3, -2],
+        [0, -4, 5, 46, 62, 24, -3, -2],
+        [0, -4, 4, 43, 63, 26, -2, -2],
+        [0, -3, 2, 41, 63, 29, -2, -2],
+        [0, -3, 1, 38, 64, 32, -1, -3],
+    ],
+    [
+        [0, 0, 0, 128, 0, 0, 0, 0],
+        [-1, 3, -7, 127, 8, -3, 1, 0],
+        [-2, 5, -13, 125, 17, -6, 3, -1],
+        [-3, 7, -17, 121, 27, -10, 5, -2],
+        [-4, 9, -20, 115, 37, -13, 6, -2],
+        [-4, 10, -23, 108, 48, -16, 8, -3],
+        [-4, 10, -24, 100, 59, -19, 9, -3],
+        [-4, 11, -24, 90, 70, -21, 10, -4],
+        [-4, 11, -23, 80, 80, -23, 11, -4],
+        [-4, 10, -21, 70, 90, -24, 11, -4],
+        [-3, 9, -19, 59, 100, -24, 10, -4],
+        [-3, 8, -16, 48, 108, -23, 10, -4],
+        [-2, 6, -13, 37, 115, -20, 9, -4],
+        [-2, 5, -10, 27, 121, -17, 7, -3],
+        [-1, 3, -6, 17, 125, -13, 5, -2],
+        [0, 1, -3, 8, 127, -7, 3, -1],
+    ],
+    [
+        [0, 0, 0, 128, 0, 0, 0, 0],
+        [0, 0, 0, 120, 8, 0, 0, 0],
+        [0, 0, 0, 112, 16, 0, 0, 0],
+        [0, 0, 0, 104, 24, 0, 0, 0],
+        [0, 0, 0, 96, 32, 0, 0, 0],
+        [0, 0, 0, 88, 40, 0, 0, 0],
+        [0, 0, 0, 80, 48, 0, 0, 0],
+        [0, 0, 0, 72, 56, 0, 0, 0],
+        [0, 0, 0, 64, 64, 0, 0, 0],
+        [0, 0, 0, 56, 72, 0, 0, 0],
+        [0, 0, 0, 48, 80, 0, 0, 0],
+        [0, 0, 0, 40, 88, 0, 0, 0],
+        [0, 0, 0, 32, 96, 0, 0, 0],
+        [0, 0, 0, 24, 104, 0, 0, 0],
+        [0, 0, 0, 16, 112, 0, 0, 0],
+        [0, 0, 0, 8, 120, 0, 0, 0],
+    ],
+];
+
 const TOKEN_TREE: [i8; 20] = [
     -(CoefToken::Zero as i8),
     2,
@@ -4455,12 +5052,14 @@ mod tests {
     use super::residual::{FrameDequant, TransformCoefficients};
     use super::{
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
-        INTRA_FRAME, IntraMode, IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME,
-        MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector,
-        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL,
-        StoredModeInfo, TileModeContexts, TileParseBuffers, TileParser, TileSyntaxError, TxSize,
-        TxType, ZEROMV, add_residual_block, intra_predict_block, mode_info_byte_len,
-        parse_intra_tiles,
+        GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, IntraMode, IntraPredictionEdges,
+        IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH,
+        ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
+        REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, SUB_BLOCKS,
+        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
+        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, ZEROMV, add_residual_block,
+        inter_predict_sample, intra_predict_block, mode_info_byte_len, parse_intra_tiles,
+        select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -4625,6 +5224,161 @@ mod tests {
     }
 
     #[test]
+    fn chroma_sub8x8_mv_selection_averages_luma_subblocks() {
+        let mut block = test_block(false);
+        block.is_inter = true;
+        block.ref_frames = [LAST_FRAME, NONE_FRAME];
+        block.block_mvs[0] = [
+            MotionVector { row: 1, col: -1 },
+            MotionVector { row: 2, col: -2 },
+            MotionVector { row: 3, col: -3 },
+            MotionVector { row: 4, col: -4 },
+        ];
+
+        assert_eq!(
+            select_inter_mv(1, 0, 0, BlockSize::Block4x4, block),
+            Ok(MotionVector { row: 3, col: -3 })
+        );
+    }
+
+    #[test]
+    fn integer_inter_prediction_samples_reference_pixels_and_clamps_edges() {
+        let data = [
+            0, 1, 2, 3, //
+            4, 5, 6, 7, //
+            8, 9, 10, 11, //
+            12, 13, 14, 15,
+        ];
+        let reference = ReferencePlane::new(&data, crate::PlaneShape::new(4, 4, 4)).unwrap();
+
+        assert_eq!(
+            inter_predict_sample(
+                reference,
+                ScaledMotion {
+                    start_x: 1 << 4,
+                    start_y: 2 << 4,
+                    step_x: 16,
+                    step_y: 16,
+                },
+                0,
+                0,
+                0,
+            ),
+            Ok(9)
+        );
+        assert_eq!(
+            inter_predict_sample(
+                reference,
+                ScaledMotion {
+                    start_x: -4 << 4,
+                    start_y: -3 << 4,
+                    step_x: 16,
+                    step_y: 16,
+                },
+                0,
+                0,
+                0,
+            ),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn bilinear_inter_prediction_uses_separable_fractional_filtering() {
+        let data = [
+            10, 30, //
+            50, 90,
+        ];
+        let reference = ReferencePlane::new(&data, crate::PlaneShape::new(2, 2, 2)).unwrap();
+
+        assert_eq!(
+            inter_predict_sample(
+                reference,
+                ScaledMotion {
+                    start_x: 8,
+                    start_y: 8,
+                    step_x: 16,
+                    step_y: 16,
+                },
+                3,
+                0,
+                0,
+            ),
+            Ok(45)
+        );
+    }
+
+    #[test]
+    fn compound_inter_prediction_writes_average_of_two_references() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut counts = SyntaxCounts::default();
+        let last_y = [10u8; 16];
+        let golden_y = [20u8; 16];
+        let uv = [128u8; 4];
+        let last = test_reference_frame(&last_y, &uv, &uv, 4, 4);
+        let golden = test_reference_frame(&golden_y, &uv, &uv, 4, 4);
+        let mut references = [None; 4];
+        references[usize::from(LAST_FRAME)] = Some(last);
+        references[usize::from(GOLDEN_FRAME)] = Some(golden);
+        let mut current_frame_storage = TestCurrentFrame::new(4, 4);
+
+        {
+            let mut current_frame = current_frame_storage.as_current_frame();
+            let parser = TileParser {
+                decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
+                probabilities: &probabilities,
+                counts: &mut counts,
+                contexts: &mut contexts,
+                tx_mode: TxMode::Only4x4,
+                frame_is_intra: false,
+                frame_width: 4,
+                frame_height: 4,
+                reference_mode: ReferenceMode::Compound,
+                compound_reference: None,
+                interpolation_filter: Some(crate::header::InterpolationFilter::EightTap),
+                allow_high_precision_mv: false,
+                use_prev_frame_mvs: false,
+                ref_frame_sign_bias: [false; 4],
+                lossless: true,
+                dequant: FrameDequant::new(0, 0, 0, 0),
+                mi_rows: 1,
+                mi_cols: 1,
+                tile_col_start: 0,
+                tile_col_end: 1,
+                left_row_base: 0,
+                prev_frame_modes: None,
+                current_frame_modes: None,
+                reference_frames: Some(ReferenceFrames::new(references)),
+            };
+            let mut block = test_block(false);
+            block.is_inter = true;
+            block.ref_frames = [LAST_FRAME, GOLDEN_FRAME];
+            block.interp_filter = 0;
+
+            parser
+                .predict_inter(
+                    &mut current_frame,
+                    InterPredictionContext {
+                        plane: 0,
+                        mi_row: 0,
+                        mi_col: 0,
+                        start_x: 0,
+                        start_y: 0,
+                        width: 4,
+                        height: 4,
+                        block_idx: 0,
+                        mi_size: BlockSize::Block8x8,
+                        block,
+                    },
+                )
+                .unwrap();
+        }
+
+        assert!(current_frame_storage.y.iter().all(|&sample| sample == 15));
+    }
+
+    #[test]
     fn minimal_intra_tile_parses_residual_syntax() {
         let frame = [0u8; 32];
         let header = test_header(false);
@@ -4673,6 +5427,8 @@ mod tests {
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: true,
+                frame_width: 8,
+                frame_height: 8,
                 reference_mode: ReferenceMode::Single,
                 compound_reference: None,
                 interpolation_filter: None,
@@ -4688,6 +5444,7 @@ mod tests {
                 left_row_base: 0,
                 prev_frame_modes: None,
                 current_frame_modes: None,
+                reference_frames: None,
             };
 
             assert!(
@@ -4722,6 +5479,8 @@ mod tests {
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
+            frame_width: 8,
+            frame_height: 8,
             reference_mode: ReferenceMode::Single,
             compound_reference: None,
             interpolation_filter: None,
@@ -4737,6 +5496,7 @@ mod tests {
             left_row_base: 0,
             prev_frame_modes: None,
             current_frame_modes: None,
+            reference_frames: None,
         };
 
         let coefficients = parser
@@ -4771,6 +5531,8 @@ mod tests {
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: true,
+                frame_width: 8,
+                frame_height: 8,
                 reference_mode: ReferenceMode::Single,
                 compound_reference: None,
                 interpolation_filter: None,
@@ -4786,6 +5548,7 @@ mod tests {
                 left_row_base: 0,
                 prev_frame_modes: None,
                 current_frame_modes: None,
+                reference_frames: None,
             };
 
             let coefficients = parser
@@ -4868,6 +5631,8 @@ mod tests {
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
+            frame_width: 8,
+            frame_height: 8,
             reference_mode: ReferenceMode::Single,
             compound_reference: None,
             interpolation_filter: None,
@@ -4883,6 +5648,7 @@ mod tests {
             left_row_base: 0,
             prev_frame_modes: None,
             current_frame_modes: None,
+            reference_frames: None,
         };
 
         assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(5));
@@ -4898,6 +5664,8 @@ mod tests {
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
+            frame_width: 8,
+            frame_height: 8,
             reference_mode: ReferenceMode::Single,
             compound_reference: None,
             interpolation_filter: None,
@@ -4913,6 +5681,7 @@ mod tests {
             left_row_base: 0,
             prev_frame_modes: None,
             current_frame_modes: None,
+            reference_frames: None,
         };
 
         assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(6));
@@ -4995,6 +5764,8 @@ mod tests {
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: false,
+            frame_width: 64,
+            frame_height: 64,
             reference_mode: ReferenceMode::Single,
             compound_reference: None,
             interpolation_filter: Some(crate::header::InterpolationFilter::EightTap),
@@ -5010,6 +5781,7 @@ mod tests {
             left_row_base: 0,
             prev_frame_modes: None,
             current_frame_modes: Some(current_modes),
+            reference_frames: None,
         };
 
         let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();
@@ -5080,6 +5852,30 @@ mod tests {
                 CurrentPlaneMut::new(&mut self.v, self.uv_shape).unwrap(),
             )
         }
+    }
+
+    fn test_reference_frame<'a>(
+        y: &'a [u8],
+        u: &'a [u8],
+        v: &'a [u8],
+        width: u32,
+        height: u32,
+    ) -> ReferenceFrame<'a> {
+        let chroma_width = width.div_ceil(2);
+        let chroma_height = height.div_ceil(2);
+        ReferenceFrame::new(
+            ReferencePlane::new(y, crate::PlaneShape::new(width, height, width as usize)).unwrap(),
+            ReferencePlane::new(
+                u,
+                crate::PlaneShape::new(chroma_width, chroma_height, chroma_width as usize),
+            )
+            .unwrap(),
+            ReferencePlane::new(
+                v,
+                crate::PlaneShape::new(chroma_width, chroma_height, chroma_width as usize),
+            )
+            .unwrap(),
+        )
     }
 
     fn prediction_edges(above_left: u8, above: &[u8], left: &[u8]) -> IntraPredictionEdges {

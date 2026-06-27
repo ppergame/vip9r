@@ -65,7 +65,7 @@ harness.
 - [x] residual coefficient storage and dequantization data model
 - [x] inverse transform kernels for the profile 0 / 8-bit subset
 - [x] intra prediction and reconstruction into the current frame
-- [ ] inter prediction from reference frame slots
+- [x] inter prediction from reference frame slots
 - [ ] loop filter and final reconstructed reference/output pixel path
 
 ### M2 — Decode, correct (bring-up campaign)
