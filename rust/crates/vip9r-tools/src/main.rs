@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use md5::{Digest, Md5};
 use vip9r_core::{
-    DecodeError, Decoder, DecoderLimits, DecoderOptions, FrameInfo, FrameSink, I420Frame,
+    DecodeError, DecodeOutcome, Decoder, DecoderLimits, FrameInfo, I420Frame, OwnedWorkspace,
+    split_packet,
 };
 
 const DEFAULT_MEDIA_ROOT_ENV: &str = "VIP9R_MEDIA_ROOT";
@@ -151,36 +152,37 @@ fn compare_ivf_to_golden(input_path: &Path, golden_path: &Path) -> Result<Compar
     let golden =
         parse_golden(&golden_text).with_context(|| format!("parse {}", golden_path.display()))?;
 
-    let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(
-        ivf.header.width.into(),
-        ivf.header.height.into(),
-    )))
-    .map_err(|err| anyhow!("create decoder: {err:?}"))?;
+    let limits = DecoderLimits::new(ivf.header.width.into(), ivf.header.height.into());
+    let mut decoder = Decoder::new(limits).map_err(|err| anyhow!("create decoder: {err:?}"))?;
+    let requirements = Decoder::workspace_requirements(limits)
+        .map_err(|err| anyhow!("workspace requirements: {err:?}"))?;
+    let mut workspace =
+        OwnedWorkspace::new(requirements).map_err(|err| anyhow!("create workspace: {err:?}"))?;
 
     let mut sink = Md5Sink::new(&golden);
     let mut decoded_coded_frames = 0u64;
-    let mut reported_shown_frames = 0u64;
 
-    for frame in &ivf.frames {
-        let shown_before = sink.actual_count();
-        let packet_report = decoder
-            .decode_packet(frame.payload, &mut sink)
-            .map_err(|err| decode_packet_error(frame.index, frame.timestamp, err))?;
-        let shown_after = sink.actual_count();
-        let emitted = shown_after - shown_before;
+    for packet in &ivf.frames {
+        let coded_frames = split_packet(packet.payload)
+            .map_err(|err| decode_packet_error(packet.index, packet.timestamp, err))?;
+        decoded_coded_frames += coded_frames.len() as u64;
 
-        decoded_coded_frames += u64::from(packet_report.coded_frames);
-        reported_shown_frames += u64::from(packet_report.shown_frames);
-
-        if emitted != packet_report.shown_frames as usize {
-            bail!(
-                "packet {} reported {} shown frames but emitted {}",
-                frame.index,
-                packet_report.shown_frames,
-                emitted
-            );
+        for (coded_index, range) in coded_frames.as_slice().iter().copied().enumerate() {
+            let coded_frame = range
+                .as_slice(packet.payload)
+                .map_err(|err| decode_packet_error(packet.index, packet.timestamp, err))?;
+            let mut workspace_view = workspace.as_workspace();
+            match decoder
+                .decode_coded_frame(coded_frame, &mut workspace_view)
+                .map_err(|err| decode_coded_frame_error(packet.index, coded_index, err))?
+            {
+                DecodeOutcome::NoOutput => {}
+                DecodeOutcome::Output(frame) => sink.frame(frame)?,
+            }
         }
     }
+
+    let comparisons = sink.into_comparisons();
 
     Ok(ComparisonReport {
         input_path: input_path.to_owned(),
@@ -188,18 +190,22 @@ fn compare_ivf_to_golden(input_path: &Path, golden_path: &Path) -> Result<Compar
         ivf_header: ivf.header,
         ivf_packet_count: ivf.frames.len(),
         decoded_coded_frames,
-        reported_shown_frames,
-        comparisons: sink.into_comparisons(),
+        reported_shown_frames: comparisons.len() as u64,
+        comparisons,
         expected_count: golden.len(),
     })
 }
 
-fn decode_packet_error<E: std::fmt::Debug>(
-    index: usize,
-    timestamp: u64,
-    err: DecodeError<E>,
-) -> anyhow::Error {
+fn decode_packet_error(index: usize, timestamp: u64, err: DecodeError) -> anyhow::Error {
     anyhow!("decode packet {index} timestamp {timestamp}: {err:?}")
+}
+
+fn decode_coded_frame_error(
+    packet_index: usize,
+    coded_index: usize,
+    err: DecodeError,
+) -> anyhow::Error {
+    anyhow!("decode packet {packet_index} coded frame {coded_index}: {err:?}")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -397,19 +403,13 @@ impl<'a> Md5Sink<'a> {
         }
     }
 
-    fn actual_count(&self) -> usize {
-        self.comparisons.len()
-    }
-
     fn into_comparisons(self) -> Vec<FrameComparison> {
         self.comparisons
     }
 }
 
-impl FrameSink for Md5Sink<'_> {
-    type Error = anyhow::Error;
-
-    fn frame(&mut self, frame: I420Frame<'_>) -> Result<(), Self::Error> {
+impl Md5Sink<'_> {
+    fn frame(&mut self, frame: I420Frame<'_>) -> Result<()> {
         let byte_len = frame
             .info
             .i420_len()

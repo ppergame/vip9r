@@ -1,26 +1,13 @@
 use crate::error::ParserError;
+use crate::{CodedFrameRange, CodedFrameRanges, MAX_CODED_FRAMES_PER_PACKET};
 
-pub(crate) const MAX_FRAMES_PER_SUPERFRAME: usize = 8;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct FrameSlices<'a> {
-    frames: [&'a [u8]; MAX_FRAMES_PER_SUPERFRAME],
-    len: usize,
-}
-
-impl<'a> FrameSlices<'a> {
-    pub(crate) fn as_slice(&self) -> &[&'a [u8]] {
-        &self.frames[..self.len]
-    }
-}
-
-pub(crate) fn split_superframe(packet: &[u8]) -> Result<FrameSlices<'_>, ParserError> {
+pub(crate) fn split_packet(packet: &[u8]) -> Result<CodedFrameRanges, ParserError> {
     let Some(&marker) = packet.last() else {
         return Err(ParserError::InvalidBitstream);
     };
 
     if marker >> 5 != 0b110 {
-        return Ok(single_frame(packet));
+        return Ok(single_frame(packet.len()));
     }
 
     let size_bytes = usize::from(((marker >> 3) & 0b11) + 1);
@@ -36,7 +23,7 @@ pub(crate) fn split_superframe(packet: &[u8]) -> Result<FrameSlices<'_>, ParserE
     }
 
     let payload_len = index_start;
-    let mut frames = [&[][..]; MAX_FRAMES_PER_SUPERFRAME];
+    let mut frames = [CodedFrameRange { start: 0, len: 0 }; MAX_CODED_FRAMES_PER_PACKET];
     let mut frame_offset = 0usize;
     let mut size_offset = index_start + 1;
 
@@ -51,7 +38,10 @@ pub(crate) fn split_superframe(packet: &[u8]) -> Result<FrameSlices<'_>, ParserE
             return Err(ParserError::InvalidBitstream);
         }
 
-        *frame = &packet[frame_offset..next_frame_offset];
+        *frame = CodedFrameRange {
+            start: frame_offset,
+            len: frame_size,
+        };
         frame_offset = next_frame_offset;
     }
 
@@ -59,16 +49,19 @@ pub(crate) fn split_superframe(packet: &[u8]) -> Result<FrameSlices<'_>, ParserE
         return Err(ParserError::InvalidBitstream);
     }
 
-    Ok(FrameSlices {
-        frames,
+    Ok(CodedFrameRanges {
+        ranges: frames,
         len: frame_count,
     })
 }
 
-fn single_frame(packet: &[u8]) -> FrameSlices<'_> {
-    let mut frames = [&[][..]; MAX_FRAMES_PER_SUPERFRAME];
-    frames[0] = packet;
-    FrameSlices { frames, len: 1 }
+fn single_frame(len: usize) -> CodedFrameRanges {
+    let mut frames = [CodedFrameRange { start: 0, len: 0 }; MAX_CODED_FRAMES_PER_PACKET];
+    frames[0] = CodedFrameRange { start: 0, len };
+    CodedFrameRanges {
+        ranges: frames,
+        len: 1,
+    }
 }
 
 fn read_le_size(bytes: &[u8]) -> Result<usize, ParserError> {
@@ -81,53 +74,51 @@ fn read_le_size(bytes: &[u8]) -> Result<usize, ParserError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParserError, split_superframe};
+    use super::{ParserError, split_packet};
+    use crate::CodedFrameRange;
 
     #[test]
     fn non_superframe_packet_is_one_frame() {
         let packet = [1, 2, 3];
 
-        let frames = split_superframe(&packet).unwrap();
+        let frames = split_packet(&packet).unwrap();
 
-        assert_eq!(frames.as_slice(), [&packet[..]]);
+        assert_eq!(frames.as_slice(), [CodedFrameRange { start: 0, len: 3 }]);
     }
 
     #[test]
     fn valid_superframe_uses_index_sizes() {
         let packet = [1, 2, 3, 4, 5, 0xc1, 2, 3, 0xc1];
 
-        let frames = split_superframe(&packet).unwrap();
+        let frames = split_packet(&packet).unwrap();
 
-        assert_eq!(frames.as_slice(), [&packet[0..2], &packet[2..5]]);
+        assert_eq!(
+            frames.as_slice(),
+            [
+                CodedFrameRange { start: 0, len: 2 },
+                CodedFrameRange { start: 2, len: 3 }
+            ]
+        );
     }
 
     #[test]
     fn truncated_superframe_index_is_rejected() {
         let packet = [1, 2, 0xc1];
 
-        assert_eq!(
-            split_superframe(&packet),
-            Err(ParserError::InvalidBitstream)
-        );
+        assert_eq!(split_packet(&packet), Err(ParserError::InvalidBitstream));
     }
 
     #[test]
     fn superframe_marker_mismatch_is_rejected() {
         let packet = [1, 2, 3, 4, 5, 0xc0, 2, 3, 0xc1];
 
-        assert_eq!(
-            split_superframe(&packet),
-            Err(ParserError::InvalidBitstream)
-        );
+        assert_eq!(split_packet(&packet), Err(ParserError::InvalidBitstream));
     }
 
     #[test]
     fn superframe_size_overrun_is_rejected() {
         let packet = [1, 2, 3, 4, 5, 0xc1, 4, 2, 0xc1];
 
-        assert_eq!(
-            split_superframe(&packet),
-            Err(ParserError::InvalidBitstream)
-        );
+        assert_eq!(split_packet(&packet), Err(ParserError::InvalidBitstream));
     }
 }

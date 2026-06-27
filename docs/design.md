@@ -74,17 +74,25 @@ still expected to stop at `Unimplemented`.
 
 ### Decode API
 
-The core API decodes one demuxed packet at a time and emits shown frames
-synchronously through a `FrameSink`. Output frames are temporary borrows valid
-only during the sink callback. This deliberately avoids a pending-output queue:
-the decoder may reuse scratch storage or reset a GOP arena before, during, or
-after a packet decode as long as it does not invalidate a frame while the sink
-is running.
+The primary core API is packet splitting plus one-coded-frame decode. A demuxed
+VP9 packet may be a superframe; `split_packet` returns up to 8 coded-frame byte
+ranges. `Decoder::decode_coded_frame` consumes one range with an explicit
+`DecodeWorkspace` and returns either no output or one shown frame. Packet-level
+helpers are adapters, not the architecture.
 
-Public output is compact I420 in libvpx-md5 order: visible Y, then U, then V.
-Internal plane storage may have stride; `I420Frame::write_compact` is the bridge
-for the golden harness. A future wasm API can wrap the same core as a stepwise
-`begin_packet`/`decode_next` ABI if JS needs pull-style output.
+`Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to
+the supplied workspace; current placeholder workspace storage exists only until
+reconstruction needs real buffers.
+
+Shown-frame output borrows from the supplied workspace and is invalid after the
+next decode or packet transition. Public output is compact I420 in libvpx-md5
+order: visible Y, then U, then V. Internal plane storage may have stride;
+`I420Frame::write_compact` is the bridge for the golden harness.
+
+The wasm boundary uses the same shape: one instance is one decoder session,
+`begin_packet` stages packet ranges, and `decode_next` advances exactly one
+coded frame. There is no reset API; JS recreates the instance on stream changes
+or decode errors.
 
 ## Measurement
 

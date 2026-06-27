@@ -1,20 +1,9 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
-use core::convert::Infallible;
+use core::marker::PhantomData;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DecoderOptions {
-    pub limits: DecoderLimits,
-}
-
-impl DecoderOptions {
-    pub const fn new(limits: DecoderLimits) -> Self {
-        Self { limits }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecoderLimits {
@@ -31,10 +20,104 @@ impl DecoderLimits {
     }
 }
 
+pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PacketReport {
-    pub coded_frames: u32,
-    pub shown_frames: u32,
+pub struct CodedFrameRange {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl CodedFrameRange {
+    pub fn as_slice(self, packet: &[u8]) -> Result<&[u8], DecodeError> {
+        let end = self
+            .start
+            .checked_add(self.len)
+            .ok_or(DecodeError::InvalidBitstream)?;
+        packet
+            .get(self.start..end)
+            .ok_or(DecodeError::InvalidBitstream)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodedFrameRanges {
+    ranges: [CodedFrameRange; MAX_CODED_FRAMES_PER_PACKET],
+    len: usize,
+}
+
+impl CodedFrameRanges {
+    pub fn as_slice(&self) -> &[CodedFrameRange] {
+        &self.ranges[..self.len]
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+pub fn split_packet(packet: &[u8]) -> Result<CodedFrameRanges, DecodeError> {
+    superframe::split_packet(packet).map_err(|err| err.into_decode_error())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceRequirements {
+    pub limits: DecoderLimits,
+    pub pixel_bytes: usize,
+    pub mi_count: usize,
+}
+
+impl WorkspaceRequirements {
+    pub fn new(limits: DecoderLimits) -> Result<Self, DecodeError> {
+        validate_limits(limits)?;
+        let i420 = required_i420_len(limits.max_width, limits.max_height)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let pixel_bytes = i420.checked_mul(9).ok_or(DecodeError::InvalidConfig)?;
+        let mi_w = limits.max_width.div_ceil(8);
+        let mi_h = limits.max_height.div_ceil(8);
+        let mi_count = usize::try_from(mi_w)
+            .ok()
+            .and_then(|w| usize::try_from(mi_h).ok().and_then(|h| w.checked_mul(h)))
+            .ok_or(DecodeError::InvalidConfig)?;
+
+        Ok(Self {
+            limits,
+            pixel_bytes,
+            mi_count,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct DecodeWorkspace<'a> {
+    _marker: PhantomData<&'a mut ()>,
+}
+
+impl DecodeWorkspace<'_> {
+    pub const fn placeholder() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+#[derive(Debug)]
+pub struct OwnedWorkspace;
+
+#[cfg(feature = "std")]
+impl OwnedWorkspace {
+    pub fn new(_requirements: WorkspaceRequirements) -> Result<Self, DecodeError> {
+        Ok(Self)
+    }
+
+    pub fn as_workspace(&mut self) -> DecodeWorkspace<'_> {
+        DecodeWorkspace::placeholder()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,14 +199,10 @@ impl I420Frame<'_> {
     }
 }
 
-pub trait FrameSink {
-    type Error;
-
-    /// Receives one shown frame.
-    ///
-    /// `frame` is only valid for this call. The decoder may reuse or reset the
-    /// storage backing it as soon as this method returns.
-    fn frame(&mut self, frame: I420Frame<'_>) -> Result<(), Self::Error>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodeOutcome<'a> {
+    NoOutput,
+    Output(I420Frame<'a>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,27 +212,23 @@ pub enum FrameCopyError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DecodeError<SinkError = Infallible> {
+pub enum DecodeError {
     InvalidConfig,
-    OutputTooSmall { required: usize },
     ResourceLimit,
     UnsupportedProfile(u8),
     UnsupportedBitDepth(u8),
     InvalidBitstream,
-    Sink(SinkError),
     Unimplemented,
 }
 
-impl<SinkError> DecodeError<SinkError> {
+impl DecodeError {
     pub const fn code(&self) -> i32 {
         match self {
             Self::InvalidConfig => -1,
-            Self::OutputTooSmall { .. } => -2,
             Self::ResourceLimit => -3,
             Self::UnsupportedProfile(_) => -4,
             Self::UnsupportedBitDepth(_) => -5,
             Self::InvalidBitstream => -6,
-            Self::Sink(_) => -7,
             Self::Unimplemented => -8,
         }
     }
@@ -172,126 +247,104 @@ mod tile_syntax;
 use compressed_header::{parse_inter_compressed_header, parse_intra_compressed_header};
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::ProbabilityState;
-use superframe::split_superframe;
 use tile::parse_tile_layout;
 use tile_syntax::parse_intra_tiles;
 
 #[derive(Debug)]
 pub struct Decoder {
-    options: DecoderOptions,
+    limits: DecoderLimits,
     header_state: HeaderParserState,
     probability_state: ProbabilityState,
 }
 
 impl Decoder {
-    pub fn new(options: DecoderOptions) -> Result<Self, DecodeError> {
-        if options.limits.max_width == 0
-            || options.limits.max_height == 0
-            || required_i420_len(options.limits.max_width, options.limits.max_height).is_none()
-        {
-            return Err(DecodeError::InvalidConfig);
-        }
+    pub fn new(limits: DecoderLimits) -> Result<Self, DecodeError> {
+        validate_limits(limits)?;
 
         Ok(Self {
-            options,
+            limits,
             header_state: HeaderParserState::new(),
             probability_state: ProbabilityState::new(),
         })
     }
 
-    pub const fn options(&self) -> DecoderOptions {
-        self.options
+    pub const fn limits(&self) -> DecoderLimits {
+        self.limits
     }
 
-    /// Decodes one demuxed VP9 packet.
-    ///
-    /// The packet is an IVF frame payload or WebM block payload. VP9 superframe
-    /// splitting belongs inside this call. Shown frames are emitted
-    /// synchronously through `sink`; no output frame may borrow decoder storage
-    /// after the sink callback returns.
-    pub fn decode_packet<Sink: FrameSink>(
+    pub fn workspace_requirements(
+        limits: DecoderLimits,
+    ) -> Result<WorkspaceRequirements, DecodeError> {
+        WorkspaceRequirements::new(limits)
+    }
+
+    pub fn decode_coded_frame<'w>(
         &mut self,
-        packet: &[u8],
-        _sink: &mut Sink,
-    ) -> Result<PacketReport, DecodeError<Sink::Error>> {
-        let frames = split_superframe(packet).map_err(|err| err.into_decode_error())?;
+        coded_frame: &[u8],
+        _workspace: &'w mut DecodeWorkspace<'_>,
+    ) -> Result<DecodeOutcome<'w>, DecodeError> {
+        let header = parse_uncompressed_frame_header(coded_frame, &self.header_state)
+            .map_err(|err| err.into_decode_error())?;
+        self.validate_frame_limits(&header)?;
+        self.setup_frame_probability_state(&header)?;
 
-        if frames.as_slice().is_empty() {
-            return Err(DecodeError::InvalidBitstream);
-        }
-
-        let mut header_state = self.header_state;
-        for frame in frames.as_slice() {
-            let header = parse_uncompressed_frame_header(frame, &header_state)
+        if !header.show_existing_frame && header.header_size_in_bytes != 0 {
+            let compressed_header_data = coded_frame
+                .get(header.compressed_header_offset..header.tile_data_offset)
+                .ok_or(DecodeError::InvalidBitstream)?;
+            self.probability_state
+                .load_probs(header.frame_context_idx)
                 .map_err(|err| err.into_decode_error())?;
-            self.validate_frame_limits(&header)?;
-            self.setup_frame_probability_state(&header)?;
+            self.probability_state
+                .load_probs2(header.frame_context_idx)
+                .map_err(|err| err.into_decode_error())?;
 
-            if !header.show_existing_frame && header.header_size_in_bytes != 0 {
-                let compressed_header_data = frame
-                    .get(header.compressed_header_offset..header.tile_data_offset)
-                    .ok_or(DecodeError::InvalidBitstream)?;
+            let compressed_header = if header.frame_is_intra {
+                parse_intra_compressed_header(
+                    compressed_header_data,
+                    &header,
+                    self.probability_state.current_mut(),
+                )
+                .map_err(|err| err.into_decode_error())?
+            } else {
+                parse_inter_compressed_header(
+                    compressed_header_data,
+                    &header,
+                    self.probability_state.current_mut(),
+                )
+                .map_err(|err| err.into_decode_error())?
+            };
+
+            if header.refresh_frame_context {
                 self.probability_state
-                    .load_probs(header.frame_context_idx)
+                    .save_probs(header.frame_context_idx)
                     .map_err(|err| err.into_decode_error())?;
-                self.probability_state
-                    .load_probs2(header.frame_context_idx)
-                    .map_err(|err| err.into_decode_error())?;
-
-                let compressed_header = if header.frame_is_intra {
-                    parse_intra_compressed_header(
-                        compressed_header_data,
-                        &header,
-                        self.probability_state.current_mut(),
-                    )
-                    .map_err(|err| err.into_decode_error())?
-                } else {
-                    parse_inter_compressed_header(
-                        compressed_header_data,
-                        &header,
-                        self.probability_state.current_mut(),
-                    )
-                    .map_err(|err| err.into_decode_error())?
-                };
-
-                if header.refresh_frame_context {
-                    self.probability_state
-                        .save_probs(header.frame_context_idx)
-                        .map_err(|err| err.into_decode_error())?;
-                }
-
-                let tile_layout =
-                    parse_tile_layout(frame, &header).map_err(|err| err.into_decode_error())?;
-                if header.frame_is_intra {
-                    parse_intra_tiles(
-                        frame,
-                        &header,
-                        &compressed_header,
-                        self.probability_state.current(),
-                        &tile_layout,
-                    )
-                    .map_err(|err| err.into_decode_error())?;
-                }
             }
 
-            header_state.update_references(&header);
+            let tile_layout =
+                parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
+            if header.frame_is_intra {
+                parse_intra_tiles(
+                    coded_frame,
+                    &header,
+                    &compressed_header,
+                    self.probability_state.current(),
+                    &tile_layout,
+                )
+                .map_err(|err| err.into_decode_error())?;
+            }
         }
-        self.header_state = header_state;
 
+        self.header_state.update_references(&header);
         Err(DecodeError::Unimplemented)
     }
 
-    pub fn reset(&mut self) {
-        self.header_state = HeaderParserState::new();
-        self.probability_state.reset();
-    }
-
-    fn validate_frame_limits<SinkError>(
+    fn validate_frame_limits(
         &self,
         header: &header::UncompressedFrameHeader,
-    ) -> Result<(), DecodeError<SinkError>> {
-        if header.frame_width > self.options.limits.max_width
-            || header.frame_height > self.options.limits.max_height
+    ) -> Result<(), DecodeError> {
+        if header.frame_width > self.limits.max_width
+            || header.frame_height > self.limits.max_height
             || header.render_width == 0
             || header.render_height == 0
             || required_i420_len(header.frame_width, header.frame_height).is_none()
@@ -301,10 +354,10 @@ impl Decoder {
         Ok(())
     }
 
-    fn setup_frame_probability_state<SinkError>(
+    fn setup_frame_probability_state(
         &mut self,
         header: &header::UncompressedFrameHeader,
-    ) -> Result<(), DecodeError<SinkError>> {
+    ) -> Result<(), DecodeError> {
         if !header.frame_is_intra && !header.error_resilient_mode {
             return Ok(());
         }
@@ -336,6 +389,16 @@ pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {
     let chroma_height = height / 2 + height % 2;
     let chroma_plane = chroma_width.checked_mul(chroma_height)?;
     luma.checked_add(chroma_plane.checked_mul(2)?)
+}
+
+fn validate_limits(limits: DecoderLimits) -> Result<(), DecodeError> {
+    if limits.max_width == 0
+        || limits.max_height == 0
+        || required_i420_len(limits.max_width, limits.max_height).is_none()
+    {
+        return Err(DecodeError::InvalidConfig);
+    }
+    Ok(())
 }
 
 fn chroma_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -385,11 +448,9 @@ fn copy_plane(output: &mut [u8], plane: Plane<'_>) -> Result<usize, FrameCopyErr
 
 #[cfg(test)]
 mod tests {
-    use core::convert::Infallible;
-
     use super::{
-        DecodeError, Decoder, DecoderLimits, DecoderOptions, FrameInfo, FrameSink, I420Frame,
-        Plane, required_i420_len,
+        DecodeError, DecodeWorkspace, Decoder, DecoderLimits, FrameInfo, I420Frame, Plane,
+        WorkspaceRequirements, required_i420_len,
     };
 
     #[test]
@@ -411,8 +472,20 @@ mod tests {
     #[test]
     fn decoder_rejects_zero_limits() {
         assert_eq!(
-            Decoder::new(DecoderOptions::new(DecoderLimits::new(0, 720))).unwrap_err(),
+            Decoder::new(DecoderLimits::new(0, 720)).unwrap_err(),
             super::DecodeError::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn workspace_requirements_are_sized_from_limits() {
+        assert_eq!(
+            WorkspaceRequirements::new(DecoderLimits::new(16, 16)).unwrap(),
+            WorkspaceRequirements {
+                limits: DecoderLimits::new(16, 16),
+                pixel_bytes: 16 * 16 * 3 / 2 * 9,
+                mi_count: 4,
+            }
         );
     }
 
@@ -510,42 +583,32 @@ mod tests {
     }
 
     #[test]
-    fn decode_packet_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
+    fn decode_coded_frame_reaches_unimplemented_output_boundary_after_valid_intra_tile_parse() {
         let frame = minimal_lossless_key_frame();
-        let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(16, 16))).unwrap();
-        let mut sink = NullSink;
+        let mut decoder = Decoder::new(DecoderLimits::new(16, 16)).unwrap();
+        let mut workspace = DecodeWorkspace::placeholder();
 
         assert_eq!(
-            decoder.decode_packet(&frame, &mut sink),
+            decoder.decode_coded_frame(&frame, &mut workspace),
             Err(DecodeError::Unimplemented)
         );
     }
 
     #[test]
-    fn decode_packet_parses_inter_compressed_header_before_unimplemented_boundary() {
+    fn decode_coded_frame_parses_inter_compressed_header_before_unimplemented_boundary() {
         let key_frame = minimal_lossless_key_frame();
         let inter_frame = minimal_lossless_inter_frame();
-        let mut decoder = Decoder::new(DecoderOptions::new(DecoderLimits::new(16, 16))).unwrap();
-        let mut sink = NullSink;
+        let mut decoder = Decoder::new(DecoderLimits::new(16, 16)).unwrap();
+        let mut workspace = DecodeWorkspace::placeholder();
 
         assert_eq!(
-            decoder.decode_packet(&key_frame, &mut sink),
+            decoder.decode_coded_frame(&key_frame, &mut workspace),
             Err(DecodeError::Unimplemented)
         );
         assert_eq!(
-            decoder.decode_packet(&inter_frame, &mut sink),
+            decoder.decode_coded_frame(&inter_frame, &mut workspace),
             Err(DecodeError::Unimplemented)
         );
-    }
-
-    struct NullSink;
-
-    impl FrameSink for NullSink {
-        type Error = Infallible;
-
-        fn frame(&mut self, _frame: I420Frame<'_>) -> Result<(), Self::Error> {
-            Ok(())
-        }
     }
 
     fn minimal_lossless_key_frame() -> [u8; 128] {

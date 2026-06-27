@@ -33,7 +33,7 @@ pub(crate) enum TileSyntaxError {
 }
 
 impl TileSyntaxError {
-    pub(crate) const fn into_decode_error<SinkError>(self) -> DecodeError<SinkError> {
+    pub(crate) const fn into_decode_error(self) -> DecodeError {
         match self {
             Self::InvalidBitstream => DecodeError::InvalidBitstream,
             Self::Unimplemented => DecodeError::Unimplemented,

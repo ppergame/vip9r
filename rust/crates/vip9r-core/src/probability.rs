@@ -112,10 +112,6 @@ impl ProbabilityState {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
-        *self = Self::new();
-    }
-
     pub(crate) fn setup_past_independence(&mut self) {
         self.current = FrameContext::DEFAULT;
     }

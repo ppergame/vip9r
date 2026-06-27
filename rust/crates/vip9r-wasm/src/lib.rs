@@ -33,5 +33,5 @@ pub extern "C" fn vip9r_decode_frame(
     output_len: usize,
 ) -> i32 {
     let _ = (input_ptr, input_len, output_ptr, output_len);
-    vip9r_core::DecodeError::<core::convert::Infallible>::Unimplemented.code()
+    vip9r_core::DecodeError::Unimplemented.code()
 }
