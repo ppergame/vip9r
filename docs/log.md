@@ -2,13 +2,10 @@
 
 Human-facing narrative of decoder implementation and optimization progress.
 Compact and legible. Record accepted implementation blocks, correctness
-milestones, and measured optimization results. Each entry should cite the VCS
-rev/change it describes. Keep routine task mechanics in `docs/design.md` or
-`docs/tracker.md`, not here.
+milestones, and measured optimization results.
 
 ## 2026-06-22 — VP9 packet front end
 
-- rev: jj `nurttsnw`
 - Added the first grinder-produced decoder block: fixed-bit parsing,
   superframe splitting, and VP9 profile 0 / 8-bit uncompressed header parsing
   through `header_size_in_bytes`.
@@ -20,7 +17,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-22 — VP9 tile payload layout
 
-- rev: jj `wzkluspu`
 - Added allocation-free tile payload layout validation after uncompressed header
   parsing: MI bounds, raster tile descriptors, and non-final little-endian tile
   size prefixes.
@@ -32,7 +28,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-22 — VP9 boolean decoder primitive
 
-- rev: jj `zrsknxmt`
 - Added the internal allocation-free VP9 boolean decoder primitive for future
   compressed-header and tile syntax parsing: init marker validation,
   probability-coded bools, literals, renormalization underflow checks, and exit
@@ -44,7 +39,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-22 — VP9 entropy header prerequisites
 
-- rev: jj `opnyvxto`
 - Retained uncompressed-header fields needed by compressed-header parsing:
   frame-context flags/index, high-precision MV, interpolation filter,
   quantizer deltas, and `lossless`.
@@ -55,7 +49,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-24 — VP9 intra compressed headers
 
-- rev: jj `qpvprvyy`
 - Added the first compressed-header block for key and intra-only frames:
   transform mode parsing, tx/skip/coef probability updates, subexponential
   probability remapping, and retained default frame probability state.
@@ -69,7 +62,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-24 — VP9 intra tile mode info
 
-- rev: jj `kmtukkoy`
 - Added key/intra tile boolean syntax through the residual handoff: partition
   tree decoding, fixed key-frame partition/Y/UV probability tables, above/left
   partition and mode contexts, skip and transform-size parsing, and
@@ -83,7 +75,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-24 — VP9 intra residual tokens
 
-- rev: jj `nsvwpklx`
 - Added parse-only residual traversal for segmentation-disabled key/intra
   frames: UV transform sizing, plane block sizing, scan selection, coefficient
   token parsing, extra coefficient bits, sign-bit consumption, and above/left
@@ -97,7 +88,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-24 — VP9 inter compressed headers
 
-- rev: jj `rtoszqvl`
 - Added inter-frame compressed-header parsing through non-coef probability
   updates: inter mode, switchable interpolation filter, intra/inter, reference
   mode/reference probabilities, Y mode, partition, and MV probabilities.
@@ -109,7 +99,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 inter tile syntax
 
-- rev: jj `tpsrpqpp`
 - Added parse-only inter-frame tile traversal: inter partition probabilities,
   mode-info syntax, reference-frame selection, interpolation filters, motion
   vector syntax/prediction scaffolding, intra blocks inside inter frames, and
@@ -124,7 +113,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 syntax counts and probability refresh
 
-- rev: jj `zoyuowll`
 - Added syntax count accumulation for the parse-only tile path and VP9 backward
   probability refresh for coefficient, non-coefficient, and MV probability
   state.
@@ -136,7 +124,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 previous-frame MV candidates
 
-- rev: jj `ukpxsptp`
 - Added previous-frame mode/MV history for the host tile parser and wired
   `UsePrevFrameMvs` into inter-frame MV reference discovery.
 - `Decoder::decode_coded_frame` now records the current frame's per-MI
@@ -147,7 +134,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 exact mode history for MV refs
 
-- rev: jj `upsntwvy`
 - Replaced the 1-D above/left-context approximation for current-frame MV
   reference candidates with exact per-MI mode-history lookup when that grid is
   available, and retained sub-block MVs for sub-8x8 candidate extraction.
@@ -158,7 +144,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 mode history in workspace
 
-- rev: jj `rysswwlv`
 - Moved previous/current frame mode-history storage out of std-only `Vec`s and
   into `DecodeWorkspace` as two packed byte slots, so host and no-std/wasm use
   the same previous-frame MV candidate path.
@@ -170,7 +155,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 shaped frame output plumbing
 
-- rev: jj `trsuoxlz`
 - Added neutral I420 output plumbing backed by the existing workspace frame
   pool: current-frame fill, reference-slot refresh/copy, `show_existing_frame`
   output, and visible plane descriptors for host and wasm consumers.
@@ -181,7 +165,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 residual coefficient/dequant model
 
-- rev: jj `rslsszuu`
 - Added a transform-block residual data model that stores signed quantized
   coefficients in raster position order, retains transform metadata, and
   dequantizes profile 0 / 8-bit blocks with spec-derived DC/AC quant tables.
@@ -195,7 +178,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 inverse transform kernels
 
-- rev: jj `qqpwnruk`
 - Added no-allocation inverse transform support for the profile 0 / 8-bit
   residual path: 4/8/16/32 IDCT, 4/8/16 IADST, and lossless 4x4 IWHT.
 - `decode_residual` now dequantizes and inverse-transforms each parsed
@@ -207,7 +189,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 intra prediction and reconstruction
 
-- rev: jj `voszzszr`
 - Added current-frame intra prediction and reconstruction for profile 0 / 8-bit
   blocks: default current-frame initialization, mutable current-frame tile
   plumbing, all ten VP9 intra predictors, skipped-block prediction, and
@@ -219,7 +200,6 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
 
 ## 2026-06-27 — VP9 inter prediction from references
 
-- rev: jj `ylwlpmpo`
 - Added profile 0 / 8-bit inter prediction from workspace reference slots:
   logical LAST/GOLDEN/ALTREF mapping through `ref_frame_idx`, read-only
   reference-plane views, luma/chroma MV selection, MV clamping/scaling,

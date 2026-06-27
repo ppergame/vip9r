@@ -118,7 +118,7 @@ moment the session is done.
     - Put log changes in the implementation commit where it makes sense
 
 The grinder is a batch job. It is ok for the orchestrator to poll it at the
-maximum allowed interval.
+maximum supported interval.
 
 Previous orchestrator infra failures:
 
