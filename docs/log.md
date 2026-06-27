@@ -178,3 +178,17 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   `--allow-mismatch` passes with 82 md5 mismatches and no missing/extra frames;
   strict md5 still fails because prediction, inverse transform, reconstruction,
   and loop filtering remain unimplemented.
+
+## 2026-06-27 — VP9 residual coefficient/dequant model
+
+- rev: jj `rslsszuu`
+- Added a transform-block residual data model that stores signed quantized
+  coefficients in raster position order, retains transform metadata, and
+  dequantizes profile 0 / 8-bit blocks with spec-derived DC/AC quant tables.
+- `TileParser::tokens` now captures coefficient magnitudes/signs and
+  `decode_residual` dequantizes each parsed non-skipped transform block before
+  dropping it at the next M1 boundary. Neutral frame output remains intentionally
+  md5-wrong until inverse transforms, prediction, reconstruction, and loop
+  filtering land.
+- Smoke still passes with 82 md5 mismatches; strict still fails with 82 md5
+  mismatches and no missing/extra frames.

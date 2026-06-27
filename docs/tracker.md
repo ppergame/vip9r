@@ -62,7 +62,7 @@ harness.
 - [x] shaped frame-pool/reference output plumbing with neutral pixels, so host
       and wasm smoke runs have shown-frame cadence instead of missing output
 - [x] decompose the remaining pixel path into first-pass reviewable blocks
-- [ ] residual coefficient storage and dequantization data model
+- [x] residual coefficient storage and dequantization data model
 - [ ] inverse transform kernels for the profile 0 / 8-bit subset
 - [ ] intra prediction and reconstruction into the current frame
 - [ ] inter prediction from reference frame slots

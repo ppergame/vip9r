@@ -10,7 +10,9 @@ use crate::probability::{
 };
 use crate::tile::{TileDescriptor, TileLayout};
 
+mod residual;
 mod tables;
+use residual::{FrameDequant, TransformCoefficients};
 use tables::*;
 
 // Above contexts are column-indexed, not frame-MI indexed. 512 MI columns covers
@@ -106,6 +108,7 @@ pub(crate) fn parse_intra_tiles(
             use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: header.lossless,
+            dequant: FrameDequant::from_header(header),
             frame_mis: (mi_rows, mi_cols),
         };
         parse_tile(
@@ -158,6 +161,7 @@ pub(crate) fn parse_inter_tiles(
             use_prev_frame_mvs: mode_buffers.use_prev_frame_mvs,
             ref_frame_sign_bias: header.ref_frame_sign_bias,
             lossless: header.lossless,
+            dequant: FrameDequant::from_header(header),
             frame_mis: (mi_rows, mi_cols),
         };
         parse_tile(
@@ -185,6 +189,7 @@ struct TileParserConfig {
     use_prev_frame_mvs: bool,
     ref_frame_sign_bias: [bool; 4],
     lossless: bool,
+    dequant: FrameDequant,
     frame_mis: (usize, usize),
 }
 
@@ -233,6 +238,7 @@ fn parse_tile(
         use_prev_frame_mvs: config.use_prev_frame_mvs,
         ref_frame_sign_bias: config.ref_frame_sign_bias,
         lossless: config.lossless,
+        dequant: config.dequant,
         mi_rows,
         mi_cols,
         tile_col_start,
@@ -278,6 +284,7 @@ struct TileParser<'a, 'b> {
     use_prev_frame_mvs: bool,
     ref_frame_sign_bias: [bool; 4],
     lossless: bool,
+    dequant: FrameDequant,
     mi_rows: usize,
     mi_cols: usize,
     tile_col_start: usize,
@@ -1492,7 +1499,7 @@ impl TileParser<'_, '_> {
                         .ok_or(TileSyntaxError::InvalidBitstream)?;
                     let mut nonzero = false;
                     if start_x < max_x && start_y < max_y && !block.skip {
-                        nonzero = self.tokens(
+                        let coefficients = self.tokens(
                             plane,
                             (start_x, start_y),
                             tx_size,
@@ -1500,6 +1507,8 @@ impl TileParser<'_, '_> {
                             mi_size,
                             block,
                         )?;
+                        nonzero = coefficients.nonzero_context();
+                        let _dequantized = self.dequant.dequantize(&coefficients);
                     }
 
                     self.contexts.update_nonzero_context(
@@ -1535,9 +1544,10 @@ impl TileParser<'_, '_> {
         block_idx: usize,
         mi_size: BlockSize,
         block: DecodedBlockInfo,
-    ) -> Result<bool, TileSyntaxError> {
+    ) -> Result<TransformCoefficients, TileSyntaxError> {
         let seg_eob = 16usize << (tx_size.index() << 1);
         let tx_type = self.get_tx_type(plane, tx_size, block_idx, mi_size, block)?;
+        let mut coefficients = TransformCoefficients::new(plane, start, tx_size, tx_type)?;
         let mut token_cache = [0u8; MAX_TX_COEFFS];
         let mut check_eob = true;
         let mut c = 0usize;
@@ -1566,15 +1576,17 @@ impl TileParser<'_, '_> {
             if token == CoefToken::Zero {
                 check_eob = false;
             } else {
-                let _coef = self.read_coef(token)?;
-                let _sign_bit = self.decoder.read_literal(1)?;
+                let coef = self.read_coef(token)?;
+                let sign_bit = self.decoder.read_literal(1)?;
+                coefficients.set_signed(pos, coef, sign_bit)?;
                 check_eob = true;
             }
 
             c = c.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?;
         }
 
-        Ok(c > 0)
+        coefficients.set_eob(c)?;
+        Ok(coefficients)
     }
 
     fn get_tx_type(
@@ -3819,11 +3831,12 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 
 #[cfg(test)]
 mod tests {
+    use super::residual::{FrameDequant, TransformCoefficients};
     use super::{
         BlockSize, CoefToken, DecodedBlockInfo, FrameModeBuffers, INTRA_FRAME, IntraMode,
         LAST_FRAME, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
         NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, StoredModeInfo,
-        TileModeContexts, TileParser, TileSyntaxError, TxSize, ZEROMV, mode_info_byte_len,
+        TileModeContexts, TileParser, TileSyntaxError, TxSize, TxType, ZEROMV, mode_info_byte_len,
         parse_intra_tiles,
     };
     use crate::boolcoder::BoolDecoder;
@@ -3881,6 +3894,7 @@ mod tests {
                 use_prev_frame_mvs: false,
                 ref_frame_sign_bias: [false; 4],
                 lossless: true,
+                dequant: FrameDequant::new(0, 0, 0, 0),
                 mi_rows: 1,
                 mi_cols: 1,
                 tile_col_start: 0,
@@ -3923,6 +3937,7 @@ mod tests {
             use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
+            dequant: FrameDequant::new(0, 0, 0, 0),
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -3932,7 +3947,7 @@ mod tests {
             current_frame_modes: None,
         };
 
-        let nonzero = parser
+        let coefficients = parser
             .tokens(
                 0,
                 (0, 0),
@@ -3943,9 +3958,110 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!nonzero);
+        assert!(!coefficients.nonzero_context());
+        assert_eq!(coefficients.eob, 0);
+        assert_eq!(coefficients.coefficients[..16], [0; 16]);
         assert_eq!(parser.decoder.bit_offset(), 1);
         assert_eq!(parser.decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn token_sign_bits_store_coefficients_in_raster_position_order() {
+        let probabilities = sign_bit_test_probabilities();
+
+        for (data, expected) in [([0x01, 0x80], 1), ([0x40, 0x80], -1)] {
+            let mut contexts = TileModeContexts::new(1).unwrap();
+            let mut counts = SyntaxCounts::default();
+            let mut parser = TileParser {
+                decoder: BoolDecoder::new(&data).unwrap(),
+                probabilities: &probabilities,
+                counts: &mut counts,
+                contexts: &mut contexts,
+                tx_mode: TxMode::Only4x4,
+                frame_is_intra: true,
+                reference_mode: ReferenceMode::Single,
+                compound_reference: None,
+                interpolation_filter: None,
+                allow_high_precision_mv: false,
+                use_prev_frame_mvs: false,
+                ref_frame_sign_bias: [false; 4],
+                lossless: true,
+                dequant: FrameDequant::new(0, 0, 0, 0),
+                mi_rows: 1,
+                mi_cols: 1,
+                tile_col_start: 0,
+                tile_col_end: 1,
+                left_row_base: 0,
+                prev_frame_modes: None,
+                current_frame_modes: None,
+            };
+
+            let coefficients = parser
+                .tokens(
+                    0,
+                    (4, 8),
+                    TxSize::Tx4x4,
+                    0,
+                    BlockSize::Block8x8,
+                    test_block(false),
+                )
+                .unwrap();
+
+            assert!(coefficients.nonzero_context());
+            assert_eq!(coefficients.eob, 2);
+            assert_eq!(coefficients.block.plane, 0);
+            assert_eq!(coefficients.block.start, (4, 8));
+            assert_eq!(coefficients.block.tx_size, TxSize::Tx4x4);
+            assert_eq!(coefficients.block.tx_type, TxType::DctDct);
+            assert_eq!(coefficients.coefficients[0], 0);
+            assert_eq!(coefficients.coefficients[1], 0);
+            assert_eq!(coefficients.coefficients[4], expected);
+            assert_eq!(parser.decoder.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn dequant_helpers_clip_q_indexes() {
+        assert_eq!(FrameDequant::new(0, -99, 0, 0).get_dc_quant(0), 4);
+        assert_eq!(FrameDequant::new(255, 0, 0, 99).get_ac_quant(1), 1828);
+    }
+
+    #[test]
+    fn dequant_helpers_apply_y_and_uv_deltas() {
+        let dequant = FrameDequant::new(4, 2, 4, 5);
+
+        assert_eq!(dequant.get_dc_quant(0), 12);
+        assert_eq!(dequant.get_ac_quant(0), 11);
+        assert_eq!(dequant.get_dc_quant(1), 13);
+        assert_eq!(dequant.get_ac_quant(2), 16);
+    }
+
+    #[test]
+    fn dequantize_uses_dc_ac_quantizers_and_tx32_dq_denom() {
+        let dequant = FrameDequant::new(4, 2, 0, 0);
+        let mut tx16 =
+            TransformCoefficients::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct).unwrap();
+        tx16.set_quantized(0, 2).unwrap();
+        tx16.set_quantized(1, 4).unwrap();
+        tx16.set_eob(2).unwrap();
+
+        let output16 = dequant.dequantize(&tx16);
+        assert_eq!(output16.block, tx16.block);
+        assert_eq!(output16.eob, 2);
+        assert_eq!(output16.coefficients[0], 24);
+        assert_eq!(output16.coefficients[1], 44);
+
+        let mut tx32 =
+            TransformCoefficients::new(0, (8, 16), TxSize::Tx32x32, TxType::DctDct).unwrap();
+        tx32.set_quantized(0, 2).unwrap();
+        tx32.set_quantized(1, 4).unwrap();
+        tx32.set_eob(2).unwrap();
+
+        let output32 = dequant.dequantize(&tx32);
+        assert_eq!(output32.block, tx32.block);
+        assert_eq!(output32.eob, 2);
+        assert_eq!(output32.coefficients[0], 12);
+        assert_eq!(output32.coefficients[1], 22);
     }
 
     #[test]
@@ -3967,6 +4083,7 @@ mod tests {
             use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
+            dequant: FrameDequant::new(0, 0, 0, 0),
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -3996,6 +4113,7 @@ mod tests {
             use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
+            dequant: FrameDequant::new(0, 0, 0, 0),
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -4092,6 +4210,7 @@ mod tests {
             use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
+            dequant: FrameDequant::new(0, 0, 0, 0),
             mi_rows: 8,
             mi_cols: 8,
             tile_col_start: 0,
@@ -4168,6 +4287,26 @@ mod tests {
             compressed_header_offset: 0,
             tile_data_offset: 1,
         }
+    }
+
+    fn sign_bit_test_probabilities() -> FrameContext {
+        let mut probabilities = FrameContext::DEFAULT;
+        let tx = TxSize::Tx4x4.index();
+        let plane_type = 0;
+        let ref_type = 0;
+
+        // Scan c=0: read more_coefs=1, then a ZERO token at raster position 0.
+        probabilities.coef_probs[tx][plane_type][ref_type][0][0][0] = 0;
+        probabilities.coef_probs[tx][plane_type][ref_type][0][0][1] = 255;
+
+        // Scan c=1 has raster position 4 for DCT_DCT 4x4. Since the prior
+        // token was ZERO, there is no more_coefs bit before this token. Force a
+        // ONE token, then force more_coefs=0 at c=2.
+        probabilities.coef_probs[tx][plane_type][ref_type][1][0][0] = 255;
+        probabilities.coef_probs[tx][plane_type][ref_type][1][0][1] = 0;
+        probabilities.coef_probs[tx][plane_type][ref_type][1][0][2] = 255;
+
+        probabilities
     }
 
     fn test_block(skip: bool) -> DecodedBlockInfo {
