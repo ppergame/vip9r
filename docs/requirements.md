@@ -121,7 +121,9 @@ The grinder is a batch job. It is ok for the orchestrator to poll it at the
 maximum allowed interval.
 
 Previous orchestrator infra failures:
-- grinder fails on turn one: malformed `tool_search` arguments with a garbage 1255-character property name; API rejected the turn
+
+- grinder fails on turn one: malformed `tool_search` arguments with a garbage
+  1255-character property name; API rejected the turn
   - verdict: retry three times
 
 ### Codex implementor
@@ -149,5 +151,5 @@ Orchestrator writes a task file then runs
 `nix run .#grinder -- run temp/task-<slug>.md`. The script puts together an
 implementor sandbox, including system prompt, task prompt and a copy of the Rust
 code. When the agent is done, the script will print a location like
-`temp/grinder.XXXXXX`. These directories are transient and the orchestrator
-deletes any stale ones. Preserve `temp/traces/` for auditing.
+`temp/grinder.XXXXXX`. These directories and the task files are transient and
+the orchestrator deletes any stale ones. Preserve `temp/traces/` for auditing.
