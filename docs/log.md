@@ -204,3 +204,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   reconstruction, inter reference pixels, and loop filtering land.
 - Smoke still passes with 82 md5 mismatches; strict still fails with 82 md5
   mismatches and no missing/extra frames.
+
+## 2026-06-27 — VP9 intra prediction and reconstruction
+
+- rev: jj `voszzszr`
+- Added current-frame intra prediction and reconstruction for profile 0 / 8-bit
+  blocks: default current-frame initialization, mutable current-frame tile
+  plumbing, all ten VP9 intra predictors, skipped-block prediction, and
+  inverse-transformed residual add/clip for intra-coded transform blocks.
+- Inter-coded blocks intentionally remain default-filled until the inter
+  prediction/reference-sampling block lands, so full-frame md5 remains wrong.
+- Host and wasm smoke pass with 82 shown frames and md5 mismatches only; strict
+  host golden still fails with 82 md5 mismatches and no missing/extra frames.

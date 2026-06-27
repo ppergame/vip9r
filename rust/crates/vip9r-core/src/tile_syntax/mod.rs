@@ -1,4 +1,5 @@
 use crate::DecodeError;
+use crate::PlaneShape;
 use crate::boolcoder::BoolDecoder;
 use crate::compressed_header::{
     CompoundReferenceSetup, CompressedHeader, InterReferenceFrame, ReferenceMode, TxMode,
@@ -12,7 +13,7 @@ use crate::tile::{TileDescriptor, TileLayout};
 
 mod residual;
 mod tables;
-use residual::{FrameDequant, TransformCoefficients};
+use residual::{DequantizedCoefficients, FrameDequant, TransformCoefficients};
 use tables::*;
 
 // Above contexts are column-indexed, not frame-MI indexed. 512 MI columns covers
@@ -32,6 +33,8 @@ const PARTITION_TYPES: usize = 4;
 const SUBSAMPLING_X: usize = 1;
 const SUBSAMPLING_Y: usize = 1;
 const MAX_TX_COEFFS: usize = 1024;
+const MAX_TX_WIDTH: usize = 32;
+const MAX_INTRA_ABOVE: usize = MAX_TX_WIDTH * 2;
 const TOKEN_TREE_NODES: usize = 10;
 const REF_LISTS: usize = 2;
 const SUB_BLOCKS: usize = 4;
@@ -76,14 +79,125 @@ impl From<ParserError> for TileSyntaxError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CurrentFrameMut<'a> {
+    y: CurrentPlaneMut<'a>,
+    u: CurrentPlaneMut<'a>,
+    v: CurrentPlaneMut<'a>,
+}
+
+impl<'a> CurrentFrameMut<'a> {
+    pub(crate) const fn new(
+        y: CurrentPlaneMut<'a>,
+        u: CurrentPlaneMut<'a>,
+        v: CurrentPlaneMut<'a>,
+    ) -> Self {
+        Self { y, u, v }
+    }
+
+    fn plane_mut(&mut self, plane: usize) -> Result<&mut CurrentPlaneMut<'a>, TileSyntaxError> {
+        match plane {
+            0 => Ok(&mut self.y),
+            1 => Ok(&mut self.u),
+            2 => Ok(&mut self.v),
+            _ => Err(TileSyntaxError::InvalidBitstream),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CurrentPlaneMut<'a> {
+    data: &'a mut [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+impl<'a> CurrentPlaneMut<'a> {
+    pub(crate) fn new(data: &'a mut [u8], shape: PlaneShape) -> Result<Self, TileSyntaxError> {
+        let width = usize::try_from(shape.width).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let height =
+            usize::try_from(shape.height).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        if shape.stride < width {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let len = shape
+            .stride
+            .checked_mul(height)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if data.len() < len {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        Ok(Self {
+            data,
+            width,
+            height,
+            stride: shape.stride,
+        })
+    }
+
+    fn sample_clamped(&self, x: usize, y: usize) -> Result<u8, TileSyntaxError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let x = core::cmp::min(x, self.width - 1);
+        let y = core::cmp::min(y, self.height - 1);
+        let index = y
+            .checked_mul(self.stride)
+            .and_then(|row| row.checked_add(x))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        self.data
+            .get(index)
+            .copied()
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn set_visible(&mut self, x: usize, y: usize, value: u8) -> Result<(), TileSyntaxError> {
+        if x >= self.width || y >= self.height {
+            return Ok(());
+        }
+
+        let index = y
+            .checked_mul(self.stride)
+            .and_then(|row| row.checked_add(x))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        *self
+            .data
+            .get_mut(index)
+            .ok_or(TileSyntaxError::InvalidBitstream)? = value;
+        Ok(())
+    }
+}
+
+pub(crate) struct TileParseBuffers<'a, 'm, 'f> {
+    counts: &'a mut SyntaxCounts,
+    mode_buffers: FrameModeBuffers<'m>,
+    current_frame: &'a mut CurrentFrameMut<'f>,
+}
+
+impl<'a, 'm, 'f> TileParseBuffers<'a, 'm, 'f> {
+    pub(crate) const fn new(
+        counts: &'a mut SyntaxCounts,
+        mode_buffers: FrameModeBuffers<'m>,
+        current_frame: &'a mut CurrentFrameMut<'f>,
+    ) -> Self {
+        Self {
+            counts,
+            mode_buffers,
+            current_frame,
+        }
+    }
+}
+
 pub(crate) fn parse_intra_tiles(
     frame: &[u8],
     header: &UncompressedFrameHeader,
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
-    counts: &mut SyntaxCounts,
     layout: &TileLayout,
-    mut mode_buffers: FrameModeBuffers<'_>,
+    mut buffers: TileParseBuffers<'_, '_, '_>,
 ) -> Result<(), TileSyntaxError> {
     if !header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -115,10 +229,13 @@ pub(crate) fn parse_intra_tiles(
             frame,
             tile,
             config,
-            probabilities,
-            counts,
-            &mut contexts,
-            mode_buffers.for_tile(),
+            buffers.mode_buffers.for_tile(),
+            TileParseShared {
+                probabilities,
+                counts: &mut *buffers.counts,
+                contexts: &mut contexts,
+                current_frame: &mut *buffers.current_frame,
+            },
         )?;
     }
 
@@ -130,9 +247,8 @@ pub(crate) fn parse_inter_tiles(
     header: &UncompressedFrameHeader,
     compressed_header: &CompressedHeader,
     probabilities: &FrameContext,
-    counts: &mut SyntaxCounts,
     layout: &TileLayout,
-    mut mode_buffers: FrameModeBuffers<'_>,
+    mut buffers: TileParseBuffers<'_, '_, '_>,
 ) -> Result<(), TileSyntaxError> {
     if header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -158,7 +274,7 @@ pub(crate) fn parse_inter_tiles(
             compound_reference: compressed_header.compound_reference,
             interpolation_filter: header.interpolation_filter,
             allow_high_precision_mv: header.allow_high_precision_mv,
-            use_prev_frame_mvs: mode_buffers.use_prev_frame_mvs,
+            use_prev_frame_mvs: buffers.mode_buffers.use_prev_frame_mvs,
             ref_frame_sign_bias: header.ref_frame_sign_bias,
             lossless: header.lossless,
             dequant: FrameDequant::from_header(header),
@@ -168,10 +284,13 @@ pub(crate) fn parse_inter_tiles(
             frame,
             tile,
             config,
-            probabilities,
-            counts,
-            &mut contexts,
-            mode_buffers.for_tile(),
+            buffers.mode_buffers.for_tile(),
+            TileParseShared {
+                probabilities,
+                counts: &mut *buffers.counts,
+                contexts: &mut contexts,
+                current_frame: &mut *buffers.current_frame,
+            },
         )?;
     }
 
@@ -193,15 +312,26 @@ struct TileParserConfig {
     frame_mis: (usize, usize),
 }
 
+struct TileParseShared<'a, 'f> {
+    probabilities: &'a FrameContext,
+    counts: &'a mut SyntaxCounts,
+    contexts: &'a mut TileModeContexts,
+    current_frame: &'a mut CurrentFrameMut<'f>,
+}
+
 fn parse_tile(
     frame: &[u8],
     tile: &TileDescriptor,
     config: TileParserConfig,
-    probabilities: &FrameContext,
-    counts: &mut SyntaxCounts,
-    contexts: &mut TileModeContexts,
     mode_buffers: FrameModeBuffers<'_>,
+    shared: TileParseShared<'_, '_>,
 ) -> Result<(), TileSyntaxError> {
+    let TileParseShared {
+        probabilities,
+        counts,
+        contexts,
+        current_frame,
+    } = shared;
     let (mi_rows, mi_cols) = config.frame_mis;
     let payload = frame
         .get(tile.payload_start..tile.payload_end)
@@ -255,7 +385,7 @@ fn parse_tile(
 
         let mut col = tile_col_start;
         while col < tile_col_end {
-            parser.decode_partition(row, col, BlockSize::Block64x64)?;
+            parser.decode_partition(row, col, BlockSize::Block64x64, current_frame)?;
             col = col
                 .checked_add(MI_BLOCK_64)
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
@@ -316,12 +446,42 @@ struct Sub8x8MvContext {
     ref_list: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntraPredictionContext {
+    plane: usize,
+    start_x: usize,
+    start_y: usize,
+    have_left: bool,
+    have_above: bool,
+    not_on_right: bool,
+    tx_size: TxSize,
+    block_idx: usize,
+    mi_size: BlockSize,
+    block: DecodedBlockInfo,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntraPredictionRequest {
+    mode: IntraMode,
+    have_left: bool,
+    have_above: bool,
+    size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IntraPredictionEdges {
+    above_left: u8,
+    above_row: [u8; MAX_INTRA_ABOVE],
+    left_col: [u8; MAX_TX_WIDTH],
+}
+
 impl TileParser<'_, '_> {
     fn decode_partition(
         &mut self,
         row: usize,
         col: usize,
         block_size: BlockSize,
+        current_frame: &mut CurrentFrameMut<'_>,
     ) -> Result<(), TileSyntaxError> {
         if row >= self.mi_rows || col >= self.mi_cols {
             return Ok(());
@@ -341,22 +501,27 @@ impl TileParser<'_, '_> {
         let subsize = block_size.subsize(partition)?;
 
         if !subsize.is_at_least_8x8() || partition == PartitionType::None {
-            self.decode_block(row, col, subsize)?;
+            self.decode_block(row, col, subsize, current_frame)?;
         } else if partition == PartitionType::Horz {
-            self.decode_block(row, col, subsize)?;
+            self.decode_block(row, col, subsize, current_frame)?;
             if has_rows {
-                self.decode_block(row + half_block_8x8, col, subsize)?;
+                self.decode_block(row + half_block_8x8, col, subsize, current_frame)?;
             }
         } else if partition == PartitionType::Vert {
-            self.decode_block(row, col, subsize)?;
+            self.decode_block(row, col, subsize, current_frame)?;
             if has_cols {
-                self.decode_block(row, col + half_block_8x8, subsize)?;
+                self.decode_block(row, col + half_block_8x8, subsize, current_frame)?;
             }
         } else {
-            self.decode_partition(row, col, subsize)?;
-            self.decode_partition(row, col + half_block_8x8, subsize)?;
-            self.decode_partition(row + half_block_8x8, col, subsize)?;
-            self.decode_partition(row + half_block_8x8, col + half_block_8x8, subsize)?;
+            self.decode_partition(row, col, subsize, current_frame)?;
+            self.decode_partition(row, col + half_block_8x8, subsize, current_frame)?;
+            self.decode_partition(row + half_block_8x8, col, subsize, current_frame)?;
+            self.decode_partition(
+                row + half_block_8x8,
+                col + half_block_8x8,
+                subsize,
+                current_frame,
+            )?;
         }
 
         if block_size == BlockSize::Block8x8 || partition != PartitionType::Split {
@@ -408,6 +573,7 @@ impl TileParser<'_, '_> {
         row: usize,
         col: usize,
         block_size: BlockSize,
+        current_frame: &mut CurrentFrameMut<'_>,
     ) -> Result<(), TileSyntaxError> {
         let avail_u = row > 0;
         let avail_l = col > self.tile_col_start;
@@ -416,7 +582,8 @@ impl TileParser<'_, '_> {
         } else {
             self.inter_frame_mode_info(row, col, block_size, avail_u, avail_l)?
         };
-        let has_nonzero_coefficients = self.decode_residual(row, col, block_size, block)?;
+        let has_nonzero_coefficients =
+            self.decode_residual(row, col, block_size, block, current_frame)?;
         if block.is_inter && block_size.is_at_least_8x8() && !has_nonzero_coefficients {
             block.skip = true;
         }
@@ -1447,6 +1614,7 @@ impl TileParser<'_, '_> {
         col: usize,
         mi_size: BlockSize,
         block: DecodedBlockInfo,
+        current_frame: &mut CurrentFrameMut<'_>,
     ) -> Result<bool, TileSyntaxError> {
         let bsize = if mi_size < BlockSize::Block8x8 {
             BlockSize::Block8x8
@@ -1498,18 +1666,44 @@ impl TileParser<'_, '_> {
                         .checked_add(y.checked_mul(4).ok_or(TileSyntaxError::InvalidBitstream)?)
                         .ok_or(TileSyntaxError::InvalidBitstream)?;
                     let mut nonzero = false;
-                    if start_x < max_x && start_y < max_y && !block.skip {
-                        let coefficients = self.tokens(
-                            plane,
-                            (start_x, start_y),
-                            tx_size,
-                            block_idx,
-                            mi_size,
-                            block,
-                        )?;
-                        nonzero = coefficients.nonzero_context();
-                        let mut dequantized = self.dequant.dequantize(&coefficients);
-                        dequantized.inverse_transform(self.lossless)?;
+                    if start_x < max_x && start_y < max_y {
+                        if !block.is_inter {
+                            self.predict_intra(
+                                current_frame,
+                                IntraPredictionContext {
+                                    plane,
+                                    start_x,
+                                    start_y,
+                                    have_left: col > self.tile_col_start || x > 0,
+                                    have_above: row > 0 || y > 0,
+                                    not_on_right: x
+                                        .checked_add(step)
+                                        .ok_or(TileSyntaxError::InvalidBitstream)?
+                                        < num4x4w,
+                                    tx_size,
+                                    block_idx,
+                                    mi_size,
+                                    block,
+                                },
+                            )?;
+                        }
+
+                        if !block.skip {
+                            let coefficients = self.tokens(
+                                plane,
+                                (start_x, start_y),
+                                tx_size,
+                                block_idx,
+                                mi_size,
+                                block,
+                            )?;
+                            nonzero = coefficients.nonzero_context();
+                            let mut dequantized = self.dequant.dequantize(&coefficients);
+                            dequantized.inverse_transform(self.lossless)?;
+                            if !block.is_inter {
+                                reconstruct(current_frame, &dequantized)?;
+                            }
+                        }
                     }
 
                     self.contexts.update_nonzero_context(
@@ -1535,6 +1729,39 @@ impl TileParser<'_, '_> {
         }
 
         Ok(any_nonzero)
+    }
+
+    fn predict_intra(
+        &self,
+        current_frame: &mut CurrentFrameMut<'_>,
+        context: IntraPredictionContext,
+    ) -> Result<(), TileSyntaxError> {
+        let mode = if context.plane > 0 {
+            context.block.uv_mode
+        } else if context.mi_size.is_at_least_8x8() {
+            IntraMode::from_raw(context.block.y_mode).ok_or(TileSyntaxError::InvalidBitstream)?
+        } else {
+            *context
+                .block
+                .sub_modes
+                .get(context.block_idx)
+                .ok_or(TileSyntaxError::InvalidBitstream)?
+        };
+        let size = transform_width(context.tx_size);
+        let plane = current_frame.plane_mut(context.plane)?;
+        let edges = intra_prediction_edges(plane, context)?;
+        let mut pred = [0u8; MAX_TX_COEFFS];
+        intra_predict_block(
+            IntraPredictionRequest {
+                mode,
+                have_left: context.have_left,
+                have_above: context.have_above,
+                size,
+            },
+            &edges,
+            &mut pred,
+        )?;
+        write_prediction_block(plane, context.start_x, context.start_y, size, &pred)
     }
 
     fn tokens(
@@ -1700,6 +1927,399 @@ impl TileParser<'_, '_> {
         }
 
         Ok(coef)
+    }
+}
+
+fn intra_prediction_edges(
+    plane: &CurrentPlaneMut<'_>,
+    context: IntraPredictionContext,
+) -> Result<IntraPredictionEdges, TileSyntaxError> {
+    let size = transform_width(context.tx_size);
+    let mut edges = IntraPredictionEdges {
+        above_left: 127,
+        above_row: [127; MAX_INTRA_ABOVE],
+        left_col: [129; MAX_TX_WIDTH],
+    };
+
+    if context.have_above {
+        let above_y = context
+            .start_y
+            .checked_sub(1)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for i in 0..size {
+            edges.above_row[i] = plane.sample_clamped(
+                context
+                    .start_x
+                    .checked_add(i)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                above_y,
+            )?;
+        }
+        for i in size..(2 * size) {
+            edges.above_row[i] = if context.not_on_right && context.tx_size == TxSize::Tx4x4 {
+                plane.sample_clamped(
+                    context
+                        .start_x
+                        .checked_add(i)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    above_y,
+                )?
+            } else {
+                edges.above_row[size - 1]
+            };
+        }
+        edges.above_left = if context.have_left {
+            plane.sample_clamped(
+                context
+                    .start_x
+                    .checked_sub(1)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                above_y,
+            )?
+        } else {
+            129
+        };
+    }
+
+    if context.have_left {
+        let left_x = context
+            .start_x
+            .checked_sub(1)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for i in 0..size {
+            edges.left_col[i] = plane.sample_clamped(
+                left_x,
+                context
+                    .start_y
+                    .checked_add(i)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+            )?;
+        }
+    }
+
+    Ok(edges)
+}
+
+fn intra_predict_block(
+    request: IntraPredictionRequest,
+    edges: &IntraPredictionEdges,
+    pred: &mut [u8; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    let size = request.size;
+    if !matches!(size, 4 | 8 | 16 | 32) {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    match request.mode {
+        IntraMode::Dc => dc_predict(request, edges, pred),
+        IntraMode::V => {
+            for row in 0..size {
+                for col in 0..size {
+                    pred[row * size + col] = edges.above_row[col];
+                }
+            }
+        }
+        IntraMode::H => {
+            for row in 0..size {
+                for col in 0..size {
+                    pred[row * size + col] = edges.left_col[row];
+                }
+            }
+        }
+        IntraMode::D45 => {
+            for row in 0..size {
+                for col in 0..size {
+                    let index = row
+                        .checked_add(col)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?;
+                    pred[row * size + col] = if index + 2 < size * 2 {
+                        avg3(
+                            edges.above_row[index],
+                            edges.above_row[index + 1],
+                            edges.above_row[index + 2],
+                        )
+                    } else {
+                        edges.above_row[2 * size - 1]
+                    };
+                }
+            }
+        }
+        IntraMode::D135 => {
+            pred[0] = avg3(edges.left_col[0], edges.above_left, edges.above_row[0]);
+            for (col, slot) in pred.iter_mut().enumerate().take(size).skip(1) {
+                *slot = avg3(
+                    above_with_left(edges, col as isize - 2),
+                    above_with_left(edges, col as isize - 1),
+                    edges.above_row[col],
+                );
+            }
+            if size > 1 {
+                pred[size] = avg3(edges.above_left, edges.left_col[0], edges.left_col[1]);
+            }
+            for row in 2..size {
+                pred[row * size] = avg3(
+                    edges.left_col[row - 2],
+                    edges.left_col[row - 1],
+                    edges.left_col[row],
+                );
+            }
+            for row in 1..size {
+                for col in 1..size {
+                    pred[row * size + col] = pred[(row - 1) * size + col - 1];
+                }
+            }
+        }
+        IntraMode::D117 => {
+            for (col, slot) in pred.iter_mut().enumerate().take(size) {
+                *slot = avg2(
+                    above_with_left(edges, col as isize - 1),
+                    edges.above_row[col],
+                );
+            }
+            if size > 1 {
+                pred[size] = avg3(edges.left_col[0], edges.above_left, edges.above_row[0]);
+                for col in 1..size {
+                    pred[size + col] = avg3(
+                        above_with_left(edges, col as isize - 2),
+                        above_with_left(edges, col as isize - 1),
+                        edges.above_row[col],
+                    );
+                }
+            }
+            if size > 2 {
+                pred[2 * size] = avg3(edges.above_left, edges.left_col[0], edges.left_col[1]);
+            }
+            for row in 3..size {
+                pred[row * size] = avg3(
+                    edges.left_col[row - 3],
+                    edges.left_col[row - 2],
+                    edges.left_col[row - 1],
+                );
+            }
+            for row in 2..size {
+                for col in 1..size {
+                    pred[row * size + col] = pred[(row - 2) * size + col - 1];
+                }
+            }
+        }
+        IntraMode::D153 => {
+            pred[0] = avg2(edges.left_col[0], edges.above_left);
+            for row in 1..size {
+                pred[row * size] = avg2(edges.left_col[row - 1], edges.left_col[row]);
+            }
+            if size > 1 {
+                pred[1] = avg3(edges.left_col[0], edges.above_left, edges.above_row[0]);
+                pred[size + 1] = avg3(edges.above_left, edges.left_col[0], edges.left_col[1]);
+                for row in 2..size {
+                    pred[row * size + 1] = avg3(
+                        edges.left_col[row - 2],
+                        edges.left_col[row - 1],
+                        edges.left_col[row],
+                    );
+                }
+            }
+            for (col, slot) in pred.iter_mut().enumerate().take(size).skip(2) {
+                *slot = avg3(
+                    above_with_left(edges, col as isize - 3),
+                    above_with_left(edges, col as isize - 2),
+                    above_with_left(edges, col as isize - 1),
+                );
+            }
+            for row in 1..size {
+                for col in 2..size {
+                    pred[row * size + col] = pred[(row - 1) * size + col - 2];
+                }
+            }
+        }
+        IntraMode::D207 => {
+            for col in 0..size {
+                pred[(size - 1) * size + col] = edges.left_col[size - 1];
+            }
+            for row in 0..size - 1 {
+                pred[row * size] = avg2(edges.left_col[row], edges.left_col[row + 1]);
+            }
+            for row in 0..size - 2 {
+                pred[row * size + 1] = avg3(
+                    edges.left_col[row],
+                    edges.left_col[row + 1],
+                    edges.left_col[row + 2],
+                );
+            }
+            pred[(size - 2) * size + 1] =
+                avg3_last_weighted(edges.left_col[size - 2], edges.left_col[size - 1]);
+            for col in 2..size {
+                for row in (0..=size - 2).rev() {
+                    pred[row * size + col] = pred[(row + 1) * size + col - 2];
+                }
+            }
+        }
+        IntraMode::D63 => {
+            for row in 0..size {
+                for col in 0..size {
+                    let index = row / 2 + col;
+                    pred[row * size + col] = if row & 1 != 0 {
+                        avg3(
+                            edges.above_row[index],
+                            edges.above_row[index + 1],
+                            edges.above_row[index + 2],
+                        )
+                    } else {
+                        avg2(edges.above_row[index], edges.above_row[index + 1])
+                    };
+                }
+            }
+        }
+        IntraMode::Tm => {
+            for row in 0..size {
+                for col in 0..size {
+                    pred[row * size + col] = clip1(
+                        i32::from(edges.above_row[col]) + i32::from(edges.left_col[row])
+                            - i32::from(edges.above_left),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn dc_predict(
+    request: IntraPredictionRequest,
+    edges: &IntraPredictionEdges,
+    pred: &mut [u8; MAX_TX_COEFFS],
+) {
+    let size = request.size;
+    let log2_size = tx_width_log2(size);
+    let value = if request.have_left && request.have_above {
+        let mut sum = 0u32;
+        for i in 0..size {
+            sum += u32::from(edges.left_col[i]) + u32::from(edges.above_row[i]);
+        }
+        ((sum + size as u32) >> (log2_size + 1)) as u8
+    } else if request.have_left {
+        let mut sum = 0u32;
+        for i in 0..size {
+            sum += u32::from(edges.left_col[i]);
+        }
+        ((sum + (1u32 << (log2_size - 1))) >> log2_size) as u8
+    } else if request.have_above {
+        let mut sum = 0u32;
+        for i in 0..size {
+            sum += u32::from(edges.above_row[i]);
+        }
+        ((sum + (1u32 << (log2_size - 1))) >> log2_size) as u8
+    } else {
+        128
+    };
+
+    for row in 0..size {
+        for col in 0..size {
+            pred[row * size + col] = value;
+        }
+    }
+}
+
+fn write_prediction_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    start_x: usize,
+    start_y: usize,
+    size: usize,
+    pred: &[u8; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    for row in 0..size {
+        let y = start_y
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for col in 0..size {
+            let x = start_x
+                .checked_add(col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            plane.set_visible(x, y, pred[row * size + col])?;
+        }
+    }
+    Ok(())
+}
+
+fn reconstruct(
+    current_frame: &mut CurrentFrameMut<'_>,
+    dequantized: &DequantizedCoefficients,
+) -> Result<(), TileSyntaxError> {
+    let plane = current_frame.plane_mut(dequantized.block.plane)?;
+    add_residual_block(
+        plane,
+        dequantized.block.start,
+        dequantized.block.tx_size,
+        &dequantized.coefficients,
+    )
+}
+
+fn add_residual_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    tx_size: TxSize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    let size = transform_width(tx_size);
+    for row in 0..size {
+        let y = start
+            .1
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for col in 0..size {
+            let x = start
+                .0
+                .checked_add(col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if x >= plane.width || y >= plane.height {
+                continue;
+            }
+            let predicted = plane.sample_clamped(x, y)?;
+            plane.set_visible(
+                x,
+                y,
+                clip1(i32::from(predicted) + residuals[row * size + col]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn above_with_left(edges: &IntraPredictionEdges, index: isize) -> u8 {
+    if index < 0 {
+        edges.above_left
+    } else {
+        edges.above_row[index as usize]
+    }
+}
+
+fn avg2(a: u8, b: u8) -> u8 {
+    ((u16::from(a) + u16::from(b) + 1) >> 1) as u8
+}
+
+fn avg3(a: u8, b: u8, c: u8) -> u8 {
+    ((u16::from(a) + 2 * u16::from(b) + u16::from(c) + 2) >> 2) as u8
+}
+
+fn avg3_last_weighted(a: u8, b: u8) -> u8 {
+    ((u16::from(a) + 3 * u16::from(b) + 2) >> 2) as u8
+}
+
+fn clip1(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+const fn transform_width(tx_size: TxSize) -> usize {
+    4 << tx_size.index()
+}
+
+fn tx_width_log2(size: usize) -> u32 {
+    match size {
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        32 => 5,
+        _ => 0,
     }
 }
 
@@ -3834,10 +4454,12 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 mod tests {
     use super::residual::{FrameDequant, TransformCoefficients};
     use super::{
-        BlockSize, CoefToken, DecodedBlockInfo, FrameModeBuffers, INTRA_FRAME, IntraMode,
-        LAST_FRAME, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
-        NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, StoredModeInfo,
-        TileModeContexts, TileParser, TileSyntaxError, TxSize, TxType, ZEROMV, mode_info_byte_len,
+        BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
+        INTRA_FRAME, IntraMode, IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME,
+        MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector,
+        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL,
+        StoredModeInfo, TileModeContexts, TileParseBuffers, TileParser, TileSyntaxError, TxSize,
+        TxType, ZEROMV, add_residual_block, intra_predict_block, mode_info_byte_len,
         parse_intra_tiles,
     };
     use crate::boolcoder::BoolDecoder;
@@ -3847,12 +4469,170 @@ mod tests {
     use crate::tile::parse_tile_layout;
 
     #[test]
+    fn dc_prediction_covers_neighbor_availability_cases() {
+        let mut above = [0; MAX_INTRA_ABOVE];
+        above[..4].copy_from_slice(&[10, 20, 30, 40]);
+        let mut left = [0; MAX_TX_WIDTH];
+        left[..4].copy_from_slice(&[50, 60, 70, 80]);
+        let edges = IntraPredictionEdges {
+            above_left: 0,
+            above_row: above,
+            left_col: left,
+        };
+
+        assert_prediction_all(
+            IntraPredictionRequest {
+                mode: IntraMode::Dc,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            45,
+        );
+        assert_prediction_all(
+            IntraPredictionRequest {
+                mode: IntraMode::Dc,
+                have_left: true,
+                have_above: false,
+                size: 4,
+            },
+            &edges,
+            65,
+        );
+        assert_prediction_all(
+            IntraPredictionRequest {
+                mode: IntraMode::Dc,
+                have_left: false,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            25,
+        );
+        assert_prediction_all(
+            IntraPredictionRequest {
+                mode: IntraMode::Dc,
+                have_left: false,
+                have_above: false,
+                size: 4,
+            },
+            &edges,
+            128,
+        );
+    }
+
+    #[test]
+    fn vertical_and_horizontal_prediction_copy_edges() {
+        let edges = prediction_edges(0, &[1, 2, 3, 4], &[9, 8, 7, 6]);
+
+        assert_prediction(
+            IntraPredictionRequest {
+                mode: IntraMode::V,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            &[1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4],
+        );
+        assert_prediction(
+            IntraPredictionRequest {
+                mode: IntraMode::H,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            &[9, 9, 9, 9, 8, 8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6],
+        );
+    }
+
+    #[test]
+    fn true_motion_prediction_clips_to_sample_range() {
+        let edges = prediction_edges(100, &[250, 10, 100, 200], &[250, 10, 100, 0]);
+        let pred = prediction(
+            IntraPredictionRequest {
+                mode: IntraMode::Tm,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+        );
+
+        assert_eq!(pred[0], 255);
+        assert_eq!(pred[5], 0);
+        assert_eq!(pred[10], 100);
+        assert_eq!(pred[15], 100);
+    }
+
+    #[test]
+    fn directional_prediction_d45_uses_extended_above_edge() {
+        let edges = prediction_edges(0, &[10, 20, 30, 40, 50, 60, 70, 80], &[0; 4]);
+
+        assert_prediction(
+            IntraPredictionRequest {
+                mode: IntraMode::D45,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            &[
+                20, 30, 40, 50, 30, 40, 50, 60, 40, 50, 60, 70, 50, 60, 70, 80,
+            ],
+        );
+    }
+
+    #[test]
+    fn directional_prediction_d207_uses_left_edge() {
+        let edges = prediction_edges(0, &[0; 8], &[10, 20, 30, 40]);
+
+        assert_prediction(
+            IntraPredictionRequest {
+                mode: IntraMode::D207,
+                have_left: true,
+                have_above: true,
+                size: 4,
+            },
+            &edges,
+            &[
+                15, 20, 25, 30, 25, 30, 35, 38, 35, 38, 40, 40, 40, 40, 40, 40,
+            ],
+        );
+    }
+
+    #[test]
+    fn reconstruction_adds_residuals_and_clips_visible_samples() {
+        let mut data = [100u8; 16];
+        let mut residuals = [0i32; MAX_TX_COEFFS];
+        residuals[0] = 200;
+        residuals[1] = -150;
+        residuals[2] = 20;
+        residuals[15] = -1;
+
+        {
+            let mut plane =
+                CurrentPlaneMut::new(&mut data, crate::PlaneShape::new(4, 4, 4)).unwrap();
+            add_residual_block(&mut plane, (0, 0), TxSize::Tx4x4, &residuals).unwrap();
+        }
+
+        assert_eq!(data[0], 255);
+        assert_eq!(data[1], 0);
+        assert_eq!(data[2], 120);
+        assert_eq!(data[15], 99);
+    }
+
+    #[test]
     fn minimal_intra_tile_parses_residual_syntax() {
         let frame = [0u8; 32];
         let header = test_header(false);
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
         let mut counts = SyntaxCounts::default();
+        let mut current_frame_storage = TestCurrentFrame::new(16, 16);
+        let mut current_frame = current_frame_storage.as_current_frame();
 
         assert_eq!(
             parse_intra_tiles(
@@ -3860,9 +4640,12 @@ mod tests {
                 &header,
                 &compressed_header,
                 &FrameContext::DEFAULT,
-                &mut counts,
                 &layout,
-                FrameModeBuffers::current(None)
+                TileParseBuffers::new(
+                    &mut counts,
+                    FrameModeBuffers::current(None),
+                    &mut current_frame,
+                ),
             ),
             Ok(())
         );
@@ -3881,6 +4664,8 @@ mod tests {
             let decoder = BoolDecoder::new(&[0x00, 0x00]).unwrap();
             let bit_offset = decoder.bit_offset();
             let mut counts = SyntaxCounts::default();
+            let mut current_frame_storage = TestCurrentFrame::new(8, 8);
+            let mut current_frame = current_frame_storage.as_current_frame();
             let mut parser = TileParser {
                 decoder,
                 probabilities: &probabilities,
@@ -3907,7 +4692,13 @@ mod tests {
 
             assert!(
                 !parser
-                    .decode_residual(0, 0, BlockSize::Block8x8, test_block(true))
+                    .decode_residual(
+                        0,
+                        0,
+                        BlockSize::Block8x8,
+                        test_block(true),
+                        &mut current_frame
+                    )
                     .unwrap()
             );
             assert_eq!(parser.decoder.bit_offset(), bit_offset);
@@ -4235,6 +5026,8 @@ mod tests {
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
         let mut counts = SyntaxCounts::default();
+        let mut current_frame_storage = TestCurrentFrame::new(16, 16);
+        let mut current_frame = current_frame_storage.as_current_frame();
 
         assert_eq!(
             parse_intra_tiles(
@@ -4242,11 +5035,95 @@ mod tests {
                 &header,
                 &compressed_header,
                 &FrameContext::DEFAULT,
-                &mut counts,
                 &layout,
-                FrameModeBuffers::current(None)
+                TileParseBuffers::new(
+                    &mut counts,
+                    FrameModeBuffers::current(None),
+                    &mut current_frame,
+                ),
             ),
             Err(TileSyntaxError::Unimplemented)
+        );
+    }
+
+    struct TestCurrentFrame {
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+        y_shape: crate::PlaneShape,
+        uv_shape: crate::PlaneShape,
+    }
+
+    impl TestCurrentFrame {
+        fn new(width: u32, height: u32) -> Self {
+            let y_len = usize::try_from(width * height).unwrap();
+            let chroma_width = width.div_ceil(2);
+            let chroma_height = height.div_ceil(2);
+            let uv_len = usize::try_from(chroma_width * chroma_height).unwrap();
+            Self {
+                y: vec![128; y_len],
+                u: vec![128; uv_len],
+                v: vec![128; uv_len],
+                y_shape: crate::PlaneShape::new(width, height, width as usize),
+                uv_shape: crate::PlaneShape::new(
+                    chroma_width,
+                    chroma_height,
+                    chroma_width as usize,
+                ),
+            }
+        }
+
+        fn as_current_frame(&mut self) -> CurrentFrameMut<'_> {
+            CurrentFrameMut::new(
+                CurrentPlaneMut::new(&mut self.y, self.y_shape).unwrap(),
+                CurrentPlaneMut::new(&mut self.u, self.uv_shape).unwrap(),
+                CurrentPlaneMut::new(&mut self.v, self.uv_shape).unwrap(),
+            )
+        }
+    }
+
+    fn prediction_edges(above_left: u8, above: &[u8], left: &[u8]) -> IntraPredictionEdges {
+        let mut above_row = [0; MAX_INTRA_ABOVE];
+        above_row[..above.len()].copy_from_slice(above);
+        let mut left_col = [0; MAX_TX_WIDTH];
+        left_col[..left.len()].copy_from_slice(left);
+        IntraPredictionEdges {
+            above_left,
+            above_row,
+            left_col,
+        }
+    }
+
+    fn prediction(
+        request: IntraPredictionRequest,
+        edges: &IntraPredictionEdges,
+    ) -> [u8; MAX_TX_COEFFS] {
+        let mut pred = [0; MAX_TX_COEFFS];
+        intra_predict_block(request, edges, &mut pred).unwrap();
+        pred
+    }
+
+    fn assert_prediction(
+        request: IntraPredictionRequest,
+        edges: &IntraPredictionEdges,
+        expected: &[u8],
+    ) {
+        let pred = prediction(request, edges);
+        assert_eq!(&pred[..expected.len()], expected);
+    }
+
+    fn assert_prediction_all(
+        request: IntraPredictionRequest,
+        edges: &IntraPredictionEdges,
+        expected: u8,
+    ) {
+        let pred = prediction(request, edges);
+        assert!(
+            pred[..request.size * request.size]
+                .iter()
+                .all(|&sample| sample == expected),
+            "prediction was {:?}",
+            &pred[..request.size * request.size]
         );
     }
 

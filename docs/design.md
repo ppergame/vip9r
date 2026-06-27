@@ -73,8 +73,10 @@ Inside grinder sandboxes, use `/media/chromium/bear-vp9.ivf`. The harness
 defaults the golden path to the `.md5` sidecar. It exits non-zero on decode
 errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
 permits wrong frame hashes for code-complete smoke runs. The current host
-decoder parses all 82 coded frames in `bear-vp9.ivf` and emits 82 deliberately
-neutral I420 frames. Smoke mode passes with 82 md5 mismatches; strict mode fails
+decoder parses all 82 coded frames in `bear-vp9.ivf` and emits 82 shown frames.
+The pixel path now performs intra prediction/reconstruction for intra-coded
+transform blocks and leaves inter-coded blocks default-filled until inter
+prediction lands. Smoke mode passes with 82 md5 mismatches; strict mode fails
 with 82 mismatches and no missing/extra frames.
 
 The wasm driver exercises the manual boundary under d8 with the same md5
@@ -92,8 +94,9 @@ $D8_LINUX64 dist/wasm-driver/main.js -- \
 ```
 
 The current wasm driver also parses all 82 coded frames in `bear-vp9.ivf` and
-emits 82 deliberately neutral I420 frames. Decode-path wasm failures are now
-expected to be real core/no-std parity issues unless they happen before
+emits 82 shown frames with the same intra-reconstructed/default-inter pixel
+state as the host. Decode-path wasm failures are now expected to be real
+core/no-std parity issues unless they happen before
 `decode_next`, which still implicates the JS/wasm wrapper, exported ABI, input
 copying, or packet setup. The driver also accepts `--allow-mismatch`; like the
 host harness, this only permits wrong frame hashes, not missing or extra shown

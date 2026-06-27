@@ -18,8 +18,8 @@ use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
 use tile_syntax::{
-    FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len, parse_inter_tiles,
-    parse_intra_tiles,
+    CurrentFrameMut, CurrentPlaneMut, FrameModeBuffers, ModeInfoView, ModeInfoViewMut,
+    TileParseBuffers, mode_info_byte_len, parse_inter_tiles, parse_intra_tiles,
 };
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
@@ -292,13 +292,61 @@ impl<'a> DecodeWorkspace<'a> {
         Ok(())
     }
 
-    fn fill_current_neutral_i420(&mut self) -> Result<(), DecodeError> {
+    fn fill_current_default_i420(&mut self) -> Result<(), DecodeError> {
         let frame_layout = self.layout.frame_pool.frame;
         let frame = self.frame_slot_mut(FramePoolSlot::Current)?;
-        fill_frame_plane(frame, frame_layout.y, 0)?;
+        fill_frame_plane(frame, frame_layout.y, 128)?;
         fill_frame_plane(frame, frame_layout.u, 128)?;
         fill_frame_plane(frame, frame_layout.v, 128)?;
         Ok(())
+    }
+
+    fn reconstruction_buffers(
+        &mut self,
+        frame_width: u32,
+        frame_height: u32,
+        use_prev_frame_mvs: bool,
+        previous_slot: Option<ModeHistorySlot>,
+        current_slot: ModeHistorySlot,
+        mi_count: usize,
+    ) -> Result<(CurrentFrameMut<'_>, FrameModeBuffers<'_>), DecodeError> {
+        self.fill_current_default_i420()?;
+
+        let frame_pool_layout = self.layout.frame_pool;
+        let frame_layout = frame_pool_layout.frame;
+        let mode_history = self.layout.mode_history;
+        let frame_pool_end = frame_pool_layout.total_bytes();
+        let first_history = mode_history.slots[0];
+        if first_history.start != frame_pool_end {
+            return Err(DecodeError::InvalidConfig);
+        }
+        let history_end = mode_history.slots[MODE_HISTORY_SLOTS - 1].end()?;
+        if history_end > self.memory.len() {
+            return Err(DecodeError::InvalidConfig);
+        }
+
+        let (frame_pool, history_and_after) = self.memory.split_at_mut(first_history.start);
+        let current = frame_pool_layout.current;
+        let current_end = current.end()?;
+        let current_frame_bytes = frame_pool
+            .get_mut(current.start..current_end)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let current_frame =
+            current_frame_view(current_frame_bytes, frame_layout, frame_width, frame_height)?;
+
+        let history = history_and_after
+            .get_mut(..history_end - first_history.start)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let mode_buffers = Self::mode_history_buffers_from_slice(
+            mode_history,
+            history,
+            use_prev_frame_mvs,
+            previous_slot,
+            current_slot,
+            mi_count,
+        )?;
+
+        Ok((current_frame, mode_buffers))
     }
 
     fn refresh_references_from_current(
@@ -414,20 +462,26 @@ impl<'a> DecodeWorkspace<'a> {
         Ok(())
     }
 
-    fn mode_history_buffers(
-        &mut self,
+    fn mode_history_buffers_from_slice<'b>(
+        layout: ModeHistoryLayout,
+        history: &'b mut [u8],
         use_prev_frame_mvs: bool,
         previous_slot: Option<ModeHistorySlot>,
         current_slot: ModeHistorySlot,
         mi_count: usize,
-    ) -> Result<FrameModeBuffers<'_>, DecodeError> {
+    ) -> Result<FrameModeBuffers<'b>, DecodeError> {
         let previous_slot = if use_prev_frame_mvs {
             previous_slot
         } else {
             None
         };
-        let (previous, mut current) =
-            self.mode_history_views(previous_slot, current_slot, mi_count)?;
+        let (previous, mut current) = Self::mode_history_views_from_slice(
+            layout,
+            history,
+            previous_slot,
+            current_slot,
+            mi_count,
+        )?;
         current.clear();
         Ok(FrameModeBuffers::new(
             use_prev_frame_mvs && previous.is_some(),
@@ -436,34 +490,41 @@ impl<'a> DecodeWorkspace<'a> {
         ))
     }
 
-    fn mode_history_views(
-        &mut self,
+    fn mode_history_views_from_slice<'b>(
+        layout: ModeHistoryLayout,
+        history: &'b mut [u8],
         previous_slot: Option<ModeHistorySlot>,
         current_slot: ModeHistorySlot,
         mi_count: usize,
-    ) -> Result<(Option<ModeInfoView<'_>>, ModeInfoViewMut<'_>), DecodeError> {
+    ) -> Result<(Option<ModeInfoView<'b>>, ModeInfoViewMut<'b>), DecodeError> {
         if previous_slot == Some(current_slot) {
             return Err(DecodeError::InvalidConfig);
         }
 
         let frame_bytes = mode_info_byte_len(mi_count).ok_or(DecodeError::InvalidBitstream)?;
-        let slot_len = self.layout.mode_history.slot_len();
+        let slot_len = layout.slot_len();
         if frame_bytes > slot_len {
             return Err(DecodeError::ResourceLimit);
         }
 
-        let first = self.layout.mode_history.slots[0];
-        let second = self.layout.mode_history.slots[1];
+        let first = layout.slots[0];
+        let second = layout.slots[1];
         debug_assert_eq!(first.len, second.len);
         debug_assert_eq!(first.end().ok(), Some(second.start));
-
-        let history_end = second.end()?;
-        if history_end > self.memory.len() {
+        if first.end()? != second.start {
             return Err(DecodeError::InvalidConfig);
         }
 
-        let (_, history_and_after) = self.memory.split_at_mut(first.start);
-        let (first_full, history_after_first) = history_and_after.split_at_mut(first.len);
+        let base = first.start;
+        let history_end = second.end()?;
+        let history_len = history_end
+            .checked_sub(base)
+            .ok_or(DecodeError::InvalidConfig)?;
+        if history_len > history.len() {
+            return Err(DecodeError::InvalidConfig);
+        }
+
+        let (first_full, history_after_first) = history.split_at_mut(first.len);
         let (second_full, _) = history_after_first.split_at_mut(second.len);
         let first_frame = &mut first_full[..frame_bytes];
         let second_frame = &mut second_full[..frame_bytes];
@@ -497,6 +558,46 @@ fn fill_frame_plane(frame: &mut [u8], layout: PlaneLayout, value: u8) -> Result<
         .ok_or(DecodeError::InvalidConfig)?;
     plane.fill(value);
     Ok(())
+}
+
+fn current_frame_view(
+    frame: &mut [u8],
+    layout: FrameLayout,
+    width: u32,
+    height: u32,
+) -> Result<CurrentFrameMut<'_>, DecodeError> {
+    let y_len = layout.y.len();
+    let u_len = layout.u.len();
+    let v_len = layout.v.len();
+    let y_end = layout.y.end()?;
+    let u_end = layout.u.end()?;
+    if layout.y.offset != 0 || layout.u.offset != y_end || layout.v.offset != u_end {
+        return Err(DecodeError::InvalidConfig);
+    }
+
+    let (y_data, after_y) = frame.split_at_mut(y_len);
+    let (u_data, after_u) = after_y.split_at_mut(u_len);
+    let (v_data, _) = after_u.split_at_mut(v_len);
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+
+    let y = CurrentPlaneMut::new(
+        y_data,
+        PlaneShape::new(width, height, layout.y.shape.stride),
+    )
+    .map_err(|_| DecodeError::InvalidConfig)?;
+    let u = CurrentPlaneMut::new(
+        u_data,
+        PlaneShape::new(chroma_width, chroma_height, layout.u.shape.stride),
+    )
+    .map_err(|_| DecodeError::InvalidConfig)?;
+    let v = CurrentPlaneMut::new(
+        v_data,
+        PlaneShape::new(chroma_width, chroma_height, layout.v.shape.stride),
+    )
+    .map_err(|_| DecodeError::InvalidConfig)?;
+
+    Ok(CurrentFrameMut::new(y, u, v))
 }
 
 fn frame_plane(
@@ -767,41 +868,50 @@ impl Decoder {
             .previous_frame_for_mvs
             .map(|previous| previous.mode_history_slot.other())
             .unwrap_or(ModeHistorySlot::Slot0);
-        let mode_buffers = workspace.mode_history_buffers(
-            previous_slot.is_some(),
-            previous_slot,
-            current_slot,
-            mi_count,
-        )?;
+        {
+            let (mut current_frame, mode_buffers) = workspace.reconstruction_buffers(
+                header.frame_width,
+                header.frame_height,
+                previous_slot.is_some(),
+                previous_slot,
+                current_slot,
+                mi_count,
+            )?;
 
-        let tile_parse_result = if header.frame_is_intra {
-            parse_intra_tiles(
-                coded_frame,
-                &header,
-                &compressed_header,
-                self.probability_state.current(),
-                &mut self.syntax_counts,
-                &tile_layout,
-                mode_buffers,
-            )
-        } else {
-            parse_inter_tiles(
-                coded_frame,
-                &header,
-                &compressed_header,
-                self.probability_state.current(),
-                &mut self.syntax_counts,
-                &tile_layout,
-                mode_buffers,
-            )
-        };
+            let tile_parse_result = if header.frame_is_intra {
+                parse_intra_tiles(
+                    coded_frame,
+                    &header,
+                    &compressed_header,
+                    self.probability_state.current(),
+                    &tile_layout,
+                    TileParseBuffers::new(
+                        &mut self.syntax_counts,
+                        mode_buffers,
+                        &mut current_frame,
+                    ),
+                )
+            } else {
+                parse_inter_tiles(
+                    coded_frame,
+                    &header,
+                    &compressed_header,
+                    self.probability_state.current(),
+                    &tile_layout,
+                    TileParseBuffers::new(
+                        &mut self.syntax_counts,
+                        mode_buffers,
+                        &mut current_frame,
+                    ),
+                )
+            };
 
-        tile_parse_result.map_err(|err| err.into_decode_error())?;
+            tile_parse_result.map_err(|err| err.into_decode_error())?;
+        }
 
         self.refresh_probability_state(&header, &compressed_header)?;
 
         let current_reference = ReferenceSlotInfo::from_header(&header);
-        workspace.fill_current_neutral_i420()?;
         workspace.refresh_references_from_current(header.refresh_frame_flags)?;
         self.refresh_reference_info(header.refresh_frame_flags, current_reference);
         self.header_state.update_references(&header);
@@ -993,7 +1103,7 @@ fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
 mod tests {
     use super::{
         DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, OwnedWorkspace,
-        PlaneShape, WorkspaceLayout, required_i420_len,
+        PlaneShape, WorkspaceLayout, required_i420_len, split_packet,
     };
 
     #[test]
@@ -1087,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_coded_frame_outputs_neutral_i420_after_valid_shown_intra_tile_parse() {
+    fn decode_coded_frame_outputs_default_i420_after_valid_shown_intra_tile_parse() {
         let frame = minimal_lossless_key_frame_with_size(13, 15);
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
@@ -1098,7 +1208,7 @@ mod tests {
         let DecodeOutcome::Output(frame) = outcome else {
             panic!("shown key frame should output");
         };
-        assert_neutral_i420_frame(
+        assert_default_i420_frame(
             frame,
             ExpectedFrame {
                 visible_width: 13,
@@ -1110,6 +1220,51 @@ mod tests {
                 uv_stride: 8,
             },
         );
+    }
+
+    #[test]
+    fn bear_first_shown_frame_is_not_globally_default_when_media_is_available() {
+        let Ok(ivf) = std::fs::read("/media/chromium/bear-vp9.ivf") else {
+            return;
+        };
+        if ivf.len() < 44 {
+            return;
+        }
+        let width = u16::from_le_bytes([ivf[12], ivf[13]]) as u32;
+        let height = u16::from_le_bytes([ivf[14], ivf[15]]) as u32;
+        let frame_size = u32::from_le_bytes([ivf[32], ivf[33], ivf[34], ivf[35]]) as usize;
+        let Some(packet_end) = 44usize.checked_add(frame_size) else {
+            return;
+        };
+        let Some(packet) = ivf.get(44..packet_end) else {
+            return;
+        };
+
+        let layout = WorkspaceLayout::new(width, height).unwrap();
+        let mut decoder = Decoder::new(layout);
+        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
+        let ranges = split_packet(packet).unwrap();
+
+        for range in ranges.as_slice() {
+            let coded_frame = range.as_slice(packet).unwrap();
+            let mut workspace = owned_workspace.as_workspace();
+            match decoder
+                .decode_coded_frame(coded_frame, &mut workspace)
+                .unwrap()
+            {
+                DecodeOutcome::NoOutput => {}
+                DecodeOutcome::Output(frame) => {
+                    assert!(
+                        !frame.y.data.iter().all(|&sample| sample == 128)
+                            || !frame.u.data.iter().all(|&sample| sample == 128)
+                            || !frame.v.data.iter().all(|&sample| sample == 128)
+                    );
+                    return;
+                }
+            }
+        }
+
+        panic!("first bear packet did not produce a shown frame");
     }
 
     #[test]
@@ -1151,7 +1306,7 @@ mod tests {
         let DecodeOutcome::Output(frame) = outcome else {
             panic!("show_existing_frame should output");
         };
-        assert_neutral_i420_frame(
+        assert_default_i420_frame(
             frame,
             ExpectedFrame {
                 visible_width: 16,
@@ -1185,7 +1340,7 @@ mod tests {
         let DecodeOutcome::Output(frame) = outcome else {
             panic!("show_existing_frame should output refreshed hidden frame");
         };
-        assert_neutral_i420_frame(
+        assert_default_i420_frame(
             frame,
             ExpectedFrame {
                 visible_width: 16,
@@ -1210,7 +1365,7 @@ mod tests {
         uv_stride: usize,
     }
 
-    fn assert_neutral_i420_frame(frame: I420Frame<'_>, expected: ExpectedFrame) {
+    fn assert_default_i420_frame(frame: I420Frame<'_>, expected: ExpectedFrame) {
         assert_eq!(frame.info.visible_width, expected.visible_width);
         assert_eq!(frame.info.visible_height, expected.visible_height);
         assert_eq!(frame.info.render_width, expected.render_width);
@@ -1247,7 +1402,7 @@ mod tests {
             frame.v.data.len(),
             expected.uv_stride * chroma_height as usize
         );
-        assert!(frame.y.data.iter().all(|&sample| sample == 0));
+        assert!(frame.y.data.iter().all(|&sample| sample == 128));
         assert!(frame.u.data.iter().all(|&sample| sample == 128));
         assert!(frame.v.data.iter().all(|&sample| sample == 128));
     }
