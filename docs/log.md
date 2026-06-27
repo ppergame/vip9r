@@ -192,3 +192,15 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   filtering land.
 - Smoke still passes with 82 md5 mismatches; strict still fails with 82 md5
   mismatches and no missing/extra frames.
+
+## 2026-06-27 — VP9 inverse transform kernels
+
+- rev: jj `qqpwnruk`
+- Added no-allocation inverse transform support for the profile 0 / 8-bit
+  residual path: 4/8/16/32 IDCT, 4/8/16 IADST, and lossless 4x4 IWHT.
+- `decode_residual` now dequantizes and inverse-transforms each parsed
+  non-skipped transform block before dropping the local block result. Neutral
+  frame output remains intentionally md5-wrong until prediction,
+  reconstruction, inter reference pixels, and loop filtering land.
+- Smoke still passes with 82 md5 mismatches; strict still fails with 82 md5
+  mismatches and no missing/extra frames.

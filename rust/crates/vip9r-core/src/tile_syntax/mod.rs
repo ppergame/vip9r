@@ -1508,7 +1508,8 @@ impl TileParser<'_, '_> {
                             block,
                         )?;
                         nonzero = coefficients.nonzero_context();
-                        let _dequantized = self.dequant.dequantize(&coefficients);
+                        let mut dequantized = self.dequant.dequantize(&coefficients);
+                        dequantized.inverse_transform(self.lossless)?;
                     }
 
                     self.contexts.update_nonzero_context(

@@ -63,7 +63,7 @@ harness.
       and wasm smoke runs have shown-frame cadence instead of missing output
 - [x] decompose the remaining pixel path into first-pass reviewable blocks
 - [x] residual coefficient storage and dequantization data model
-- [ ] inverse transform kernels for the profile 0 / 8-bit subset
+- [x] inverse transform kernels for the profile 0 / 8-bit subset
 - [ ] intra prediction and reconstruction into the current frame
 - [ ] inter prediction from reference frame slots
 - [ ] loop filter and final reconstructed reference/output pixel path
