@@ -120,6 +120,10 @@ moment the session is done.
 The grinder is a batch job. It is ok for the orchestrator to poll it at the
 maximum allowed interval.
 
+Previous orchestrator infra failures:
+- grinder fails on turn one: malformed `tool_search` arguments with a garbage 1255-character property name; API rejected the turn
+  - verdict: try again
+
 ### Codex implementor
 
 Scope: one decoder implementation functional block or optimization strategy.
