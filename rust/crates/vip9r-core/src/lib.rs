@@ -17,7 +17,9 @@ use compressed_header::{
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
-use tile_syntax::{parse_inter_tiles, parse_intra_tiles};
+#[cfg(feature = "std")]
+use tile_syntax::StoredModeInfo;
+use tile_syntax::{FrameModeBuffers, parse_inter_tiles, parse_intra_tiles};
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
 
@@ -369,6 +371,18 @@ pub struct Decoder {
     probability_state: ProbabilityState,
     syntax_counts: SyntaxCounts,
     last_frame_type: header::FrameType,
+    previous_frame_for_mvs: Option<PreviousFrameForMvs>,
+    #[cfg(feature = "std")]
+    prev_mode_info: Vec<StoredModeInfo>,
+    #[cfg(feature = "std")]
+    curr_mode_info: Vec<StoredModeInfo>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PreviousFrameForMvs {
+    width: u32,
+    height: u32,
+    show_frame: bool,
 }
 
 impl Decoder {
@@ -379,6 +393,11 @@ impl Decoder {
             probability_state: ProbabilityState::new(),
             syntax_counts: SyntaxCounts::default(),
             last_frame_type: header::FrameType::Key,
+            previous_frame_for_mvs: None,
+            #[cfg(feature = "std")]
+            prev_mode_info: Vec::new(),
+            #[cfg(feature = "std")]
+            curr_mode_info: Vec::new(),
         }
     }
 
@@ -419,11 +438,60 @@ impl Decoder {
                 )
                 .map_err(|err| err.into_decode_error())?
             };
-
             let tile_layout =
                 parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
             self.syntax_counts.clear();
-            if header.frame_is_intra {
+            #[cfg(feature = "std")]
+            let use_prev_frame_mvs = self.use_prev_frame_mvs(&header);
+
+            #[cfg(feature = "std")]
+            let tile_parse_result = {
+                let mi_count = frame_mi_count(header.frame_width, header.frame_height)?;
+                let mut prev_mode_info = core::mem::take(&mut self.prev_mode_info);
+                let mut curr_mode_info = core::mem::take(&mut self.curr_mode_info);
+                curr_mode_info.resize(mi_count, StoredModeInfo::DEFAULT);
+                curr_mode_info.fill(StoredModeInfo::DEFAULT);
+                let prev_frame_modes = if use_prev_frame_mvs && prev_mode_info.len() == mi_count {
+                    Some(prev_mode_info.as_slice())
+                } else {
+                    None
+                };
+                let result = if header.frame_is_intra {
+                    parse_intra_tiles(
+                        coded_frame,
+                        &header,
+                        &compressed_header,
+                        self.probability_state.current(),
+                        &mut self.syntax_counts,
+                        &tile_layout,
+                        Some(curr_mode_info.as_mut_slice()),
+                    )
+                } else {
+                    let use_prev_frame_mvs = use_prev_frame_mvs && prev_frame_modes.is_some();
+                    parse_inter_tiles(
+                        coded_frame,
+                        &header,
+                        &compressed_header,
+                        self.probability_state.current(),
+                        &mut self.syntax_counts,
+                        &tile_layout,
+                        FrameModeBuffers::new(
+                            use_prev_frame_mvs,
+                            prev_frame_modes,
+                            Some(curr_mode_info.as_mut_slice()),
+                        ),
+                    )
+                };
+                if result.is_ok() {
+                    core::mem::swap(&mut prev_mode_info, &mut curr_mode_info);
+                }
+                self.prev_mode_info = prev_mode_info;
+                self.curr_mode_info = curr_mode_info;
+                result
+            };
+
+            #[cfg(not(feature = "std"))]
+            let tile_parse_result = if header.frame_is_intra {
                 parse_intra_tiles(
                     coded_frame,
                     &header,
@@ -431,8 +499,8 @@ impl Decoder {
                     self.probability_state.current(),
                     &mut self.syntax_counts,
                     &tile_layout,
+                    None,
                 )
-                .map_err(|err| err.into_decode_error())?;
             } else {
                 parse_inter_tiles(
                     coded_frame,
@@ -441,9 +509,11 @@ impl Decoder {
                     self.probability_state.current(),
                     &mut self.syntax_counts,
                     &tile_layout,
+                    FrameModeBuffers::none(),
                 )
-                .map_err(|err| err.into_decode_error())?;
-            }
+            };
+
+            tile_parse_result.map_err(|err| err.into_decode_error())?;
 
             self.refresh_probability_state(&header, &compressed_header)?;
         }
@@ -451,6 +521,11 @@ impl Decoder {
         self.header_state.update_references(&header);
         if !header.show_existing_frame {
             self.last_frame_type = header.frame_type;
+            self.previous_frame_for_mvs = Some(PreviousFrameForMvs {
+                width: header.frame_width,
+                height: header.frame_height,
+                show_frame: header.show_frame,
+            });
         }
         Ok(DecodeOutcome::NoOutput)
     }
@@ -468,6 +543,19 @@ impl Decoder {
             return Err(DecodeError::ResourceLimit);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    fn use_prev_frame_mvs(&self, header: &header::UncompressedFrameHeader) -> bool {
+        if header.error_resilient_mode || header.frame_is_intra || header.show_existing_frame {
+            return false;
+        }
+        let Some(previous) = self.previous_frame_for_mvs else {
+            return false;
+        };
+        previous.width == header.frame_width
+            && previous.height == header.frame_height
+            && previous.show_frame
     }
 
     fn setup_frame_probability_state(
@@ -549,6 +637,17 @@ pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {
     let chroma_height = height / 2 + height % 2;
     let chroma_plane = chroma_width.checked_mul(chroma_height)?;
     luma.checked_add(chroma_plane.checked_mul(2)?)
+}
+
+#[cfg(feature = "std")]
+fn frame_mi_count(width: u32, height: u32) -> Result<usize, DecodeError> {
+    let mi_cols = width.checked_add(7).ok_or(DecodeError::InvalidBitstream)? >> 3;
+    let mi_rows = height.checked_add(7).ok_or(DecodeError::InvalidBitstream)? >> 3;
+    let mi_cols = usize::try_from(mi_cols).map_err(|_| DecodeError::InvalidBitstream)?;
+    let mi_rows = usize::try_from(mi_rows).map_err(|_| DecodeError::InvalidBitstream)?;
+    mi_rows
+        .checked_mul(mi_cols)
+        .ok_or(DecodeError::InvalidBitstream)
 }
 
 fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {

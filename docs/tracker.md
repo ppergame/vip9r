@@ -53,8 +53,12 @@ harness.
 - [x] inter compressed-header parser and default non-coef/MV probability state
 - [x] inter tile partition/mode-info/MV syntax and residual parse-only
 - [x] syntax counts and adaptive probability refresh
-- [ ] resolve `bear-vp9.ivf` packet 17 inter tile syntax
+- [x] resolve `bear-vp9.ivf` packet 17 inter tile syntax
       `InvalidBitstream` after probability refresh
+- [ ] resolve `bear-vp9.ivf` packet 25 inter tile syntax
+      `InvalidBitstream` after previous-frame MV candidates
+- [ ] move previous-frame MV mode-history storage from the std-only host parser
+      path into workspace/no-std state before relying on wasm parity
 - [ ] decompose the remaining decode path into reviewable, grinder-sized blocks
 - [ ] implement each block to code-complete
 

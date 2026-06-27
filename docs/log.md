@@ -133,3 +133,14 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   coefficient update factor, and refreshes frame contexts after tile parsing.
 - Golden smoke on `bear-vp9.ivf` advances past packet 1 and now stops at
   `decode packet 17 coded frame 0: InvalidBitstream`.
+
+## 2026-06-27 — VP9 previous-frame MV candidates
+
+- rev: jj `ukpxsptp`
+- Added previous-frame mode/MV history for the host tile parser and wired
+  `UsePrevFrameMvs` into inter-frame MV reference discovery.
+- `Decoder::decode_coded_frame` now records the current frame's per-MI
+  reference/MV state after successful tile parsing and supplies it to the next
+  eligible inter frame.
+- Golden smoke on `bear-vp9.ivf` advances past packet 17 and now stops at
+  `decode packet 25 coded frame 0: InvalidBitstream`.

@@ -78,6 +78,7 @@ pub(crate) fn parse_intra_tiles(
     probabilities: &FrameContext,
     counts: &mut SyntaxCounts,
     layout: &TileLayout,
+    current_frame_modes: Option<&mut [StoredModeInfo]>,
 ) -> Result<(), TileSyntaxError> {
     if !header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -90,6 +91,7 @@ pub(crate) fn parse_intra_tiles(
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
     let mut contexts = TileModeContexts::new(mi_cols)?;
+    let mut mode_buffers = FrameModeBuffers::current(current_frame_modes);
 
     for tile in layout.as_slice() {
         let config = TileParserConfig {
@@ -99,11 +101,20 @@ pub(crate) fn parse_intra_tiles(
             compound_reference: None,
             interpolation_filter: None,
             allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: header.lossless,
             frame_mis: (mi_rows, mi_cols),
         };
-        parse_tile(frame, tile, config, probabilities, counts, &mut contexts)?;
+        parse_tile(
+            frame,
+            tile,
+            config,
+            probabilities,
+            counts,
+            &mut contexts,
+            mode_buffers.for_tile(),
+        )?;
     }
 
     Ok(())
@@ -116,6 +127,7 @@ pub(crate) fn parse_inter_tiles(
     probabilities: &FrameContext,
     counts: &mut SyntaxCounts,
     layout: &TileLayout,
+    mut mode_buffers: FrameModeBuffers<'_>,
 ) -> Result<(), TileSyntaxError> {
     if header.frame_is_intra || header.show_existing_frame {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -141,11 +153,20 @@ pub(crate) fn parse_inter_tiles(
             compound_reference: compressed_header.compound_reference,
             interpolation_filter: header.interpolation_filter,
             allow_high_precision_mv: header.allow_high_precision_mv,
+            use_prev_frame_mvs: mode_buffers.use_prev_frame_mvs,
             ref_frame_sign_bias: header.ref_frame_sign_bias,
             lossless: header.lossless,
             frame_mis: (mi_rows, mi_cols),
         };
-        parse_tile(frame, tile, config, probabilities, counts, &mut contexts)?;
+        parse_tile(
+            frame,
+            tile,
+            config,
+            probabilities,
+            counts,
+            &mut contexts,
+            mode_buffers.for_tile(),
+        )?;
     }
 
     Ok(())
@@ -159,6 +180,7 @@ struct TileParserConfig {
     compound_reference: Option<CompoundReferenceSetup>,
     interpolation_filter: Option<InterpolationFilter>,
     allow_high_precision_mv: bool,
+    use_prev_frame_mvs: bool,
     ref_frame_sign_bias: [bool; 4],
     lossless: bool,
     frame_mis: (usize, usize),
@@ -171,6 +193,7 @@ fn parse_tile(
     probabilities: &FrameContext,
     counts: &mut SyntaxCounts,
     contexts: &mut TileModeContexts,
+    mode_buffers: FrameModeBuffers<'_>,
 ) -> Result<(), TileSyntaxError> {
     let (mi_rows, mi_cols) = config.frame_mis;
     let payload = frame
@@ -205,6 +228,7 @@ fn parse_tile(
         compound_reference: config.compound_reference,
         interpolation_filter: config.interpolation_filter,
         allow_high_precision_mv: config.allow_high_precision_mv,
+        use_prev_frame_mvs: config.use_prev_frame_mvs,
         ref_frame_sign_bias: config.ref_frame_sign_bias,
         lossless: config.lossless,
         mi_rows,
@@ -212,6 +236,8 @@ fn parse_tile(
         tile_col_start,
         tile_col_end,
         left_row_base: tile_row_start,
+        prev_frame_modes: mode_buffers.prev_frame_modes,
+        current_frame_modes: mode_buffers.current_frame_modes,
     };
 
     let mut row = tile_row_start;
@@ -247,6 +273,7 @@ struct TileParser<'a, 'b> {
     compound_reference: Option<CompoundReferenceSetup>,
     interpolation_filter: Option<InterpolationFilter>,
     allow_high_precision_mv: bool,
+    use_prev_frame_mvs: bool,
     ref_frame_sign_bias: [bool; 4],
     lossless: bool,
     mi_rows: usize,
@@ -254,6 +281,8 @@ struct TileParser<'a, 'b> {
     tile_col_start: usize,
     tile_col_end: usize,
     left_row_base: usize,
+    prev_frame_modes: Option<&'b [StoredModeInfo]>,
+    current_frame_modes: Option<&'b mut [StoredModeInfo]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,6 +413,7 @@ impl TileParser<'_, '_> {
         }
         self.contexts
             .update_mode_context(self.left_row_base, row, col, block_size, block)?;
+        self.update_current_frame_modes(row, col, block_size, block)?;
         Ok(())
     }
 
@@ -481,6 +511,54 @@ impl TileParser<'_, '_> {
             .read_bool(self.probabilities.is_inter_prob[ctx])?;
         increment_count(&mut self.counts.counts_is_inter[ctx][bool_index(is_inter)]);
         Ok(is_inter)
+    }
+
+    fn update_current_frame_modes(
+        &mut self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        block: DecodedBlockInfo,
+    ) -> Result<(), TileSyntaxError> {
+        let Some(current_frame_modes) = self.current_frame_modes.as_deref_mut() else {
+            return Ok(());
+        };
+
+        let mut mvs = [MotionVector::ZERO; REF_LISTS];
+        for (ref_list, mv) in mvs.iter_mut().enumerate() {
+            *mv = block.block_mvs[ref_list][3];
+        }
+        let stored = StoredModeInfo {
+            ref_frames: block.ref_frames,
+            mvs,
+        };
+        let width = usize::from(block_size.num_8x8_wide());
+        let height = usize::from(block_size.num_8x8_high());
+        for y in 0..height {
+            let mode_row = row
+                .checked_add(y)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if mode_row >= self.mi_rows {
+                continue;
+            }
+            for x in 0..width {
+                let mode_col = col
+                    .checked_add(x)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                if mode_col >= self.mi_cols {
+                    continue;
+                }
+                let index = mode_row
+                    .checked_mul(self.mi_cols)
+                    .and_then(|value| value.checked_add(mode_col))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                let slot = current_frame_modes
+                    .get_mut(index)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                *slot = stored;
+            }
+        }
+        Ok(())
     }
 
     fn intra_block_mode_info(
@@ -1108,16 +1186,23 @@ impl TileParser<'_, '_> {
             }
         }
 
-        // Parse-only shortcut: previous-frame motion-vector candidates are not
-        // retained yet, so UsePrevFrameMvs is treated as false. The current
-        // frame's above/left candidates are still used for inter_mode contexts
-        // and MV syntax decisions.
+        if self.use_prev_frame_mvs {
+            if_same_prev_frame_add_mv(&mut state, self.prev_mv_ref_candidate(row, col)?, ref_frame);
+        }
         if different_ref_found {
             for candidate in search {
                 if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
                     if_diff_ref_frame_add_mv(&mut state, info, ref_frame, self.ref_sign_biases())?;
                 }
             }
+        }
+        if self.use_prev_frame_mvs {
+            if_diff_prev_frame_add_mv(
+                &mut state,
+                self.prev_mv_ref_candidate(row, col)?,
+                ref_frame,
+                self.ref_sign_biases(),
+            )?;
         }
 
         let mode_context = *COUNTER_TO_CONTEXT
@@ -1261,6 +1346,28 @@ impl TileParser<'_, '_> {
                 .map(|info| Some(CandidateModeInfo::from(info)));
         }
         Ok(None)
+    }
+
+    fn prev_mv_ref_candidate(
+        &self,
+        row: usize,
+        col: usize,
+    ) -> Result<Option<StoredModeInfo>, TileSyntaxError> {
+        let Some(prev_frame_modes) = self.prev_frame_modes else {
+            return Ok(None);
+        };
+        if row >= self.mi_rows || col >= self.mi_cols {
+            return Ok(None);
+        }
+        let index = row
+            .checked_mul(self.mi_cols)
+            .and_then(|value| value.checked_add(col))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        prev_frame_modes
+            .get(index)
+            .copied()
+            .map(Some)
+            .ok_or(TileSyntaxError::InvalidBitstream)
     }
 
     fn clamp_mv_ref(
@@ -1624,6 +1731,66 @@ impl From<NeighborModeInfo> for CandidateModeInfo {
             ref_frames: info.ref_frames,
             interp_filter: info.interp_filter,
             mvs: info.mvs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StoredModeInfo {
+    ref_frames: [u8; REF_LISTS],
+    mvs: [MotionVector; REF_LISTS],
+}
+
+impl StoredModeInfo {
+    #[cfg(feature = "std")]
+    pub(crate) const DEFAULT: Self = Self {
+        ref_frames: [INTRA_FRAME, NONE_FRAME],
+        mvs: [MotionVector::ZERO; REF_LISTS],
+    };
+}
+
+pub(crate) struct FrameModeBuffers<'a> {
+    use_prev_frame_mvs: bool,
+    prev_frame_modes: Option<&'a [StoredModeInfo]>,
+    current_frame_modes: Option<&'a mut [StoredModeInfo]>,
+}
+
+impl<'a> FrameModeBuffers<'a> {
+    #[cfg(not(feature = "std"))]
+    pub(crate) const fn none() -> Self {
+        Self {
+            use_prev_frame_mvs: false,
+            prev_frame_modes: None,
+            current_frame_modes: None,
+        }
+    }
+
+    pub(crate) const fn current(current_frame_modes: Option<&'a mut [StoredModeInfo]>) -> Self {
+        Self {
+            use_prev_frame_mvs: false,
+            prev_frame_modes: None,
+            current_frame_modes,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) const fn new(
+        use_prev_frame_mvs: bool,
+        prev_frame_modes: Option<&'a [StoredModeInfo]>,
+        current_frame_modes: Option<&'a mut [StoredModeInfo]>,
+    ) -> Self {
+        Self {
+            use_prev_frame_mvs,
+            prev_frame_modes,
+            current_frame_modes,
+        }
+    }
+
+    fn for_tile(&mut self) -> FrameModeBuffers<'_> {
+        FrameModeBuffers {
+            use_prev_frame_mvs: self.use_prev_frame_mvs,
+            prev_frame_modes: self.prev_frame_modes,
+            current_frame_modes: self.current_frame_modes.as_deref_mut(),
         }
     }
 }
@@ -2670,12 +2837,63 @@ fn if_same_ref_frame_add_mv(state: &mut MvRefState, info: CandidateModeInfo, ref
     }
 }
 
+fn if_same_prev_frame_add_mv(state: &mut MvRefState, info: Option<StoredModeInfo>, ref_frame: u8) {
+    let Some(info) = info else {
+        return;
+    };
+    for ref_list in 0..REF_LISTS {
+        if info.ref_frames[ref_list] == ref_frame {
+            state.add_mv_ref(info.mvs[ref_list]);
+            return;
+        }
+    }
+}
+
 fn if_diff_ref_frame_add_mv(
     state: &mut MvRefState,
     info: CandidateModeInfo,
     ref_frame: u8,
     sign_biases: [bool; 4],
 ) -> Result<(), TileSyntaxError> {
+    let same_mvs = info.mvs[0] == info.mvs[1];
+    for ref_list in 0..REF_LISTS {
+        let candidate_frame = info.ref_frames[ref_list];
+        if candidate_frame > INTRA_FRAME
+            && candidate_frame != ref_frame
+            && (ref_list == 0 || !same_mvs)
+        {
+            let mut mv = info.mvs[ref_list];
+            let candidate_bias = *sign_biases
+                .get(usize::from(candidate_frame))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let target_bias = *sign_biases
+                .get(usize::from(ref_frame))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if candidate_bias != target_bias {
+                mv.row = mv
+                    .row
+                    .checked_neg()
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                mv.col = mv
+                    .col
+                    .checked_neg()
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+            }
+            state.add_mv_ref(mv);
+        }
+    }
+    Ok(())
+}
+
+fn if_diff_prev_frame_add_mv(
+    state: &mut MvRefState,
+    info: Option<StoredModeInfo>,
+    ref_frame: u8,
+    sign_biases: [bool; 4],
+) -> Result<(), TileSyntaxError> {
+    let Some(info) = info else {
+        return Ok(());
+    };
     let same_mvs = info.mvs[0] == info.mvs[1];
     for ref_list in 0..REF_LISTS {
         let candidate_frame = info.ref_frames[ref_list];
@@ -3438,7 +3656,8 @@ mod tests {
                 &compressed_header,
                 &FrameContext::DEFAULT,
                 &mut counts,
-                &layout
+                &layout,
+                None
             ),
             Ok(())
         );
@@ -3468,6 +3687,7 @@ mod tests {
                 compound_reference: None,
                 interpolation_filter: None,
                 allow_high_precision_mv: false,
+                use_prev_frame_mvs: false,
                 ref_frame_sign_bias: [false; 4],
                 lossless: true,
                 mi_rows: 1,
@@ -3475,6 +3695,8 @@ mod tests {
                 tile_col_start: 0,
                 tile_col_end: 1,
                 left_row_base: 0,
+                prev_frame_modes: None,
+                current_frame_modes: None,
             };
 
             assert!(
@@ -3507,6 +3729,7 @@ mod tests {
             compound_reference: None,
             interpolation_filter: None,
             allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
@@ -3514,6 +3737,8 @@ mod tests {
             tile_col_start: 0,
             tile_col_end: 1,
             left_row_base: 0,
+            prev_frame_modes: None,
+            current_frame_modes: None,
         };
 
         let nonzero = parser
@@ -3548,6 +3773,7 @@ mod tests {
             compound_reference: None,
             interpolation_filter: None,
             allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
@@ -3555,6 +3781,8 @@ mod tests {
             tile_col_start: 0,
             tile_col_end: 1,
             left_row_base: 0,
+            prev_frame_modes: None,
+            current_frame_modes: None,
         };
 
         assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(5));
@@ -3574,6 +3802,7 @@ mod tests {
             compound_reference: None,
             interpolation_filter: None,
             allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             mi_rows: 1,
@@ -3581,6 +3810,8 @@ mod tests {
             tile_col_start: 0,
             tile_col_end: 1,
             left_row_base: 0,
+            prev_frame_modes: None,
+            current_frame_modes: None,
         };
 
         assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(6));
@@ -3602,7 +3833,8 @@ mod tests {
                 &compressed_header,
                 &FrameContext::DEFAULT,
                 &mut counts,
-                &layout
+                &layout,
+                None
             ),
             Err(TileSyntaxError::Unimplemented)
         );
