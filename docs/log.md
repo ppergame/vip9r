@@ -144,3 +144,14 @@ rev/change it describes. Keep routine task mechanics in `docs/design.md` or
   eligible inter frame.
 - Golden smoke on `bear-vp9.ivf` advances past packet 17 and now stops at
   `decode packet 25 coded frame 0: InvalidBitstream`.
+
+## 2026-06-27 — VP9 exact mode history for MV refs
+
+- rev: jj `upsntwvy`
+- Replaced the 1-D above/left-context approximation for current-frame MV
+  reference candidates with exact per-MI mode-history lookup when that grid is
+  available, and retained sub-block MVs for sub-8x8 candidate extraction.
+- Host golden smoke on `bear-vp9.ivf` now parses all 82 coded frames. It exits
+  at the next expected M1 boundary: no shown frames are output yet, so the
+  harness reports 82 missing frames. Wasm/no-std parity still waits on moving
+  mode-history storage into workspace state.

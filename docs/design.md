@@ -72,8 +72,9 @@ cargo run -p vip9r-tools -- golden /bulk/vip9r/chromium/bear-vp9.ivf
 Inside grinder sandboxes, use `/media/chromium/bear-vp9.ivf`. The harness
 defaults the golden path to the `.md5` sidecar. It exits non-zero on decode
 errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
-permits wrong frame hashes for code-complete smoke runs. The current decoder is
-still expected to stop at `Unimplemented`.
+permits wrong frame hashes for code-complete smoke runs. The current host
+decoder parses all 82 coded frames in `bear-vp9.ivf` and then exits with 82
+missing shown frames because reconstruction and output are still unwired.
 
 The wasm driver exercises the manual boundary under d8 with the same md5
 protocol. It is the wasm/shipping-path parity gate, but grinder implementors do
@@ -89,12 +90,13 @@ $D8_LINUX64 dist/wasm-driver/main.js -- \
   /bulk/vip9r/chromium/bear-vp9.ivf
 ```
 
-Until reconstruction exists, the expected wasm-driver failure is
-`vip9r_decode_next: unimplemented (-8)`. A failure earlier than
-`decode_next` means the JS/wasm wrapper, exported ABI, input copying, or packet
-setup regressed. The driver also accepts `--allow-mismatch`; like the host
-harness, this only permits wrong frame hashes, not missing or extra shown
-frames.
+Wasm parity is temporarily behind the host parse-only path because MV mode
+history storage is still `std`/host-owned rather than workspace-backed. Move
+that state into the no-std workspace before treating decode-path wasm failures
+as wrapper regressions. Failures before `decode_next` still implicate the
+JS/wasm wrapper, exported ABI, input copying, or packet setup. The driver also
+accepts `--allow-mismatch`; like the host harness, this only permits wrong frame
+hashes, not missing or extra shown frames.
 
 ### Decode API
 

@@ -529,8 +529,11 @@ impl TileParser<'_, '_> {
             *mv = block.block_mvs[ref_list][3];
         }
         let stored = StoredModeInfo {
+            valid: true,
+            y_mode: block.y_mode,
             ref_frames: block.ref_frames,
             mvs,
+            sub_mvs: block.block_mvs,
         };
         let width = usize::from(block_size.num_8x8_wide());
         let height = usize::from(block_size.num_8x8_high());
@@ -1324,6 +1327,21 @@ impl TileParser<'_, '_> {
             usize::try_from(candidate_r).map_err(|_| TileSyntaxError::InvalidBitstream)?;
         let candidate_c =
             usize::try_from(candidate_c).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        // MV reference searches can reach several rows/columns away from the
+        // current block.  The 1-D above/left probability contexts only describe
+        // immediate neighbours, so use the exact decoded mode grid when it is
+        // available.
+        if let Some(current_frame_modes) = self.current_frame_modes.as_deref() {
+            let index = candidate_r
+                .checked_mul(self.mi_cols)
+                .and_then(|value| value.checked_add(candidate_c))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let info = current_frame_modes
+                .get(index)
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            return Ok(info.valid.then_some(CandidateModeInfo::from(info)));
+        }
         if candidate_r < self.left_row_base {
             return self
                 .contexts
@@ -1363,11 +1381,11 @@ impl TileParser<'_, '_> {
             .checked_mul(self.mi_cols)
             .and_then(|value| value.checked_add(col))
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        prev_frame_modes
+        let info = prev_frame_modes
             .get(index)
             .copied()
-            .map(Some)
-            .ok_or(TileSyntaxError::InvalidBitstream)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        Ok(info.valid.then_some(info))
     }
 
     fn clamp_mv_ref(
@@ -1722,6 +1740,7 @@ struct CandidateModeInfo {
     ref_frames: [u8; REF_LISTS],
     interp_filter: u8,
     mvs: [MotionVector; REF_LISTS],
+    sub_mvs: [[MotionVector; SUB_BLOCKS]; REF_LISTS],
 }
 
 impl From<NeighborModeInfo> for CandidateModeInfo {
@@ -1731,21 +1750,40 @@ impl From<NeighborModeInfo> for CandidateModeInfo {
             ref_frames: info.ref_frames,
             interp_filter: info.interp_filter,
             mvs: info.mvs,
+            sub_mvs: [[info.mvs[0]; SUB_BLOCKS], [info.mvs[1]; SUB_BLOCKS]],
+        }
+    }
+}
+
+impl From<StoredModeInfo> for CandidateModeInfo {
+    fn from(info: StoredModeInfo) -> Self {
+        Self {
+            y_mode: info.y_mode,
+            ref_frames: info.ref_frames,
+            interp_filter: SWITCHABLE_FILTER_SENTINEL,
+            mvs: info.mvs,
+            sub_mvs: info.sub_mvs,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StoredModeInfo {
+    valid: bool,
+    y_mode: u8,
     ref_frames: [u8; REF_LISTS],
     mvs: [MotionVector; REF_LISTS],
+    sub_mvs: [[MotionVector; SUB_BLOCKS]; REF_LISTS],
 }
 
 impl StoredModeInfo {
     #[cfg(feature = "std")]
     pub(crate) const DEFAULT: Self = Self {
+        valid: false,
+        y_mode: IntraMode::Dc as u8,
         ref_frames: [INTRA_FRAME, NONE_FRAME],
         mvs: [MotionVector::ZERO; REF_LISTS],
+        sub_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
     };
 }
 
@@ -2819,11 +2857,9 @@ fn get_sub_block_mv(
     } else {
         3
     };
-    // Parse-only shortcut: compact neighbor storage keeps the block MV, not all
-    // four sub-block MVs, so sub-8x8 candidates use the block representative.
-    let _ = idx;
-    info.mvs
+    info.sub_mvs
         .get(ref_list)
+        .and_then(|mvs| mvs.get(idx))
         .copied()
         .ok_or(TileSyntaxError::InvalidBitstream)
 }
@@ -3631,9 +3667,10 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockSize, CoefToken, DecodedBlockInfo, INTRA_FRAME, IntraMode, MotionVector, NONE_FRAME,
-        REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, TileModeContexts, TileParser,
-        TileSyntaxError, TxSize, parse_intra_tiles,
+        BlockSize, CoefToken, DecodedBlockInfo, INTRA_FRAME, IntraMode, LAST_FRAME, MotionVector,
+        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL,
+        StoredModeInfo, TileModeContexts, TileParser, TileSyntaxError, TxSize, ZEROMV,
+        parse_intra_tiles,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -3816,6 +3853,65 @@ mod tests {
 
         assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(6));
         assert_eq!(parser.decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn mv_ref_candidate_uses_exact_current_frame_history_for_deep_offsets() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(8).unwrap();
+        let stale_mv = MotionVector { row: -3, col: 5 };
+        contexts.above_mode[4] = NeighborModeInfo {
+            y_mode: ZEROMV,
+            ref_frames: [LAST_FRAME, NONE_FRAME],
+            mvs: [stale_mv, MotionVector::ZERO],
+            ..NeighborModeInfo::DEFAULT
+        };
+
+        let exact_mv = MotionVector { row: 11, col: -7 };
+        let exact_sub_mvs = [
+            MotionVector { row: 1, col: 2 },
+            MotionVector { row: 3, col: 4 },
+            MotionVector { row: 5, col: 6 },
+            MotionVector { row: 7, col: 8 },
+        ];
+        let mut current_modes = [StoredModeInfo::DEFAULT; 64];
+        current_modes[8 + 4] = StoredModeInfo {
+            valid: true,
+            y_mode: NEARESTMV,
+            ref_frames: [LAST_FRAME, NONE_FRAME],
+            mvs: [exact_mv, MotionVector::ZERO],
+            sub_mvs: [exact_sub_mvs, [MotionVector::ZERO; SUB_BLOCKS]],
+        };
+
+        let mut counts = SyntaxCounts::default();
+        let parser = TileParser {
+            decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
+            probabilities: &probabilities,
+            counts: &mut counts,
+            contexts: &mut contexts,
+            tx_mode: TxMode::Only4x4,
+            frame_is_intra: false,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: Some(crate::header::InterpolationFilter::EightTap),
+            allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
+            ref_frame_sign_bias: [false; 4],
+            lossless: true,
+            mi_rows: 8,
+            mi_cols: 8,
+            tile_col_start: 0,
+            tile_col_end: 8,
+            left_row_base: 0,
+            prev_frame_modes: None,
+            current_frame_modes: Some(&mut current_modes),
+        };
+
+        let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();
+
+        assert_eq!(candidate.y_mode, NEARESTMV);
+        assert_eq!(candidate.mvs[0], exact_mv);
+        assert_eq!(candidate.sub_mvs[0], exact_sub_mvs);
     }
 
     #[test]

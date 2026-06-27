@@ -55,7 +55,7 @@ harness.
 - [x] syntax counts and adaptive probability refresh
 - [x] resolve `bear-vp9.ivf` packet 17 inter tile syntax
       `InvalidBitstream` after probability refresh
-- [ ] resolve `bear-vp9.ivf` packet 25 inter tile syntax
+- [x] resolve `bear-vp9.ivf` packet 25 inter tile syntax
       `InvalidBitstream` after previous-frame MV candidates
 - [ ] move previous-frame MV mode-history storage from the std-only host parser
       path into workspace/no-std state before relying on wasm parity
