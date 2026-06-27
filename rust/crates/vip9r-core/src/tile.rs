@@ -177,7 +177,7 @@ fn read_le_u32(bytes: &[u8]) -> Result<usize, ParserError> {
 #[cfg(test)]
 mod tests {
     use super::{ParserError, TileDescriptor, parse_tile_layout};
-    use crate::header::{FrameType, UncompressedFrameHeader};
+    use crate::header::{FrameType, LoopFilterParams, UncompressedFrameHeader};
 
     #[test]
     fn one_tile_frame_uses_remaining_payload_without_size_prefix() {
@@ -304,6 +304,7 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless: true,
+            loop_filter: LoopFilterParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2,

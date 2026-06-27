@@ -5,7 +5,7 @@ use crate::compressed_header::{
     CompoundReferenceSetup, CompressedHeader, InterReferenceFrame, ReferenceMode, TxMode,
 };
 use crate::error::ParserError;
-use crate::header::{InterpolationFilter, UncompressedFrameHeader};
+use crate::header::{InterpolationFilter, LoopFilterParams, UncompressedFrameHeader};
 use crate::probability::{
     CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
 };
@@ -44,7 +44,9 @@ const LAST_FRAME: u8 = 1;
 const GOLDEN_FRAME: u8 = 2;
 const ALTREF_FRAME: u8 = 3;
 const NEARESTMV: u8 = 10;
+const NEARMV: u8 = 11;
 const ZEROMV: u8 = 12;
+const NEWMV: u8 = 13;
 const SWITCHABLE_FILTER_SENTINEL: u8 = 3;
 const MVREF_NEIGHBOURS: usize = 8;
 const MAX_MV_REF_CANDIDATES: usize = 2;
@@ -359,6 +361,8 @@ pub(crate) fn parse_intra_tiles(
         )?;
     }
 
+    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+
     Ok(())
 }
 
@@ -419,6 +423,8 @@ pub(crate) fn parse_inter_tiles(
             },
         )?;
     }
+
+    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
 
     Ok(())
 }
@@ -864,6 +870,10 @@ impl TileParser<'_, '_, '_> {
         }
         let stored = StoredModeInfo {
             valid: true,
+            skip: block.skip,
+            tx_size: block.tx_size,
+            segment_id: block.segment_id,
+            mi_size: block_size,
             y_mode: block.y_mode,
             ref_frames: block.ref_frames,
             mvs,
@@ -2803,6 +2813,537 @@ fn add_residual_block(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LoopFilterConfig<'a> {
+    params: LoopFilterParams,
+    modes: ModeInfoView<'a>,
+    mi_rows: usize,
+    mi_cols: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopFilterStrength {
+    lvl: u8,
+    limit: u8,
+    blimit: u8,
+    thresh: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopFilterMasks {
+    hev: bool,
+    filter: bool,
+    flat: bool,
+    flat2: bool,
+}
+
+fn loop_filter_frame(
+    header: &UncompressedFrameHeader,
+    current_frame: &mut CurrentFrameMut<'_>,
+    mode_buffers: &FrameModeBuffers<'_>,
+) -> Result<(), TileSyntaxError> {
+    if header.loop_filter.level == 0 {
+        return Ok(());
+    }
+    if header.profile != 0 || header.bit_depth != 8 {
+        return Err(TileSyntaxError::Unimplemented);
+    }
+
+    let modes = mode_buffers
+        .current_frame_modes
+        .as_ref()
+        .ok_or(TileSyntaxError::InvalidBitstream)?
+        .as_view();
+    let config = LoopFilterConfig {
+        params: header.loop_filter,
+        modes,
+        mi_rows: mi_size(header.frame_height)?,
+        mi_cols: mi_size(header.frame_width)?,
+    };
+
+    let mut row = 0usize;
+    while row < config.mi_rows {
+        let mut col = 0usize;
+        while col < config.mi_cols {
+            for plane in 0..PLANES {
+                for pass in 0..2 {
+                    loop_filter_superblock(current_frame, config, plane, pass, row, col)?;
+                }
+            }
+            col = col
+                .checked_add(MI_BLOCK_64)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+        }
+        row = row
+            .checked_add(MI_BLOCK_64)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+    }
+
+    Ok(())
+}
+
+fn loop_filter_superblock(
+    current_frame: &mut CurrentFrameMut<'_>,
+    config: LoopFilterConfig<'_>,
+    plane_index: usize,
+    pass: usize,
+    row: usize,
+    col: usize,
+) -> Result<(), TileSyntaxError> {
+    let sub_x = subsampling_x(plane_index);
+    let sub_y = subsampling_y(plane_index);
+    let (dx, dy, sub, edge_len) = if pass == 0 {
+        (1i32, 0i32, sub_x, 64usize >> sub_y)
+    } else {
+        (0i32, 1i32, sub_y, 64usize >> sub_x)
+    };
+    let edge_count = 16usize >> sub;
+    let mi_cols_luma = config
+        .mi_cols
+        .checked_mul(8)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let mi_rows_luma = config
+        .mi_rows
+        .checked_mul(8)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let sb_x = col
+        .checked_mul(8)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let sb_y = row
+        .checked_mul(8)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+    let plane = current_frame.plane_mut(plane_index)?;
+    for edge in 0..edge_count {
+        for i in 0..edge_len {
+            let (x, y) = if pass == 0 {
+                (
+                    sb_x.checked_add(
+                        edge.checked_mul(4 << sub_x)
+                            .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    )
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    sb_y.checked_add(i << sub_y)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                )
+            } else {
+                (
+                    sb_x.checked_add(i << sub_x)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    sb_y.checked_add(
+                        edge.checked_mul(4 << sub_y)
+                            .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    )
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                )
+            };
+
+            if !loop_filter_on_screen(pass, x, y, mi_cols_luma, mi_rows_luma) {
+                continue;
+            }
+
+            let loop_col = ((x >> 3) >> sub_x) << sub_x;
+            let loop_row = ((y >> 3) >> sub_y) << sub_y;
+            let info = loop_filter_mode_info(config, loop_row, loop_col)?;
+            let tx_sz = if plane_index > 0 {
+                get_uv_tx_size(info.mi_size, info.tx_size)?
+            } else {
+                info.tx_size
+            };
+            let sb_size = if sub == 0 {
+                info.mi_size
+            } else {
+                core::cmp::max(BlockSize::Block16x16, info.mi_size)
+            };
+            let is_block_edge = loop_filter_is_block_edge(pass, x, y, sb_size);
+            let is_tx_edge =
+                loop_filter_is_tx_edge(pass, edge, x, tx_sz, sub_x, config.mi_cols, mi_cols_luma)?;
+            let apply_filter =
+                is_block_edge || (is_tx_edge && (info.ref_frames[0] == INTRA_FRAME || !info.skip));
+            if !apply_filter {
+                continue;
+            }
+
+            let filter_size = loop_filter_size(LoopFilterSizeInput {
+                tx_size: tx_sz,
+                is_32_edge: edge.is_multiple_of(8),
+                pass,
+                x,
+                y,
+                sub_x,
+                sub_y,
+                mi_rows: config.mi_rows,
+                mi_cols: config.mi_cols,
+            });
+            let strength = loop_filter_strength(config.params, info)?;
+            if strength.lvl == 0 {
+                continue;
+            }
+
+            sample_filter(
+                plane,
+                i32::try_from(x >> sub_x).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+                i32::try_from(y >> sub_y).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+                dx,
+                dy,
+                filter_size,
+                strength,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn loop_filter_on_screen(
+    pass: usize,
+    x: usize,
+    y: usize,
+    mi_cols_luma: usize,
+    mi_rows_luma: usize,
+) -> bool {
+    if x >= mi_cols_luma || y >= mi_rows_luma {
+        return false;
+    }
+    if pass == 0 && x == 0 {
+        return false;
+    }
+    if pass == 1 && y == 0 {
+        return false;
+    }
+    true
+}
+
+fn loop_filter_mode_info(
+    config: LoopFilterConfig<'_>,
+    row: usize,
+    col: usize,
+) -> Result<StoredModeInfo, TileSyntaxError> {
+    if row >= config.mi_rows || col >= config.mi_cols {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    let index = row
+        .checked_mul(config.mi_cols)
+        .and_then(|value| value.checked_add(col))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let info = config.modes.get(index)?;
+    if !info.valid {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    Ok(info)
+}
+
+fn loop_filter_is_block_edge(pass: usize, x: usize, y: usize, sb_size: BlockSize) -> bool {
+    if pass == 0 {
+        x.is_multiple_of(8 * usize::from(sb_size.num_8x8_wide()))
+    } else {
+        y.is_multiple_of(8 * usize::from(sb_size.num_8x8_high()))
+    }
+}
+
+fn loop_filter_is_tx_edge(
+    pass: usize,
+    edge: usize,
+    x: usize,
+    tx_size: TxSize,
+    sub_x: usize,
+    mi_cols: usize,
+    mi_cols_luma: usize,
+) -> Result<bool, TileSyntaxError> {
+    if pass == 1
+        && sub_x == 1
+        && !mi_cols.is_multiple_of(2)
+        && !edge.is_multiple_of(2)
+        && x.checked_add(8).ok_or(TileSyntaxError::InvalidBitstream)? >= mi_cols_luma
+    {
+        return Ok(false);
+    }
+    Ok(edge.is_multiple_of(1usize << tx_size.index()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopFilterSizeInput {
+    tx_size: TxSize,
+    is_32_edge: bool,
+    pass: usize,
+    x: usize,
+    y: usize,
+    sub_x: usize,
+    sub_y: usize,
+    mi_rows: usize,
+    mi_cols: usize,
+}
+
+fn loop_filter_size(input: LoopFilterSizeInput) -> TxSize {
+    let base_size = if input.tx_size == TxSize::Tx4x4 && input.is_32_edge {
+        TxSize::Tx8x8
+    } else {
+        TxSize::from_index(core::cmp::min(
+            TxSize::Tx16x16.index(),
+            input.tx_size.index(),
+        ))
+    };
+
+    let crosses_chroma_right =
+        input.pass == 0 && input.sub_x == 1 && (input.x >> 3) == input.mi_cols - 1;
+    let crosses_chroma_bottom =
+        input.pass == 1 && input.sub_y == 1 && (input.y >> 3) == input.mi_rows - 1;
+    if base_size == TxSize::Tx16x16 && (crosses_chroma_right || crosses_chroma_bottom) {
+        TxSize::Tx8x8
+    } else {
+        base_size
+    }
+}
+
+fn loop_filter_strength(
+    params: LoopFilterParams,
+    info: StoredModeInfo,
+) -> Result<LoopFilterStrength, TileSyntaxError> {
+    let mut lvl = i32::from(params.level);
+    if params.delta_enabled {
+        let n_shift = i32::from(params.level >> 5);
+        let ref_frame = usize::from(info.ref_frames[0]);
+        let ref_delta = params
+            .ref_deltas
+            .get(ref_frame)
+            .copied()
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        lvl += i32::from(ref_delta) << n_shift;
+        if info.ref_frames[0] > INTRA_FRAME {
+            let mode_delta = params.mode_deltas[usize::from(loop_filter_mode_type(info.y_mode))];
+            lvl += i32::from(mode_delta) << n_shift;
+        }
+        lvl = clip3(0, 63, lvl);
+    }
+    let lvl = u8::try_from(lvl).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let shift = if params.sharpness > 4 {
+        2
+    } else if params.sharpness > 0 {
+        1
+    } else {
+        0
+    };
+    let limit = if params.sharpness > 0 {
+        clip3(1, i32::from(9 - params.sharpness), i32::from(lvl >> shift))
+    } else {
+        core::cmp::max(1, i32::from(lvl >> shift))
+    };
+    let blimit = 2 * (i32::from(lvl) + 2) + limit;
+    Ok(LoopFilterStrength {
+        lvl,
+        limit: u8::try_from(limit).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        blimit: u8::try_from(blimit).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        thresh: lvl >> 4,
+    })
+}
+
+fn loop_filter_mode_type(y_mode: u8) -> bool {
+    matches!(y_mode, NEARESTMV | NEARMV | NEWMV)
+}
+
+fn sample_filter(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    filter_size: TxSize,
+    strength: LoopFilterStrength,
+) -> Result<(), TileSyntaxError> {
+    let masks = filter_masks(plane, x, y, dx, dy, filter_size, strength)?;
+    if !masks.filter {
+        return Ok(());
+    }
+    if filter_size == TxSize::Tx4x4 || !masks.flat {
+        narrow_filter(plane, x, y, dx, dy, masks.hev)
+    } else if filter_size == TxSize::Tx8x8 || !masks.flat2 {
+        wide_filter(plane, x, y, dx, dy, 3)
+    } else {
+        wide_filter(plane, x, y, dx, dy, 4)
+    }
+}
+
+fn filter_masks(
+    plane: &CurrentPlaneMut<'_>,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    filter_size: TxSize,
+    strength: LoopFilterStrength,
+) -> Result<LoopFilterMasks, TileSyntaxError> {
+    let mut q = [0u8; 8];
+    let mut p = [0u8; 8];
+    for k in 0..8i32 {
+        q[usize::try_from(k).map_err(|_| TileSyntaxError::InvalidBitstream)?] =
+            loop_filter_sample(plane, x + dx * k, y + dy * k)?;
+        let pk = k + 1;
+        p[usize::try_from(k).map_err(|_| TileSyntaxError::InvalidBitstream)?] =
+            loop_filter_sample(plane, x - dx * pk, y - dy * pk)?;
+    }
+
+    let hev = abs_diff(p[1], p[0]) > i32::from(strength.thresh)
+        || abs_diff(q[1], q[0]) > i32::from(strength.thresh);
+    let limit = i32::from(strength.limit);
+    let blimit = i32::from(strength.blimit);
+    let mask = abs_diff(p[3], p[2]) > limit
+        || abs_diff(p[2], p[1]) > limit
+        || abs_diff(p[1], p[0]) > limit
+        || abs_diff(q[1], q[0]) > limit
+        || abs_diff(q[2], q[1]) > limit
+        || abs_diff(q[3], q[2]) > limit
+        || abs_diff(p[0], q[0]) * 2 + abs_diff(p[1], q[1]) / 2 > blimit;
+    let filter = !mask;
+
+    let mut flat = false;
+    if filter_size >= TxSize::Tx8x8 {
+        flat = abs_diff(p[1], p[0]) <= 1
+            && abs_diff(q[1], q[0]) <= 1
+            && abs_diff(p[2], p[0]) <= 1
+            && abs_diff(q[2], q[0]) <= 1
+            && abs_diff(p[3], p[0]) <= 1
+            && abs_diff(q[3], q[0]) <= 1;
+    }
+
+    let mut flat2 = false;
+    if filter_size >= TxSize::Tx16x16 {
+        flat2 = abs_diff(p[7], p[0]) <= 1
+            && abs_diff(q[7], q[0]) <= 1
+            && abs_diff(p[6], p[0]) <= 1
+            && abs_diff(q[6], q[0]) <= 1
+            && abs_diff(p[5], p[0]) <= 1
+            && abs_diff(q[5], q[0]) <= 1
+            && abs_diff(p[4], p[0]) <= 1
+            && abs_diff(q[4], q[0]) <= 1;
+    }
+
+    Ok(LoopFilterMasks {
+        hev,
+        filter,
+        flat,
+        flat2,
+    })
+}
+
+fn narrow_filter(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    hev: bool,
+) -> Result<(), TileSyntaxError> {
+    let q0 = loop_filter_sample(plane, x, y)?;
+    let q1 = loop_filter_sample(plane, x + dx, y + dy)?;
+    let p0 = loop_filter_sample(plane, x - dx, y - dy)?;
+    let p1 = loop_filter_sample(plane, x - 2 * dx, y - 2 * dy)?;
+    let ps1 = i32::from(p1) - 128;
+    let ps0 = i32::from(p0) - 128;
+    let qs0 = i32::from(q0) - 128;
+    let qs1 = i32::from(q1) - 128;
+    let mut filter = if hev { filter4_clamp(ps1 - qs1) } else { 0 };
+    filter = filter4_clamp(filter + 3 * (qs0 - ps0));
+    let filter1 = filter4_clamp(filter + 4) >> 3;
+    let filter2 = filter4_clamp(filter + 3) >> 3;
+    let oq0 = filter4_clamp(qs0 - filter1) + 128;
+    let op0 = filter4_clamp(ps0 + filter2) + 128;
+    loop_filter_set(
+        plane,
+        x,
+        y,
+        u8::try_from(oq0).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+    )?;
+    loop_filter_set(
+        plane,
+        x - dx,
+        y - dy,
+        u8::try_from(op0).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+    )?;
+
+    if !hev {
+        filter = round2_i32(filter1, 1);
+        let oq1 = filter4_clamp(qs1 - filter) + 128;
+        let op1 = filter4_clamp(ps1 + filter) + 128;
+        loop_filter_set(
+            plane,
+            x + dx,
+            y + dy,
+            u8::try_from(oq1).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        )?;
+        loop_filter_set(
+            plane,
+            x - 2 * dx,
+            y - 2 * dy,
+            u8::try_from(op1).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn wide_filter(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    log2_size: u8,
+) -> Result<(), TileSyntaxError> {
+    let n = (1i32 << (log2_size - 1)) - 1;
+    let count = usize::try_from(2 * n).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let mut filtered = [0u8; 14];
+    for i in -n..n {
+        let mut t = i32::from(loop_filter_sample(plane, x + i * dx, y + i * dy)?);
+        for j in -n..=n {
+            let p = clip3(-(n + 1), n, i + j);
+            t += i32::from(loop_filter_sample(plane, x + p * dx, y + p * dy)?);
+        }
+        let index = usize::try_from(i + n).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        filtered[index] = clip1(round2_i32(t, log2_size));
+    }
+    for i in -n..n {
+        let index = usize::try_from(i + n).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        if index >= count {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        loop_filter_set(plane, x + i * dx, y + i * dy, filtered[index])?;
+    }
+    Ok(())
+}
+
+fn loop_filter_sample(plane: &CurrentPlaneMut<'_>, x: i32, y: i32) -> Result<u8, TileSyntaxError> {
+    if plane.width == 0 || plane.height == 0 {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    let max_x = i32::try_from(plane.width - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let max_y = i32::try_from(plane.height - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let x = usize::try_from(clip3(0, max_x, x)).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let y = usize::try_from(clip3(0, max_y, y)).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    plane.sample_clamped(x, y)
+}
+
+fn loop_filter_set(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: i32,
+    y: i32,
+    value: u8,
+) -> Result<(), TileSyntaxError> {
+    if x < 0 || y < 0 {
+        return Ok(());
+    }
+    let x = usize::try_from(x).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let y = usize::try_from(y).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    plane.set_visible(x, y, value)
+}
+
+fn abs_diff(a: u8, b: u8) -> i32 {
+    (i32::from(a) - i32::from(b)).abs()
+}
+
+fn filter4_clamp(value: i32) -> i32 {
+    clip3(-128, 127, value)
+}
+
 fn above_with_left(edges: &IntraPredictionEdges, index: isize) -> u8 {
     if index < 0 {
         edges.above_left
@@ -2918,6 +3459,10 @@ impl From<StoredModeInfo> for CandidateModeInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StoredModeInfo {
     valid: bool,
+    skip: bool,
+    tx_size: TxSize,
+    segment_id: u8,
+    mi_size: BlockSize,
     y_mode: u8,
     ref_frames: [u8; REF_LISTS],
     mvs: [MotionVector; REF_LISTS],
@@ -2929,8 +3474,12 @@ const STORED_MODE_INFO_Y_MODE_OFFSET: usize = 1;
 const STORED_MODE_INFO_REF_FRAMES_OFFSET: usize = 2;
 const STORED_MODE_INFO_MVS_OFFSET: usize = 4;
 const STORED_MODE_INFO_SUB_MVS_OFFSET: usize = 12;
+const STORED_MODE_INFO_SKIP_OFFSET: usize = 44;
+const STORED_MODE_INFO_TX_SIZE_OFFSET: usize = 45;
+const STORED_MODE_INFO_SEGMENT_ID_OFFSET: usize = 46;
+const STORED_MODE_INFO_MI_SIZE_OFFSET: usize = 47;
 
-pub(crate) const STORED_MODE_INFO_BYTES: usize = 44;
+pub(crate) const STORED_MODE_INFO_BYTES: usize = 48;
 
 pub(crate) fn mode_info_byte_len(mi_count: usize) -> Option<usize> {
     mi_count.checked_mul(STORED_MODE_INFO_BYTES)
@@ -3058,6 +3607,10 @@ fn decode_stored_mode_info(bytes: &[u8]) -> Result<StoredModeInfo, TileSyntaxErr
 
     let valid = bytes[STORED_MODE_INFO_VALID_OFFSET] != 0;
     let y_mode = bytes[STORED_MODE_INFO_Y_MODE_OFFSET];
+    let tx_size = TxSize::from_raw(bytes[STORED_MODE_INFO_TX_SIZE_OFFSET])
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let mi_size = BlockSize::from_raw(bytes[STORED_MODE_INFO_MI_SIZE_OFFSET])
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
     let ref_frames = [
         bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET],
         bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1],
@@ -3081,6 +3634,10 @@ fn decode_stored_mode_info(bytes: &[u8]) -> Result<StoredModeInfo, TileSyntaxErr
 
     Ok(StoredModeInfo {
         valid,
+        skip: bytes[STORED_MODE_INFO_SKIP_OFFSET] != 0,
+        tx_size,
+        segment_id: bytes[STORED_MODE_INFO_SEGMENT_ID_OFFSET],
+        mi_size,
         y_mode,
         ref_frames,
         mvs,
@@ -3093,6 +3650,10 @@ fn encode_stored_mode_info(info: StoredModeInfo, bytes: &mut [u8]) {
     bytes.fill(0);
     bytes[STORED_MODE_INFO_VALID_OFFSET] = u8::from(info.valid);
     bytes[STORED_MODE_INFO_Y_MODE_OFFSET] = info.y_mode;
+    bytes[STORED_MODE_INFO_SKIP_OFFSET] = u8::from(info.skip);
+    bytes[STORED_MODE_INFO_TX_SIZE_OFFSET] = info.tx_size as u8;
+    bytes[STORED_MODE_INFO_SEGMENT_ID_OFFSET] = info.segment_id;
+    bytes[STORED_MODE_INFO_MI_SIZE_OFFSET] = info.mi_size as u8;
     bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET] = info.ref_frames[0];
     bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1] = info.ref_frames[1];
 
@@ -3561,6 +4122,25 @@ enum BlockSize {
 }
 
 impl BlockSize {
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Block4x4),
+            1 => Some(Self::Block4x8),
+            2 => Some(Self::Block8x4),
+            3 => Some(Self::Block8x8),
+            4 => Some(Self::Block8x16),
+            5 => Some(Self::Block16x8),
+            6 => Some(Self::Block16x16),
+            7 => Some(Self::Block16x32),
+            8 => Some(Self::Block32x16),
+            9 => Some(Self::Block32x32),
+            10 => Some(Self::Block32x64),
+            11 => Some(Self::Block64x32),
+            12 => Some(Self::Block64x64),
+            _ => None,
+        }
+    }
+
     const fn index(self) -> usize {
         self as usize
     }
@@ -3683,7 +4263,7 @@ impl InterMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u8)]
 enum TxSize {
     Tx4x4 = 0,
@@ -5063,7 +5643,7 @@ mod tests {
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
-    use crate::header::{FrameType, UncompressedFrameHeader};
+    use crate::header::{FrameType, LoopFilterParams, UncompressedFrameHeader};
     use crate::probability::{FrameContext, SyntaxCounts};
     use crate::tile::parse_tile_layout;
 
@@ -5692,6 +6272,10 @@ mod tests {
     fn packed_mode_info_round_trips_motion_vectors() {
         let info = StoredModeInfo {
             valid: true,
+            skip: true,
+            tx_size: TxSize::Tx8x8,
+            segment_id: 0,
+            mi_size: BlockSize::Block16x16,
             y_mode: NEARESTMV,
             ref_frames: [LAST_FRAME, NONE_FRAME],
             mvs: [
@@ -5748,6 +6332,10 @@ mod tests {
                 8 + 4,
                 StoredModeInfo {
                     valid: true,
+                    skip: false,
+                    tx_size: TxSize::Tx4x4,
+                    segment_id: 0,
+                    mi_size: BlockSize::Block8x8,
                     y_mode: NEARESTMV,
                     ref_frames: [LAST_FRAME, NONE_FRAME],
                     mvs: [exact_mv, MotionVector::ZERO],
@@ -5953,6 +6541,7 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless: true,
+            loop_filter: LoopFilterParams::disabled(),
             segmentation_enabled,
             segmentation_update_map: false,
             tile_cols_log2: 0,

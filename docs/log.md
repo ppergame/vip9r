@@ -210,3 +210,14 @@ milestones, and measured optimization results.
   so reference/output frames are still intentionally unfiltered.
 - Host and wasm smoke pass with 82 shown frames and md5 mismatches only; strict
   host golden still fails with 82 md5 mismatches and no missing/extra frames.
+
+## 2026-06-27 — VP9 loop filter and first strict green vector
+
+- rev: jj `qmmoswxu`
+- Added profile 0 / 8-bit loop-filter header state, per-MI filter metadata, and
+  the final in-loop filter pass before reference refresh/output.
+- `bear-vp9.ivf` strict md5 now passes on both the host golden harness and the
+  d8 wasm driver: 82 matched, 0 mismatched, 0 missing, 0 extra.
+- M1 is code-complete for the current supported subset. M2 bring-up now moves to
+  conformance vectors and corpus clips; segmentation remains outside the
+  implemented tile subset and is still rejected before filtering.

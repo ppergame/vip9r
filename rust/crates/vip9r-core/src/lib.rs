@@ -921,12 +921,14 @@ impl Decoder {
         workspace: &'w mut DecodeWorkspace<'_>,
     ) -> Result<DecodeOutcome<'w>, DecodeError> {
         workspace.require_layout(self.layout)?;
-        let header = parse_uncompressed_frame_header(coded_frame, &self.header_state)
+        let mut parsed_header_state = self.header_state;
+        let header = parse_uncompressed_frame_header(coded_frame, &mut parsed_header_state)
             .map_err(|err| err.into_decode_error())?;
         self.validate_frame_limits(&header)?;
         self.setup_frame_probability_state(&header)?;
 
         if header.show_existing_frame {
+            self.header_state = parsed_header_state;
             self.header_state.update_references(&header);
             let reference_index = usize::from(
                 header
@@ -942,6 +944,7 @@ impl Decoder {
         }
 
         if header.header_size_in_bytes == 0 {
+            self.header_state = parsed_header_state;
             self.header_state.update_references(&header);
             self.last_frame_type = header.frame_type;
             self.previous_frame_for_mvs = None;
@@ -1033,6 +1036,7 @@ impl Decoder {
         let current_reference = ReferenceSlotInfo::from_header(&header);
         workspace.refresh_references_from_current(header.refresh_frame_flags)?;
         self.refresh_reference_info(header.refresh_frame_flags, current_reference);
+        self.header_state = parsed_header_state;
         self.header_state.update_references(&header);
         self.last_frame_type = header.frame_type;
         self.previous_frame_for_mvs = Some(PreviousFrameForMvs {

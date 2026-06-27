@@ -4,6 +4,8 @@ use crate::error::ParserError;
 const NUM_REF_FRAMES: usize = 8;
 const REFS_PER_FRAME: usize = 3;
 const SIGN_BIAS_FRAMES: usize = 4;
+const MAX_REF_FRAMES: usize = 4;
+const MAX_MODE_LF_DELTAS: usize = 2;
 const LAST_FRAME: usize = 1;
 const MAX_TILE_WIDTH_B64: u32 = 64;
 const MIN_TILE_WIDTH_B64: u32 = 4;
@@ -50,13 +52,19 @@ pub(crate) struct ReferenceFrameInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HeaderParserState {
     reference_frames: [Option<ReferenceFrameInfo>; NUM_REF_FRAMES],
+    loop_filter: LoopFilterState,
 }
 
 impl HeaderParserState {
     pub(crate) const fn new() -> Self {
         Self {
             reference_frames: [None; NUM_REF_FRAMES],
+            loop_filter: LoopFilterState::new(),
         }
+    }
+
+    fn setup_past_independence(&mut self) {
+        self.loop_filter = LoopFilterState::new();
     }
 
     pub(crate) fn update_references(&mut self, header: &UncompressedFrameHeader) {
@@ -80,6 +88,42 @@ impl HeaderParserState {
 
     fn reference(&self, index: u8) -> Result<ReferenceFrameInfo, ParserError> {
         self.reference_frames[usize::from(index)].ok_or(ParserError::InvalidBitstream)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LoopFilterState {
+    ref_deltas: [i8; MAX_REF_FRAMES],
+    mode_deltas: [i8; MAX_MODE_LF_DELTAS],
+}
+
+impl LoopFilterState {
+    const fn new() -> Self {
+        Self {
+            ref_deltas: [1, 0, -1, -1],
+            mode_deltas: [0, 0],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LoopFilterParams {
+    pub(crate) level: u8,
+    pub(crate) sharpness: u8,
+    pub(crate) delta_enabled: bool,
+    pub(crate) ref_deltas: [i8; MAX_REF_FRAMES],
+    pub(crate) mode_deltas: [i8; MAX_MODE_LF_DELTAS],
+}
+
+impl LoopFilterParams {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            level: 0,
+            sharpness: 0,
+            delta_enabled: false,
+            ref_deltas: [0; MAX_REF_FRAMES],
+            mode_deltas: [0; MAX_MODE_LF_DELTAS],
+        }
     }
 }
 
@@ -115,6 +159,7 @@ pub(crate) struct UncompressedFrameHeader {
     pub(crate) delta_q_uv_dc: i32,
     pub(crate) delta_q_uv_ac: i32,
     pub(crate) lossless: bool,
+    pub(crate) loop_filter: LoopFilterParams,
     pub(crate) segmentation_enabled: bool,
     pub(crate) segmentation_update_map: bool,
     pub(crate) tile_cols_log2: u8,
@@ -126,7 +171,7 @@ pub(crate) struct UncompressedFrameHeader {
 
 pub(crate) fn parse_uncompressed_frame_header(
     frame: &[u8],
-    state: &HeaderParserState,
+    state: &mut HeaderParserState,
 ) -> Result<UncompressedFrameHeader, ParserError> {
     let mut reader = FixedBitReader::new(frame);
 
@@ -187,6 +232,7 @@ pub(crate) fn parse_uncompressed_frame_header(
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless: false,
+            loop_filter: LoopFilterParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2: 0,
@@ -292,10 +338,11 @@ pub(crate) fn parse_uncompressed_frame_header(
     let raw_frame_context_idx = reader.read_f(2)? as u8;
     let mut frame_context_idx = raw_frame_context_idx;
     if frame_is_intra || error_resilient_mode {
+        state.setup_past_independence();
         frame_context_idx = 0;
     }
 
-    loop_filter_params(&mut reader)?;
+    let loop_filter = loop_filter_params(&mut reader, &mut state.loop_filter)?;
     let quantization = quantization_params(&mut reader)?;
     let segmentation = segmentation_params(&mut reader)?;
     let tile_info = tile_info(&mut reader, frame_width)?;
@@ -332,6 +379,7 @@ pub(crate) fn parse_uncompressed_frame_header(
         delta_q_uv_dc: quantization.delta_q_uv_dc,
         delta_q_uv_ac: quantization.delta_q_uv_ac,
         lossless: quantization.lossless,
+        loop_filter,
         segmentation_enabled: segmentation.enabled,
         segmentation_update_map: segmentation.update_map,
         tile_cols_log2: tile_info.0,
@@ -471,26 +519,37 @@ fn read_interpolation_filter(
     }
 }
 
-fn loop_filter_params(reader: &mut FixedBitReader<'_>) -> Result<(), ParserError> {
-    let _loop_filter_level = reader.read_f(6)?;
-    let _loop_filter_sharpness = reader.read_f(3)?;
+fn loop_filter_params(
+    reader: &mut FixedBitReader<'_>,
+    state: &mut LoopFilterState,
+) -> Result<LoopFilterParams, ParserError> {
+    let loop_filter_level = reader.read_f(6)? as u8;
+    let loop_filter_sharpness = reader.read_f(3)? as u8;
     let loop_filter_delta_enabled = reader.read_bool()?;
     if loop_filter_delta_enabled {
         let loop_filter_delta_update = reader.read_bool()?;
         if loop_filter_delta_update {
-            for _ in 0..4 {
+            for ref_delta in &mut state.ref_deltas {
                 if reader.read_bool()? {
-                    let _loop_filter_ref_delta = reader.read_s(6)?;
+                    *ref_delta = i8::try_from(reader.read_s(6)?)
+                        .map_err(|_| ParserError::InvalidBitstream)?;
                 }
             }
-            for _ in 0..2 {
+            for mode_delta in &mut state.mode_deltas {
                 if reader.read_bool()? {
-                    let _loop_filter_mode_delta = reader.read_s(6)?;
+                    *mode_delta = i8::try_from(reader.read_s(6)?)
+                        .map_err(|_| ParserError::InvalidBitstream)?;
                 }
             }
         }
     }
-    Ok(())
+    Ok(LoopFilterParams {
+        level: loop_filter_level,
+        sharpness: loop_filter_sharpness,
+        delta_enabled: loop_filter_delta_enabled,
+        ref_deltas: state.ref_deltas,
+        mode_deltas: state.mode_deltas,
+    })
 }
 
 fn quantization_params(reader: &mut FixedBitReader<'_>) -> Result<QuantizationParams, ParserError> {
@@ -691,7 +750,8 @@ mod tests {
         builder.byte(0); // one compressed-header byte so offsets are in range
         let frame = builder.finish();
 
-        let header = parse_uncompressed_frame_header(&frame, &HeaderParserState::new()).unwrap();
+        let header =
+            parse_uncompressed_frame_header(&frame, &mut HeaderParserState::new()).unwrap();
 
         assert_eq!(header.profile, 0);
         assert_eq!(header.bit_depth, 8);
@@ -757,7 +817,7 @@ mod tests {
         builder.f(2, 3); // frame to show map index
         let frame = builder.finish();
 
-        let header = parse_uncompressed_frame_header(&frame, &state).unwrap();
+        let header = parse_uncompressed_frame_header(&frame, &mut state).unwrap();
 
         assert!(header.show_existing_frame);
         assert_eq!(header.frame_to_show_map_idx, Some(2));
@@ -788,7 +848,7 @@ mod tests {
         builder.f(0x43, 8);
 
         assert_eq!(
-            parse_uncompressed_frame_header(&builder.finish(), &HeaderParserState::new()),
+            parse_uncompressed_frame_header(&builder.finish(), &mut HeaderParserState::new()),
             Err(ParserError::InvalidBitstream)
         );
     }
@@ -840,7 +900,7 @@ mod tests {
         builder.byte(0);
         let frame = builder.finish();
 
-        let header = parse_uncompressed_frame_header(&frame, &state).unwrap();
+        let header = parse_uncompressed_frame_header(&frame, &mut state).unwrap();
 
         assert_eq!(header.frame_width, 320);
         assert_eq!(header.frame_height, 240);
@@ -892,14 +952,14 @@ mod tests {
         }
 
         assert_eq!(
-            parse_uncompressed_frame_header(&builder.finish(), &HeaderParserState::new()),
+            parse_uncompressed_frame_header(&builder.finish(), &mut HeaderParserState::new()),
             Err(ParserError::InvalidBitstream)
         );
     }
 
     fn parse_key_frame_with_quant(base_q_idx: u8, deltas: [i32; 3]) -> UncompressedFrameHeader {
         let frame = key_frame_with_quant(base_q_idx, deltas);
-        parse_uncompressed_frame_header(&frame, &HeaderParserState::new()).unwrap()
+        parse_uncompressed_frame_header(&frame, &mut HeaderParserState::new()).unwrap()
     }
 
     fn key_frame_with_quant(base_q_idx: u8, deltas: [i32; 3]) -> [u8; 128] {
@@ -982,7 +1042,7 @@ mod tests {
         builder.byte(0);
         let frame = builder.finish();
 
-        parse_uncompressed_frame_header(&frame, &state).unwrap()
+        parse_uncompressed_frame_header(&frame, &mut state).unwrap()
     }
 
     struct HeaderBuilder {

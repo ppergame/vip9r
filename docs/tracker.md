@@ -66,13 +66,14 @@ harness.
 - [x] inverse transform kernels for the profile 0 / 8-bit subset
 - [x] intra prediction and reconstruction into the current frame
 - [x] inter prediction from reference frame slots
-- [ ] loop filter and final reconstructed reference/output pixel path
+- [x] loop filter and final reconstructed reference/output pixel path
 
 ### M2 — Decode, correct (bring-up campaign)
 
 Drive frame-md5 correctness green. Gated on M1.
 
-- [ ] first bit-exact frame
+- [x] first bit-exact frame
+- [x] `bear-vp9.ivf` strict md5 green on host and wasm
 - [ ] conformance subset green on full frames
 - [ ] webm demux + corpus clips green
 

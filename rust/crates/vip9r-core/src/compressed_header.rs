@@ -539,7 +539,9 @@ mod tests {
     };
     use crate::boolcoder::BoolDecoder;
     use crate::error::ParserError;
-    use crate::header::{FrameType, InterpolationFilter, UncompressedFrameHeader};
+    use crate::header::{
+        FrameType, InterpolationFilter, LoopFilterParams, UncompressedFrameHeader,
+    };
     use crate::probability::FrameContext;
 
     #[test]
@@ -714,6 +716,7 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless,
+            loop_filter: LoopFilterParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2: 0,
@@ -758,6 +761,7 @@ mod tests {
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
             lossless,
+            loop_filter: LoopFilterParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2: 0,
