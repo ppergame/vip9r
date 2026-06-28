@@ -122,7 +122,9 @@ pub(crate) fn parse_tile_layout(
                     return Err(ParserError::InvalidBitstream);
                 }
 
-                let tile_size = read_le_u32(&frame[cursor..size_field_end])?;
+                // tile_size is specified as f(32); at this byte-aligned point
+                // that is an MSB-first 32-bit value.
+                let tile_size = read_be_u32(&frame[cursor..size_field_end])?;
                 payload_start = size_field_end;
                 payload_end = payload_start
                     .checked_add(tile_size)
@@ -166,11 +168,11 @@ fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u8) -> Result<u32, Par
     u32::try_from(min(offset, u64::from(mis))).map_err(|_| ParserError::InvalidBitstream)
 }
 
-fn read_le_u32(bytes: &[u8]) -> Result<usize, ParserError> {
-    let value = u32::from(bytes[0])
-        | (u32::from(bytes[1]) << 8)
-        | (u32::from(bytes[2]) << 16)
-        | (u32::from(bytes[3]) << 24);
+fn read_be_u32(bytes: &[u8]) -> Result<usize, ParserError> {
+    let value = (u32::from(bytes[0]) << 24)
+        | (u32::from(bytes[1]) << 16)
+        | (u32::from(bytes[2]) << 8)
+        | u32::from(bytes[3]);
     usize::try_from(value).map_err(|_| ParserError::InvalidBitstream)
 }
 
@@ -202,8 +204,8 @@ mod tests {
     }
 
     #[test]
-    fn multiple_tiles_consume_little_endian_non_final_size_prefixes() {
-        let frame = [0xcc, 2, 0, 0, 0, 0xa0, 0xa1, 0xb0, 0xb1, 0xb2];
+    fn multiple_tiles_consume_big_endian_non_final_size_prefixes() {
+        let frame = [0xcc, 0, 0, 0, 2, 0xa0, 0xa1, 0xb0, 0xb1, 0xb2];
         let header = test_header(512, 64, 1, 0, 1);
 
         let layout = parse_tile_layout(&frame, &header).unwrap();
@@ -234,7 +236,7 @@ mod tests {
 
     #[test]
     fn tile_size_overrunning_remaining_payload_is_rejected() {
-        let frame = [0xcc, 3, 0, 0, 0, 0xa0, 0xa1];
+        let frame = [0xcc, 0, 0, 0, 3, 0xa0, 0xa1];
         let header = test_header(512, 64, 1, 0, 1);
 
         assert_eq!(
@@ -247,9 +249,9 @@ mod tests {
     fn odd_dimensions_use_spec_mi_tile_bounds() {
         let frame = [
             0xcc, // compressed header byte
-            1, 0, 0, 0, 0xa0, // row 0, col 0
-            2, 0, 0, 0, 0xb0, 0xb1, // row 0, col 1
-            3, 0, 0, 0, 0xc0, 0xc1, 0xc2, // row 1, col 0
+            0, 0, 0, 1, 0xa0, // row 0, col 0
+            0, 0, 0, 2, 0xb0, 0xb1, // row 0, col 1
+            0, 0, 0, 3, 0xc0, 0xc1, 0xc2, // row 1, col 0
             0xd0, 0xd1, 0xd2, 0xd3, // final tile: row 1, col 1
         ];
         let header = test_header(449, 65, 1, 1, 1);

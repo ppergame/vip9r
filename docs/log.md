@@ -233,3 +233,14 @@ milestones, and measured optimization results.
   `vp90-2-05-resize.ivf` is 10 matched / 0 mismatched, and
   `vp90-2-18-resize.ivf` is 100 matched / 0 mismatched. `bear-vp9.ivf` remains
   green at 82 matched / 0 mismatched.
+
+## 2026-06-28 — VP9 tile-size byte order
+
+- rev: jj `rvwqnmuw`
+- Fixed non-final VP9 tile-size parsing to treat the byte-aligned `f(32)` field
+  as MSB-first instead of little-endian.
+- `vp90-2-09-subpixel-00.ivf` now passes strict wasm-golden at 20 matched /
+  0 mismatched. The sorted md5-backed corpus sweep then advances through 221
+  media files and stops at the next frontier, `vp90-2-09-aq2.webm`, which
+  returns `Unimplemented` at packet 0 coded frame 0 on the segmentation-enabled
+  tile path.
