@@ -16,6 +16,9 @@ Environment:
   VIP9R_ORCHESTRATOR_MAX_RUNS  Safety cap. 0 means unlimited. Default: 0
   VIP9R_CODEX_SANDBOX          Codex sandbox mode. Default: danger-full-access
   VIP9R_CODEX_APPROVAL_POLICY  Codex approval_policy override. Default: never
+
+Stop marker:
+  temp/orchestrator-loop.stop   If present, exit instead of starting or continuing.
 EOF
 }
 
@@ -30,6 +33,8 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/.." && pwd)"
 codex_events="$repo/scripts/codex-events.mjs"
+stop_marker_rel="temp/orchestrator-loop.stop"
+stop_marker="$repo/$stop_marker_rel"
 
 require_gptpod_sandbox() {
   local project_marker="/run/claudepod-project"
@@ -93,6 +98,11 @@ $script_instructions"
 
 run=0
 while :; do
+  if [[ -e "$stop_marker" ]]; then
+    echo "orchestrator-loop: stop marker present: $stop_marker_rel" >&2
+    exit 0
+  fi
+
   run=$((run + 1))
   if (( max_runs > 0 && run > max_runs )); then
     echo "orchestrator-loop: reached VIP9R_ORCHESTRATOR_MAX_RUNS=$max_runs" >&2
