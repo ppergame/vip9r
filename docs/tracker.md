@@ -113,16 +113,10 @@ Drive frame-md5 correctness green. Gated on M2R.
 - [x] fix `vp90-2-22-svc_1280x720_3.ivf`: strict wasm-golden green after
       deriving zero IVF dimensions from md5 sidecar names and comparing the
       top spatial layer
-- [x] finish/classify long 720p validation for
-      `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm`; the sorted direct-d8 sweep
-      passed 300/330 files, then spent 13+ minutes CPU-bound on this vector
-      before the run was stopped; a bounded strict run later passed 17,895
-      matched / 0 mismatched in 1367s
-- [ ] continue sorted corpus validation from
-      `vp90-2-bbb_1920x1080_tile_1x1_2581kbps.webm`; use
-      `wasm-golden --progress-frames=N` for long vectors
-- [ ] conformance subset green on full frames
-- [ ] webm demux + corpus clips green
+- [x] local md5-backed corpus green: strict wasm-golden passes every current
+      `/bulk/vip9r` md5-backed media file, 330/330 total, covering the chromium
+      smoke vector, libvpx conformance/perf vectors, and local realworld WebM
+      clips
 - [ ] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,
       init/media segment split, `SeekHead`, and unknown-size element cases before
       widening parser scope

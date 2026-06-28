@@ -291,16 +291,17 @@ milestones, and measured optimization results.
   0 mismatched after decoding 60 shown outputs and skipping 40 lower-layer
   outputs. `vp90-2-15-segkey_adpq.webm` remains green at 150 matched /
   0 mismatched, guarding against overbroad dimension filtering.
-- A sorted direct-d8 corpus sweep passed 300/330 media files, including the
-  previous SVC frontier, then spent 13+ minutes CPU-bound on
-  `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm` (17,895 md5 frames) before this
-  orchestrator run stopped the sweep rather than leave a long `d8` process
-  running.
 
-## 2026-06-28 — VP9 long-vector validation progress
+## 2026-06-28 — VP9 md5 corpus complete
 
-- Classified `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm` as a long validation
-  bottleneck, not a correctness failure: strict wasm-golden passed at 17,895
-  matched / 0 mismatched / 0 missing / 0 extra in 1367s.
 - Added optional `wasm-golden --progress-frames=N` output for long corpus runs.
   Default golden output and pass/fail criteria are unchanged.
+- Strict wasm-golden now passes every md5-backed media file currently present in
+  `/bulk/vip9r`: 330/330 total, with no mismatched, missing, or extra shown
+  frames. The set covers `chromium/bear-vp9.ivf`, 323 libvpx conformance/perf
+  vectors and clips, and six realworld WebM clips.
+- The final parallel validation batches completed the remaining TOS tail and
+  realworld clips without decoder changes. Notable slow paths were
+  `vp90-2-tos_1920x800_tile_1x4_fpm_2335kbps.webm` at 17,620 matched frames and
+  `realworld/wikimedia/spring-original-2048x858p24-1_41mbps.webm` at 11,138
+  matched frames.
