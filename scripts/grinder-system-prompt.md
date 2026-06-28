@@ -36,15 +36,16 @@ before reviewing.
 
 Workspace crates:
 
-- `vip9r` - decoder library, tests, and wasm ABI. Builds for the host with
-  `std` and for `wasm32-unknown-unknown` as a freestanding module.
-- `vip9r-tools` - host-native tooling, currently including the IVF frame md5
-  golden harness.
+- `vip9r` - decoder library, tests, and wasm ABI. Builds for the host with `std`
+  and for `wasm32-unknown-unknown` as a freestanding module.
+- `vip9r-wasm-test-macros` - test helper macro
 
 ### Inputs (read-only)
 
 - `/specs` - specs.
 - `/media` - VP9 test-vector corpus and frame md5 checksums.
+- `wasm-tests` and `wasm-golden` on PATH - scripts that build and test the wasm
+  module.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -61,20 +62,16 @@ Depending on the task, you can verify your work with
 
 - Engineering judgement. Self-review the change and decide whether it would
   satisfy the orchestrator and the user.
-- Unit tests
+- Wasm unit tests: `wasm-tests`
 - `cargo clippy`
-- Host golden harness, strict:
-  `cargo run -p vip9r-tools -- golden /media/chromium/bear-vp9.ivf`
-- Host golden harness, M1 smoke mode:
-  `cargo run -p vip9r-tools -- golden --allow-mismatch /media/chromium/bear-vp9.ivf`
+- Wasm golden runner, strict: `wasm-golden`
+- Wasm golden runner, smoke mode: `wasm-golden --allow-mismatch`
 - (WIP) Performance timings
-- (WIP) Clip-level decode matching frame md5 sums
 
-WIP note: benchmarking and clip-level checksum tooling are not yet available.
-They will be offered to you in a later task/milestone. The strict host golden
-harness currently exits non-zero because the decoder is incomplete; that is
-expected until a task says to drive correctness green. Smoke mode still fails on
-decode errors and missing/extra shown frames, but allows wrong frame md5 values.
+WIP note: benchmarking tooling is not yet available. It will be offered to you
+in a later task/milestone. The strict wasm golden runner is the full-decode
+correctness gate. Smoke mode still fails on decode errors and missing/extra
+shown frames, but allows wrong frame md5 values.
 
 ## Monitoring updates
 

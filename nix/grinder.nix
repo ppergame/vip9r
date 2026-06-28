@@ -10,6 +10,55 @@
   caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
+  wasmTests = pkgs.writeShellApplication {
+    name = "wasm-tests";
+    runtimeInputs = [rustToolchain];
+    text = ''
+      set -euo pipefail
+
+      if [[ $# -ne 0 ]]; then
+        echo "usage: wasm-tests" >&2
+        exit 2
+      fi
+
+      d8="''${D8_LINUX64:?D8_LINUX64 is not set}"
+      runner="/run/js/dist/wasm-driver/tests.js"
+      if [[ ! -f "$runner" ]]; then
+        echo "missing prebuilt wasm driver: $runner" >&2
+        echo "ask the orchestrator to build and supply the JS runner artifacts" >&2
+        exit 2
+      fi
+
+      cargo build -p vip9r --target wasm32-unknown-unknown --release --features wasm-tests
+      exec "$d8" "$runner" -- target/wasm32-unknown-unknown/release/vip9r.wasm
+    '';
+  };
+  wasmGolden = pkgs.writeShellApplication {
+    name = "wasm-golden";
+    runtimeInputs = [rustToolchain];
+    text = ''
+      set -euo pipefail
+
+      allow_mismatch=0
+      if [[ $# -gt 0 && "$1" == "--allow-mismatch" ]]; then
+        allow_mismatch=1
+        shift
+      fi
+      if [[ $# -gt 1 ]]; then
+        echo "usage: wasm-golden [--allow-mismatch] [INPUT_IVF]" >&2
+        exit 2
+      fi
+
+      d8="''${D8_LINUX64:?D8_LINUX64 is not set}"
+      runner="/run/js/dist/wasm-driver/golden.js"
+      input="''${1:-/media/chromium/bear-vp9.ivf}"
+      cargo build -p vip9r --target wasm32-unknown-unknown --release
+      if [[ "$allow_mismatch" -eq 1 ]]; then
+        exec "$d8" "$runner" -- --allow-mismatch target/wasm32-unknown-unknown/release/vip9r.wasm "$input"
+      fi
+      exec "$d8" "$runner" -- target/wasm32-unknown-unknown/release/vip9r.wasm "$input"
+    '';
+  };
   sandboxPackages =
     (with pkgs; [
       # Shell and baseline userland.
@@ -52,7 +101,6 @@
       libvpx
       nodejs
       pkg-config
-      pnpm
       python3
       ripgrep
       rustToolchain
@@ -62,7 +110,7 @@
       # Debugging and host inspection.
       strace
     ])
-    ++ [codex];
+    ++ [codex wasmGolden wasmTests];
   sandboxEnv = pkgs.buildEnv {
     name = "vip9r-grinder-env";
     paths = sandboxPackages;
@@ -96,12 +144,11 @@ in
 
     text = ''
       usage() {
-        cat >&2 <<'EOF'
-      usage:
-        grinder run TASK_FILE
-        grinder shell [COMMAND...]
-        grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]
-      EOF
+        printf '%s\n' \
+          'usage:' \
+          '  grinder run TASK_FILE' \
+          '  grinder shell [COMMAND...]' \
+          '  grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]' >&2
       }
 
       repo="$PWD"
@@ -150,6 +197,14 @@ in
       system_prompt="$repo/scripts/grinder-system-prompt.md"
       codex_config="$repo/scripts/grinder-codex-config.toml"
       codex_events="$repo/scripts/codex-events.mjs"
+      wasm_driver_dist="$repo/js/dist/wasm-driver"
+      for artifact in golden.js tests.js; do
+        if [[ ! -f "$wasm_driver_dist/$artifact" ]]; then
+          echo "missing prebuilt wasm driver artifact: $wasm_driver_dist/$artifact" >&2
+          echo "run: cd js && pnpm build:wasm-driver" >&2
+          exit 2
+        fi
+      done
 
       temp_dir="$repo/temp"
       codex_home="$temp_dir/codex-home"
@@ -173,6 +228,8 @@ in
         [[ "$(basename "$entry")" == target ]] && continue
         cp -a "$entry" "$run/rust/"
       done
+      mkdir -p "$run/js/dist"
+      cp -a "$wasm_driver_dist" "$run/js/dist/"
 
       cp -a "$system_prompt" "$run/system.md"
       if [[ -n "$task_file" ]]; then

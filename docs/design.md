@@ -25,13 +25,12 @@ two phases rather than gated incrementally:
   from the spec. Almost nothing produces a correct full frame until the entire
   pipeline (entropy → dequant → inverse transform → prediction → reconstruction
   → loop filter) exists, so per-frame goldens cannot gate early work. M1
-  verification is builds, `clippy`, targeted unit tests, engineering judgment,
-  and the host golden harness running end to end with output allowed to be
-  wrong.
+  verification was builds, `clippy`, targeted unit tests, engineering judgment,
+  and a frame-md5 harness running end to end with output allowed to be wrong.
 - **Bring-up second (M2).** Drive frame-md5 correctness green. The fast host
-  harness is the primary debugging loop; the wasm driver is the shipping-path
-  parity check. The first frame whose md5 matches is the first-bit-exact
-  milestone; from there it is debugging.
+  harness has been retired; the d8 wasm driver is the canonical correctness
+  loop and shipping-path parity check. The first frame whose md5 matches is the
+  first-bit-exact milestone; from there it is debugging.
 
 libvpx-generated outputs are useful when the spec or test vectors are not
 enough. Intermediate checks may be added when they make failures easier to
@@ -44,9 +43,9 @@ reverse the `FrameIsIntra` condition. The decoder uses the fixed
 `kf_partition_probs` table for key/intra frame partition syntax, matching the
 table naming and key-frame syntax context.
 
-### Golden harnesses
+### Golden runner
 
-Golden harnesses decode a vector frame by frame and compare per-frame md5
+The golden runner decodes a vector frame by frame and compares per-frame md5
 against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 
 - The hash is over the raw I420 frame: Y (visible `d_w`×`d_h`), then U, then V
@@ -61,43 +60,27 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
 needed to begin.
 
-The host harness runs `vip9r` directly. It is the cheap core bring-up and
-debug loop, not the final shipping-path gate:
+The d8 wasm driver is the canonical golden path and exercises the manual
+boundary used by the shipping path. In grinder sandboxes, use the short command:
 
 ```sh
-cd rust
-cargo run -p vip9r-tools -- golden /bulk/vip9r/chromium/bear-vp9.ivf
+wasm-golden
 ```
 
-Inside grinder sandboxes, use `/media/chromium/bear-vp9.ivf`. The harness
-defaults the golden path to the `.md5` sidecar. It exits non-zero on decode
-errors, missing/extra shown frames, or md5 mismatches; `--allow-mismatch` only
-permits wrong frame hashes for code-complete smoke runs. The current host
-decoder parses all 82 coded frames in `bear-vp9.ivf`, emits 82 shown frames,
-applies the in-loop filter, and strict md5 passes with 82 matched frames and no
-mismatches/missing/extra frames.
+`wasm-golden` builds the release wasm module and runs d8 against prebuilt JS
+runner artifacts supplied to the sandbox; it does not build or expose the JS
+project. It defaults to `/media/chromium/bear-vp9.ivf` inside grinder and the
+driver defaults the golden path to the `.md5` sidecar. It exits non-zero on
+decode errors, missing/extra shown frames, or md5 mismatches;
+`wasm-golden --allow-mismatch` only permits wrong frame hashes for code-complete
+smoke runs. The current wasm driver parses all 82 coded frames in
+`bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
+md5 passes with 82 matched frames and no mismatches/missing/extra frames.
 
-The wasm driver exercises the manual boundary under d8 with the same md5
-protocol. It is the wasm/shipping-path parity gate, but grinder implementors do
-not get it by default while current tasks are Rust/core-focused:
-
-```sh
-cd rust
-cargo build -p vip9r --target wasm32-unknown-unknown
-cd ../js
-pnpm build:wasm-driver
-$D8_LINUX64 dist/wasm-driver/golden.js -- \
-  ../rust/target/wasm32-unknown-unknown/debug/vip9r.wasm \
-  /bulk/vip9r/chromium/bear-vp9.ivf
-```
-
-The current wasm driver also parses all 82 coded frames in `bear-vp9.ivf`,
-emits 82 shown frames, and strict md5 passes with the same output as the host.
-Decode-path wasm failures are now expected to be real core/no-std parity issues
-unless they happen before `decode_next`, which still implicates the JS/wasm
-wrapper, exported ABI, input copying, or packet setup. The driver also accepts
-`--allow-mismatch`; like the host harness, this only permits wrong frame hashes,
-not missing or extra shown frames.
+Decode-path wasm failures are expected to be real core/no-std issues unless
+they happen before `decode_next`, which still implicates the JS/wasm wrapper,
+exported ABI, input copying, or packet setup. The JS runner reports packet,
+timestamp, coded-frame, and output-frame context without changing the wasm ABI.
 
 ### Decode API
 

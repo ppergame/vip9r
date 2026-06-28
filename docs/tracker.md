@@ -11,14 +11,14 @@ an ordered backlog, not an architecture commitment.
 
 ## Now
 
-M0 — decode API and the fast host golden harness.
+M0 — decode API and the first frame-md5 golden harness.
 
 - [x] user: VP9 profile 0 / 8-bit spec source
 - [x] user: conformance vectors for the profile 0 / 8-bit subset
 - [x] prebuilt d8 binaries for host and ARM
 - [x] freestanding `no_std` wasm skeleton with a minimal decode API
-- [x] finalize the core decode API for host harness frame output
-- [x] fast host golden harness: IVF demux, per-frame md5 vs the `.md5` golden,
+- [x] finalize the core decode API for frame output
+- [x] initial golden harness: IVF demux, per-frame md5 vs the `.md5` golden,
       on `bear-vp9.ivf`
 - [x] first implementor handoff packet
 
@@ -83,11 +83,11 @@ M2 beyond `bear-vp9.ivf`. Gated on M1; gates M2.
 - [ ] add wasm-test print support: static bounded formatting buffer, imported JS
       sink function, `test_println!`, and a panic handler that prints `PanicInfo`
       before trapping
-- [ ] migrate the `bear-vp9.ivf` strict md5 check to the wasm/d8 frontend as the
+- [x] migrate the `bear-vp9.ivf` strict md5 check to the wasm/d8 frontend as the
       canonical golden path
-- [ ] remove `vip9r-tools`; do not add WebM or new correctness surface area to the
-      native runner
-- [ ] update `docs/design.md` and `scripts/grinder-system-prompt.md` so future
+- [x] remove `vip9r-tools`; do not add WebM or new correctness surface area in
+      this migration
+- [x] update `docs/design.md` and `scripts/grinder-system-prompt.md` so future
       tasks use wasm/d8 for full-decode correctness and wasm unit tests for
       target-exact implementation checks
 
