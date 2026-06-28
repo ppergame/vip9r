@@ -110,8 +110,13 @@ Drive frame-md5 correctness green. Gated on M2R.
       expanding fixed tile-context column storage for 19200px+ frames
 - [x] fix `vp90-2-19-skip-02.webm`: strict wasm-golden green after preserving
       `PrevSegmentIds` across frames that do not update the segment map
-- [ ] fix or classify `vp90-2-22-svc_1280x720_3.ivf`: golden runner rejects
-      IVF dimensions `0x0` after the sorted md5-backed sweep passes 304 files
+- [x] fix `vp90-2-22-svc_1280x720_3.ivf`: strict wasm-golden green after
+      deriving zero IVF dimensions from md5 sidecar names and comparing the
+      top spatial layer
+- [ ] finish/classify long 720p validation for
+      `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm`; the sorted direct-d8 sweep
+      passed 300/330 files, then spent 13+ minutes CPU-bound on this vector
+      before the run was stopped
 - [ ] conformance subset green on full frames
 - [ ] webm demux + corpus clips green
 - [ ] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,

@@ -13,7 +13,7 @@ import {
   parseVp9Input,
   passes,
 } from "./golden";
-import type { NativeFrame, Plane } from "../wasm";
+import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 
 describe("wasm golden runner helpers", () => {
   test("parses IVF headers and packets, including extended headers", () => {
@@ -30,6 +30,14 @@ describe("wasm golden runner helpers", () => {
     expect([...ivf.packets[0].payload]).toEqual([1, 2, 3]);
     expect(ivf.packets[1].timestamp).toBe(1n);
     expect([...ivf.packets[1].payload]).toEqual([4, 5]);
+  });
+
+  test("preserves zero IVF dimensions for sidecar-sized vectors", () => {
+    const ivf = parseIvf(sampleIvf({ width: 0, height: 0 }));
+
+    expect(ivf.width).toBe(0);
+    expect(ivf.height).toBe(0);
+    expect(ivf.packets).toHaveLength(2);
   });
 
   test("dispatches IVF and WebM inputs by magic bytes", () => {
@@ -68,10 +76,8 @@ describe("wasm golden runner helpers", () => {
     badHeaderLength[7] = 0;
     expect(() => parseIvf(badHeaderLength)).toThrow("IVF header length is too small: 31");
 
-    const zeroWidth = sampleIvf();
-    zeroWidth[12] = 0;
-    zeroWidth[13] = 0;
-    expect(() => parseIvf(zeroWidth)).toThrow("IVF dimensions must be non-zero: 0x240");
+    const noPackets = sampleIvf().subarray(0, 32);
+    expect(() => parseIvf(noPackets)).toThrow("IVF contains no packets");
   });
 
   test("parses libvpx md5 sidecars", () => {
@@ -126,6 +132,15 @@ describe("wasm golden runner helpers", () => {
     });
   });
 
+  test("chooses decoder dimensions from sidecar frame names when IVF dimensions are zero", () => {
+    const golden = parseGolden("369f3d6ce1ba7ad7bd5716d0aef8daf4  svc-1280x720-0001.i420\n");
+
+    expect(decoderDimensionsForGolden({ width: 0, height: 0 }, golden)).toEqual({
+      width: 1280,
+      height: 720,
+    });
+  });
+
   test("falls back to container dimensions when sidecar names do not include dimensions", () => {
     const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
 
@@ -134,6 +149,14 @@ describe("wasm golden runner helpers", () => {
       width: 320,
       height: 240,
     });
+  });
+
+  test("rejects decoder dimensions when neither container nor sidecar gives a size", () => {
+    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
+
+    expect(() => decoderDimensionsForGolden({ width: 0, height: 0 }, golden)).toThrow(
+      "decoder dimensions unavailable: container=0x0, golden=none",
+    );
   });
 
   test("md5 implementation matches known vectors", () => {
@@ -189,6 +212,29 @@ describe("wasm golden runner helpers", () => {
     expect(passes(report, true)).toBe(false);
   });
 
+  test("filters decoded outputs whose dimensions are absent from dimensioned sidecar names", () => {
+    const ivf = parseIvf(sampleIvf({ width: 0, height: 0 }));
+    const top1 = scriptedFrame(4, 4, 10, 20, 30, 1);
+    const top2 = scriptedFrame(4, 4, 11, 21, 31, 10);
+    const decoder = scriptedDecoder([
+      scriptedFrame(2, 2, 1, 2, 3, 20),
+      top1,
+      scriptedFrame(2, 2, 4, 5, 6, 30),
+      top2,
+    ]);
+    const golden = parseGolden(
+      `${md5Hex(top1.compact)}  svc-4x4-0001.i420\n` +
+        `${md5Hex(top2.compact)}  svc-4x4-0002.i420\n`,
+    );
+
+    const report = compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder);
+
+    expect(report.decodedOutputFrames).toBe(4);
+    expect(report.skippedOutputFrames).toBe(2);
+    expect(report.comparisons).toHaveLength(2);
+    expect(passes(report, false)).toBe(true);
+  });
+
   test("adds packet context to begin-packet failures without wasm ABI help", () => {
     const ivf = parseIvf(sampleIvf());
     const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
@@ -241,6 +287,8 @@ function sampleReport(comparisons: ComparisonReport["comparisons"], expectedCoun
     declaredFrameCount: 2,
     packetCount: 2,
     codedFrames: 2,
+    decodedOutputFrames: comparisons.length,
+    skippedOutputFrames: 0,
     comparisons,
     expectedCount,
   };
@@ -283,6 +331,77 @@ function frameWithPlanes(
   return { decoder, native };
 }
 
+type ScriptedFrame = {
+  native: NativeFrame;
+  compact: Uint8Array;
+  planes: Map<number, Uint8Array>;
+};
+
+function scriptedDecoder(frames: ScriptedFrame[]): FrameDecoder {
+  const planeBytes = new Map<number, Uint8Array>();
+  for (const frame of frames) {
+    for (const [offset, bytes] of frame.planes) {
+      planeBytes.set(offset, bytes);
+    }
+  }
+  let index = 0;
+  return {
+    beginPacket() {},
+    decodeNext(): DecodeStep {
+      if (index >= frames.length) {
+        throw new Error("scripted decoder exhausted");
+      }
+      const frame = frames[index].native;
+      index += 1;
+      return { kind: "output", packetDone: index % 2 === 0, frame };
+    },
+    planeBytes(plane: Plane) {
+      const bytes = planeBytes.get(plane.offset);
+      if (!bytes) {
+        throw new Error(`unknown plane offset ${plane.offset}`);
+      }
+      return bytes.subarray(0, plane.byteLength);
+    },
+  };
+}
+
+function scriptedFrame(
+  width: number,
+  height: number,
+  yValue: number,
+  uValue: number,
+  vValue: number,
+  offsetBase: number,
+): ScriptedFrame {
+  const chromaWidth = Math.ceil(width / 2);
+  const chromaHeight = Math.ceil(height / 2);
+  const y = new Uint8Array(width * height).fill(yValue);
+  const u = new Uint8Array(chromaWidth * chromaHeight).fill(uValue);
+  const v = new Uint8Array(chromaWidth * chromaHeight).fill(vValue);
+  const compact = new Uint8Array(y.byteLength + u.byteLength + v.byteLength);
+  compact.set(y, 0);
+  compact.set(u, y.byteLength);
+  compact.set(v, y.byteLength + u.byteLength);
+
+  return {
+    native: {
+      decodedWidth: width,
+      decodedHeight: height,
+      renderWidth: width,
+      renderHeight: height,
+      y: { offset: offsetBase, byteLength: y.byteLength, stride: width },
+      u: { offset: offsetBase + 1, byteLength: u.byteLength, stride: chromaWidth },
+      v: { offset: offsetBase + 2, byteLength: v.byteLength, stride: chromaWidth },
+    },
+    compact,
+    planes: new Map([
+      [offsetBase, y],
+      [offsetBase + 1, u],
+      [offsetBase + 2, v],
+    ]),
+  };
+}
+
 function sampleWebm(): Uint8Array {
   return webmConcat(
     webmElement(WEBM_ID.EBML, webmStringElement(WEBM_ID.DocType, "webm")),
@@ -318,15 +437,15 @@ function sampleWebm(): Uint8Array {
   );
 }
 
-function sampleIvf(options: { headerLength?: number } = {}): Uint8Array {
+function sampleIvf(options: { headerLength?: number; width?: number; height?: number } = {}): Uint8Array {
   const headerLength = options.headerLength ?? 32;
   const bytes: number[] = [];
   ascii(bytes, "DKIF");
   le16(bytes, 0);
   le16(bytes, headerLength);
   ascii(bytes, "VP90");
-  le16(bytes, 320);
-  le16(bytes, 240);
+  le16(bytes, options.width ?? 320);
+  le16(bytes, options.height ?? 240);
   le32(bytes, 1000);
   le32(bytes, 1);
   le32(bytes, 2);

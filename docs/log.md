@@ -276,3 +276,23 @@ milestones, and measured optimization results.
   0 mismatched. The sorted md5-backed corpus sweep advances through 304 media
   files and stops at `vp90-2-22-svc_1280x720_3.ivf`, where the golden runner
   rejects IVF header dimensions `0x0` before decode.
+
+## 2026-06-28 — VP9 zero-dimension SVC IVF harnessing
+
+- Changed the wasm golden runner to allow IVF header dimensions `0x0` through
+  demux metadata and derive decoder limits from dimensioned md5 sidecar frame
+  names when the container cannot provide them.
+- Added a narrow zero-dimension IVF comparison rule for SVC vectors whose md5
+  sidecar covers only the top spatial layer: decoded outputs with dimensions
+  absent from the sidecar are counted and skipped before positional md5
+  comparison. The rule is not applied globally because some WebM sidecar
+  filename dimensions are not the decoded frame dimensions.
+- `vp90-2-22-svc_1280x720_3.ivf` now passes strict wasm-golden at 20 matched /
+  0 mismatched after decoding 60 shown outputs and skipping 40 lower-layer
+  outputs. `vp90-2-15-segkey_adpq.webm` remains green at 150 matched /
+  0 mismatched, guarding against overbroad dimension filtering.
+- A sorted direct-d8 corpus sweep passed 300/330 media files, including the
+  previous SVC frontier, then spent 13+ minutes CPU-bound on
+  `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm` (17,895 md5 frames) before this
+  orchestrator run stopped the sweep rather than leave a long `d8` process
+  running.

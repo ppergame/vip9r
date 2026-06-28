@@ -63,6 +63,12 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
   frame count ≤ coded frame count.
 - Golden format is one line per shown frame: `<md5hex>  <name>.i420`. Compare
   positionally.
+- Some SVC IVF vectors advertise `0x0` container dimensions and carry a
+  dimensioned md5 sidecar for the top spatial layer only. The runner may derive
+  decoder limits from those sidecar names; for zero-dimension IVF only, decoded
+  outputs whose decoded size is absent from the sidecar dimensions are skipped
+  before positional comparison. Do not apply this skip rule to ordinary IVF/WebM
+  vectors: md5 filename dimensions are not reliable enough for a global filter.
 
 The d8 wasm driver is the canonical golden path and exercises the manual
 boundary used by the shipping path. In grinder sandboxes, use the short command:
@@ -88,9 +94,10 @@ payloads become VP9 packets, and laced VP9 blocks are rejected.
 parser is single-pass over a complete file-shaped input: it expects `Tracks`
 before `Cluster`, does not follow `SeekHead`, and does not model split
 init/media segments yet. For resize vectors whose `TrackEntry` dimensions are
-smaller than later decoded frames, the harness sizes the decoder from the
-maximum dimensions encoded in the `.md5` sidecar frame names when available,
-falling back to container dimensions.
+smaller than later decoded frames, and for zero-dimension IVF vectors with
+dimensioned sidecar names, the harness sizes the decoder from the maximum
+dimensions encoded in the `.md5` sidecar frame names when available, falling
+back to container dimensions.
 
 Decode-path wasm failures are expected to be real core/no-std issues unless they
 happen before `decode_next`, which still implicates the JS/wasm wrapper,

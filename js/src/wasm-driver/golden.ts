@@ -80,6 +80,8 @@ export type ComparisonReport = {
   timestampScale?: number;
   packetCount: number;
   codedFrames: number;
+  decodedOutputFrames: number;
+  skippedOutputFrames: number;
   comparisons: FrameComparison[];
   expectedCount: number;
 };
@@ -135,7 +137,10 @@ export function compareDecodedVp9ToGolden(
   decoder: FrameDecoder,
 ): ComparisonReport {
   const comparisons: FrameComparison[] = [];
+  const comparedDimensions = zeroDimensionIvf(input) ? comparedGoldenDimensions(golden) : undefined;
   let coded = 0;
+  let decodedOutputFrames = 0;
+  let skippedOutputFrames = 0;
   for (const packet of input.packets) {
     try {
       decoder.beginPacket(packet.payload);
@@ -155,6 +160,18 @@ export function compareDecodedVp9ToGolden(
       codedIndex += 1;
 
       if (step.kind === "output") {
+        decodedOutputFrames += 1;
+        if (
+          comparedDimensions !== undefined &&
+          !comparedDimensions.has(dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight))
+        ) {
+          skippedOutputFrames += 1;
+          if (step.packetDone) {
+            break;
+          }
+          continue;
+        }
+
         let actual: string;
         try {
           actual = md5Hex(compactI420(decoder, step.frame));
@@ -182,10 +199,23 @@ export function compareDecodedVp9ToGolden(
     }
   }
 
-  return makeReport(inputPath, goldenPath, input, coded, comparisons, golden.length);
+  return makeReport(
+    inputPath,
+    goldenPath,
+    input,
+    coded,
+    decodedOutputFrames,
+    skippedOutputFrames,
+    comparisons,
+    golden.length,
+  );
 }
 
 export const compareDecodedIvfToGolden = compareDecodedVp9ToGolden;
+
+function zeroDimensionIvf(input: DemuxedVp9): boolean {
+  return input.container === "ivf" && input.width === 0 && input.height === 0;
+}
 
 export function parseVp9Input(data: Uint8Array): DemuxedVp9 {
   if (data.byteLength >= 4 && ascii(data, 0, 4) === "DKIF") {
@@ -239,9 +269,6 @@ export function parseIvf(data: Uint8Array): IvfFile {
 
   const width = le16(data, 12);
   const height = le16(data, 14);
-  if (width === 0 || height === 0) {
-    throw new Error(`IVF dimensions must be non-zero: ${width}x${height}`);
-  }
 
   const packets: IvfPacket[] = [];
   let offset = headerLength;
@@ -312,10 +339,16 @@ export function decoderDimensionsForGolden(
   golden: GoldenFrame[],
 ): { width: number; height: number } {
   const maxDimensions = maxGoldenDimensions(golden);
-  return {
-    width: Math.max(input.width, maxDimensions?.width ?? 0),
-    height: Math.max(input.height, maxDimensions?.height ?? 0),
-  };
+  const width = Math.max(input.width, maxDimensions?.width ?? 0);
+  const height = Math.max(input.height, maxDimensions?.height ?? 0);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    throw new Error(
+      `decoder dimensions unavailable: container=${input.width}x${input.height}, golden=${
+        maxDimensions === undefined ? "none" : `${maxDimensions.width}x${maxDimensions.height}`
+      }`,
+    );
+  }
+  return { width, height };
 }
 
 export function maxGoldenDimensions(golden: GoldenFrame[]): { width: number; height: number } | undefined {
@@ -335,6 +368,18 @@ export function maxGoldenDimensions(golden: GoldenFrame[]): { width: number; hei
   return { width, height };
 }
 
+function comparedGoldenDimensions(golden: GoldenFrame[]): Set<string> | undefined {
+  const dimensions = new Set<string>();
+  for (const frame of golden) {
+    const parsed = dimensionsFromGoldenName(frame.name);
+    if (parsed === undefined) {
+      return undefined;
+    }
+    dimensions.add(dimensionKey(parsed.width, parsed.height));
+  }
+  return dimensions;
+}
+
 function dimensionsFromGoldenName(name: string): { width: number; height: number } | undefined {
   const xSeparated = /(?:^|[-_])(\d+)x(\d+)-\d+\.i420$/i.exec(name);
   const dashSeparated = /(?:^|[-_])(\d+)-(\d+)-\d+\.i420$/i.exec(name);
@@ -351,11 +396,17 @@ function dimensionsFromGoldenName(name: string): { width: number; height: number
   return { width, height };
 }
 
+function dimensionKey(width: number, height: number): string {
+  return `${width}x${height}`;
+}
+
 export function makeReport(
   inputPath: string,
   goldenPath: string,
   input: DemuxedVp9,
   codedFrames: number,
+  decodedOutputFrames: number,
+  skippedOutputFrames: number,
   comparisons: FrameComparison[],
   expectedCount: number,
 ): ComparisonReport {
@@ -372,6 +423,8 @@ export function makeReport(
     timestampScale: input.timestampScale,
     packetCount: input.packets.length,
     codedFrames,
+    decodedOutputFrames,
+    skippedOutputFrames,
     comparisons,
     expectedCount,
   };
@@ -409,7 +462,7 @@ export function formatReport(report: ComparisonReport): string[] {
     `input: ${report.inputPath}`,
     `golden: ${report.goldenPath}`,
     formatContainerLine(report),
-    `decoder: coded_frames=${report.codedFrames} shown_frames=${report.comparisons.length}`,
+    `decoder: coded_frames=${report.codedFrames} decoded_outputs=${report.decodedOutputFrames} compared_frames=${report.comparisons.length} skipped_outputs=${report.skippedOutputFrames}`,
     `frames: ${matchedCount(report)} matched, ${mismatchCount(report)} mismatched, ${missingCount(report)} missing, ${extraCount(report)} extra`,
   ];
 
