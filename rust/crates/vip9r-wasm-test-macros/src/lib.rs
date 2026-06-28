@@ -63,7 +63,10 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn __vip9r_wasm_test_finish(self) -> i32 {
                     match self {
                         Ok(()) => 0,
-                        Err(_) => 1,
+                        Err(err) => {
+                            crate::__vip9r_test_failure(core::format_args!("{err:?}"));
+                            1
+                        }
                     }
                 }
             }

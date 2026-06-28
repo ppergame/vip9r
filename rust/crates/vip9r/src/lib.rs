@@ -1,6 +1,13 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+#[macro_export]
+macro_rules! diag {
+    ($($arg:tt)*) => {
+        $crate::__vip9r_diag(::core::format_args!($($arg)*))
+    };
+}
+
 mod bitstream;
 mod boolcoder;
 mod compressed_header;
@@ -25,6 +32,16 @@ use tile_syntax::{
 };
 
 pub const MAX_CODED_FRAMES_PER_PACKET: usize = 8;
+
+#[doc(hidden)]
+pub fn __vip9r_diag(args: core::fmt::Arguments<'_>) {
+    wasm::log(wasm::LogKind::Diagnostic, args);
+}
+
+#[doc(hidden)]
+pub fn __vip9r_test_failure(args: core::fmt::Arguments<'_>) {
+    wasm::log(wasm::LogKind::TestFailure, args);
+}
 
 const REFERENCE_FRAME_SLOTS: usize = 8;
 const FRAME_POOL_SLOTS: usize = 1 + REFERENCE_FRAME_SLOTS;

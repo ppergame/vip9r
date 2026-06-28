@@ -1,6 +1,19 @@
 import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 
+export const WasmLogKind = {
+  Diagnostic: 0,
+  TestFailure: 1,
+  Panic: 2,
+} as const;
+
+export type WasmLog = {
+  kind: number;
+  message: string;
+};
+
+export type WasmLogSink = (log: WasmLog) => void;
+
 export type IvfPacket = {
   index: number;
   timestamp: bigint;
@@ -58,6 +71,7 @@ export type ComparisonReport = {
 export type GoldenIo = {
   read(path: string): string;
   readbuffer(path: string): ArrayBuffer;
+  log: WasmLogSink;
 };
 
 export type FrameDecoder = {
@@ -68,12 +82,32 @@ export type FrameDecoder = {
 
 export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonReport {
   const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
-  const instance = new WebAssembly.Instance(wasm, {});
+  let instance: WebAssembly.Instance | undefined;
+  const imports = makeVip9rImports(() => {
+    if (instance === undefined) {
+      throw new Error("vip9r_log called before wasm instance was assigned");
+    }
+    return instanceMemory(instance);
+  }, io.log);
+  instance = new WebAssembly.Instance(wasm, imports);
   const ivf = parseIvf(new Uint8Array(io.readbuffer(args.inputPath)));
   const golden = parseGolden(io.read(args.goldenPath));
   const decoder = new Vp9Decoder(instance, ivf.width, ivf.height);
 
   return compareDecodedIvfToGolden(args.inputPath, args.goldenPath, ivf, golden, decoder);
+}
+
+export function formatWasmLog(log: WasmLog): string {
+  switch (log.kind) {
+    case WasmLogKind.Diagnostic:
+      return `wasm diag: ${log.message}`;
+    case WasmLogKind.TestFailure:
+      return `wasm test failure: ${log.message}`;
+    case WasmLogKind.Panic:
+      return `wasm panic: ${log.message}`;
+    default:
+      return `wasm log ${log.kind}: ${log.message}`;
+  }
 }
 
 export function compareDecodedIvfToGolden(
@@ -529,4 +563,47 @@ function contextError(context: string, error: unknown): Error {
     wrapped.stack = `${wrapped.message}\nCaused by: ${error.stack}`;
   }
   return wrapped;
+}
+
+const utf8Decoder = typeof TextDecoder === "function" ? new TextDecoder("utf-8") : undefined;
+
+function makeVip9rImports(
+  getMemory: () => WebAssembly.Memory,
+  sink: WasmLogSink,
+): WebAssembly.Imports {
+  return {
+    env: {
+      vip9r_log(kind: number, ptr: number, len: number): void {
+        const memory = getMemory();
+        if (!Number.isInteger(ptr) || !Number.isInteger(len) || ptr < 0 || len < 0) {
+          throw new Error(`invalid wasm log span: ptr=${ptr} len=${len}`);
+        }
+        if (ptr + len > memory.buffer.byteLength) {
+          throw new Error(`wasm log span out of bounds: ptr=${ptr} len=${len}`);
+        }
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        sink({ kind, message: decodeUtf8(bytes) });
+      },
+    },
+  };
+}
+
+function instanceMemory(instance: WebAssembly.Instance): WebAssembly.Memory {
+  const memory = instance.exports.memory;
+  if (!(memory instanceof WebAssembly.Memory)) {
+    throw new Error("missing wasm export: memory");
+  }
+  return memory;
+}
+
+function decodeUtf8(bytes: Uint8Array): string {
+  if (utf8Decoder !== undefined) {
+    return utf8Decoder.decode(bytes);
+  }
+
+  let text = "";
+  for (const byte of bytes) {
+    text += String.fromCharCode(byte);
+  }
+  return text;
 }

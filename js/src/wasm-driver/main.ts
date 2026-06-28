@@ -6,6 +6,7 @@ import {
   missingCount,
   mismatchCount,
   passes,
+  formatWasmLog,
 } from "./golden";
 import type { DriverArgs } from "./golden";
 
@@ -21,7 +22,13 @@ type D8Global = typeof globalThis & {
 
 function main(args: string[]): void {
   const driverArgs = parseArgs(args);
-  const report = compareWasmToGolden(driverArgs, { read, readbuffer });
+  const report = compareWasmToGolden(driverArgs, {
+    read,
+    readbuffer,
+    log(log) {
+      print(formatWasmLog(log));
+    },
+  });
   for (const line of formatReport(report)) {
     print(line);
   }

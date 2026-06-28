@@ -80,9 +80,9 @@ M2 beyond `bear-vp9.ivf`. Gated on M1; gates M2.
       without wasmtime
 - [x] add a `wasm-tests` feature and proc-macro `#[wasm_tests]` module shape
       that exports inline `#[test]` functions for the d8 runner
-- [ ] add wasm-test print support: static bounded formatting buffer, imported JS
-      sink function, `test_println!`, and a panic handler that prints `PanicInfo`
-      before trapping
+- [x] add wasm diagnostic print support: bounded stack formatting buffer,
+      imported kinded JS sink function, `diag!`, `Result::Err` test messages,
+      and a panic handler that prints `PanicInfo` before trapping
 - [x] migrate the `bear-vp9.ivf` strict md5 check to the wasm/d8 frontend as the
       canonical golden path
 - [x] remove `vip9r-tools`; do not add WebM or new correctness surface area in

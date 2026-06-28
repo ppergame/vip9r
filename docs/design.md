@@ -80,7 +80,14 @@ md5 passes with 82 matched frames and no mismatches/missing/extra frames.
 Decode-path wasm failures are expected to be real core/no-std issues unless
 they happen before `decode_next`, which still implicates the JS/wasm wrapper,
 exported ABI, input copying, or packet setup. The JS runner reports packet,
-timestamp, coded-frame, and output-frame context without changing the wasm ABI.
+timestamp, coded-frame, and output-frame context around decode calls.
+
+All d8 frontends instantiate the wasm module with `env.vip9r_log(kind, ptr, len)`.
+Rust `diag!` formats into a bounded stack buffer and the JS sink copies bytes
+synchronously during the import call; callers must not retain the raw wasm span.
+Routine golden and test runs print nothing unless Rust emits diagnostics or
+panics. Log kind `0` is ordinary diagnostics, `1` is wasm test failure output,
+and `2` is panic output.
 
 ### Decode API
 

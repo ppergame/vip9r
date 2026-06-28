@@ -1,4 +1,7 @@
-use core::panic::PanicInfo;
+use core::{
+    fmt::{self, Write},
+    panic::PanicInfo,
+};
 
 use crate::{
     DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, Plane, WorkspaceLayout,
@@ -11,10 +14,62 @@ const RESOURCE_LIMIT: i32 = -3;
 const WASM_PAGE: usize = 64 * 1024;
 const ARENA_ALIGN: usize = 16;
 const MAX_CODED_FRAMES: usize = crate::MAX_CODED_FRAMES_PER_PACKET;
+const LOG_BUFFER_LEN: usize = 1024;
 
 #[panic_handler]
-fn panic(_info: &PanicInfo<'_>) -> ! {
+fn panic(info: &PanicInfo<'_>) -> ! {
+    log(LogKind::Panic, format_args!("{info}"));
     core::arch::wasm32::unreachable();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LogKind {
+    Diagnostic = 0,
+    TestFailure = 1,
+    Panic = 2,
+}
+
+#[link(wasm_import_module = "env")]
+unsafe extern "C" {
+    fn vip9r_log(kind: i32, ptr: *const u8, len: usize);
+}
+
+struct LogBuffer {
+    bytes: [u8; LOG_BUFFER_LEN],
+    len: usize,
+}
+
+impl LogBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; LOG_BUFFER_LEN],
+            len: 0,
+        }
+    }
+}
+
+impl Write for LogBuffer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let remaining = self.bytes.len() - self.len;
+        let mut copy_len = remaining.min(s.len());
+        while !s.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
+
+        self.bytes[self.len..self.len + copy_len].copy_from_slice(&s.as_bytes()[..copy_len]);
+        self.len += copy_len;
+        if copy_len == s.len() {
+            Ok(())
+        } else {
+            Err(fmt::Error)
+        }
+    }
+}
+
+pub(crate) fn log(kind: LogKind, args: fmt::Arguments<'_>) {
+    let mut buffer = LogBuffer::new();
+    let _ = fmt::write(&mut buffer, args);
+    unsafe { vip9r_log(kind as i32, buffer.bytes.as_ptr(), buffer.len) };
 }
 
 #[repr(C)]
