@@ -62,7 +62,7 @@ Depending on the task, you can verify your work with
 
 - Engineering judgement. Self-review the change and decide whether it would
   satisfy the orchestrator and the user.
-- Wasm unit tests: `wasm-tests`
+- Wasm unit tests: `wasm-tests`, or `wasm-tests TEST_SUBSTRING` for targeted runs
 - `cargo clippy`
 - Wasm golden runner, strict: `wasm-golden`
 - Wasm golden runner, smoke mode: `wasm-golden --allow-mismatch`

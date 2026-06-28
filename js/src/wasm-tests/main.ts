@@ -9,6 +9,7 @@ type D8Global = typeof globalThis & {
 
 type RunnerArgs = {
   wasmPath: string;
+  testFilter?: string;
 };
 
 type TestResult =
@@ -19,13 +20,26 @@ const TEST_PREFIX = "vip9r_test__";
 const TEST_FAILURE = 1;
 
 function main(args: string[]): void {
-  const { wasmPath } = parseArgs(args);
+  const { wasmPath, testFilter } = parseArgs(args);
   const module = new WebAssembly.Module(readbuffer(wasmPath));
   const testNames = discoverTests(module);
+  const selectedTestNames = selectTests(testNames, testFilter);
+
+  if (testFilter !== undefined) {
+    const filtered = testNames.length - selectedTestNames.length;
+    const filterLabel = JSON.stringify(testFilter);
+    if (selectedTestNames.length === 0) {
+      print(`no tests matched substring ${filterLabel} (${testNames.length} discovered)`);
+      quit(1);
+    }
+    print(
+      `running ${selectedTestNames.length} of ${testNames.length} tests matching ${filterLabel} (${filtered} filtered out)`,
+    );
+  }
 
   let passed = 0;
   let failed = 0;
-  for (const testName of testNames) {
+  for (const testName of selectedTestNames) {
     const result = runTest(module, testName);
     if (result.kind === "pass") {
       passed += 1;
@@ -37,11 +51,11 @@ function main(args: string[]): void {
   }
 
   if (failed === 0) {
-    print(`result: ok. ${passed} passed; 0 failed`);
+    print(formatResult("ok", passed, failed, testNames.length - selectedTestNames.length));
     return;
   }
 
-  print(`result: FAILED. ${passed} passed; ${failed} failed`);
+  print(formatResult("FAILED", passed, failed, testNames.length - selectedTestNames.length));
   quit(1);
 }
 
@@ -50,20 +64,24 @@ function parseArgs(args: string[]): RunnerArgs {
     printUsage();
     quit(0);
   }
-  if (args.length !== 1) {
+  if (args.length < 1 || args.length > 2) {
     printUsage();
-    throw new UsageError("expected wasm path");
+    throw new UsageError("expected wasm path and optional test substring");
   }
-  const [wasmPath] = args;
+  const [wasmPath, testFilter] = args;
   if (wasmPath.startsWith("-")) {
     printUsage();
     throw new UsageError(`unknown argument: ${wasmPath}`);
   }
-  return { wasmPath };
+  const runnerArgs: RunnerArgs = { wasmPath };
+  if (testFilter !== undefined) {
+    runnerArgs.testFilter = testFilter;
+  }
+  return runnerArgs;
 }
 
 function printUsage(): void {
-  print("usage: d8 dist/wasm-driver/tests.js -- vip9r.wasm");
+  print("usage: d8 dist/wasm-driver/tests.js -- vip9r.wasm [TEST_SUBSTRING]");
 }
 
 function discoverTests(module: WebAssembly.Module): string[] {
@@ -74,6 +92,21 @@ function discoverTests(module: WebAssembly.Module): string[] {
     }
   }
   return tests;
+}
+
+function selectTests(testNames: string[], testFilter: string | undefined): string[] {
+  if (testFilter === undefined) {
+    return testNames;
+  }
+  return testNames.filter((testName) => testName.includes(testFilter));
+}
+
+function formatResult(status: "ok" | "FAILED", passed: number, failed: number, filtered: number): string {
+  const base = `result: ${status}. ${passed} passed; ${failed} failed`;
+  if (filtered === 0) {
+    return base;
+  }
+  return `${base}; ${filtered} filtered out`;
 }
 
 function runTest(module: WebAssembly.Module, testName: string): TestResult {

@@ -48,8 +48,13 @@ in {
     text = ''
       set -euo pipefail
 
-      if [[ $# -ne 0 ]]; then
-        echo "usage: wasm-tests" >&2
+      if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+        echo "usage: wasm-tests [TEST_SUBSTRING]" >&2
+        exit 0
+      fi
+
+      if [[ $# -gt 1 ]]; then
+        echo "usage: wasm-tests [TEST_SUBSTRING]" >&2
         exit 2
       fi
 
@@ -61,6 +66,9 @@ in {
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         -p vip9r --release --features wasm-tests
+      if [[ $# -eq 1 ]]; then
+        exec "${v8.linux64}/d8" "$runner" -- "$wasm_path" "$1"
+      fi
       exec "${v8.linux64}/d8" "$runner" -- "$wasm_path"
     '';
   };
