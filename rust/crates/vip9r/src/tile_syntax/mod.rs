@@ -938,7 +938,7 @@ impl TileParser<'_, '_, '_> {
                 if !info.valid {
                     return Err(TileSyntaxError::InvalidBitstream);
                 }
-                segment_id = core::cmp::min(segment_id, info.segment_id);
+                segment_id = core::cmp::min(segment_id, info.segment_map_id);
             }
         }
         Ok(segment_id)
@@ -990,17 +990,21 @@ impl TileParser<'_, '_, '_> {
         for (ref_list, mv) in mvs.iter_mut().enumerate() {
             *mv = block.block_mvs[ref_list][3];
         }
-        let stored = StoredModeInfo {
+        let mut stored = StoredModeInfo {
             valid: true,
             skip: block.skip,
             tx_size: block.tx_size,
             segment_id: block.segment_id,
+            segment_map_id: block.segment_id,
             mi_size: block_size,
             y_mode: block.y_mode,
             ref_frames: block.ref_frames,
             mvs,
             sub_mvs: block.block_mvs,
         };
+        let segment_map_updates = self.segmentation.enabled && self.segmentation.update_map;
+        let preserve_segment_map = !self.segment_map_reset && !segment_map_updates;
+        let prev_frame_modes = self.prev_frame_modes;
         let width = usize::from(block_size.num_8x8_wide());
         let height = usize::from(block_size.num_8x8_high());
         for y in 0..height {
@@ -1021,6 +1025,22 @@ impl TileParser<'_, '_, '_> {
                     .checked_mul(self.mi_cols)
                     .and_then(|value| value.checked_add(mode_col))
                     .ok_or(TileSyntaxError::InvalidBitstream)?;
+                stored.segment_map_id = if preserve_segment_map {
+                    match prev_frame_modes {
+                        Some(prev_frame_modes) => {
+                            let previous = prev_frame_modes.get(index)?;
+                            if !previous.valid {
+                                return Err(TileSyntaxError::InvalidBitstream);
+                            }
+                            previous.segment_map_id
+                        }
+                        None => 0,
+                    }
+                } else if self.segment_map_reset && !segment_map_updates {
+                    0
+                } else {
+                    block.segment_id
+                };
                 current_frame_modes.set(index, stored)?;
             }
         }
@@ -3633,7 +3653,13 @@ pub(crate) struct StoredModeInfo {
     valid: bool,
     skip: bool,
     tx_size: TxSize,
+    // Current frame's SegmentIds entry, used by loop filtering and other
+    // current-frame syntax consumers.
     segment_id: u8,
+    // Persistent PrevSegmentIds entry after this frame. This can differ from
+    // segment_id when segmentation_update_map is false: current block syntax
+    // uses get_segment_id(), but the saved segmentation map is not refreshed.
+    segment_map_id: u8,
     mi_size: BlockSize,
     y_mode: u8,
     ref_frames: [u8; REF_LISTS],
@@ -3650,8 +3676,9 @@ const STORED_MODE_INFO_SKIP_OFFSET: usize = 44;
 const STORED_MODE_INFO_TX_SIZE_OFFSET: usize = 45;
 const STORED_MODE_INFO_SEGMENT_ID_OFFSET: usize = 46;
 const STORED_MODE_INFO_MI_SIZE_OFFSET: usize = 47;
+const STORED_MODE_INFO_SEGMENT_MAP_ID_OFFSET: usize = 48;
 
-pub(crate) const STORED_MODE_INFO_BYTES: usize = 48;
+pub(crate) const STORED_MODE_INFO_BYTES: usize = 49;
 
 pub(crate) fn mode_info_byte_len(mi_count: usize) -> Option<usize> {
     mi_count.checked_mul(STORED_MODE_INFO_BYTES)
@@ -3809,6 +3836,7 @@ fn decode_stored_mode_info(bytes: &[u8]) -> Result<StoredModeInfo, TileSyntaxErr
         skip: bytes[STORED_MODE_INFO_SKIP_OFFSET] != 0,
         tx_size,
         segment_id: bytes[STORED_MODE_INFO_SEGMENT_ID_OFFSET],
+        segment_map_id: bytes[STORED_MODE_INFO_SEGMENT_MAP_ID_OFFSET],
         mi_size,
         y_mode,
         ref_frames,
@@ -3825,6 +3853,7 @@ fn encode_stored_mode_info(info: StoredModeInfo, bytes: &mut [u8]) {
     bytes[STORED_MODE_INFO_SKIP_OFFSET] = u8::from(info.skip);
     bytes[STORED_MODE_INFO_TX_SIZE_OFFSET] = info.tx_size as u8;
     bytes[STORED_MODE_INFO_SEGMENT_ID_OFFSET] = info.segment_id;
+    bytes[STORED_MODE_INFO_SEGMENT_MAP_ID_OFFSET] = info.segment_map_id;
     bytes[STORED_MODE_INFO_MI_SIZE_OFFSET] = info.mi_size as u8;
     bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET] = info.ref_frames[0];
     bytes[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1] = info.ref_frames[1];
@@ -6520,6 +6549,7 @@ mod tests {
             skip: true,
             tx_size: TxSize::Tx8x8,
             segment_id: 0,
+            segment_map_id: 3,
             mi_size: BlockSize::Block16x16,
             y_mode: NEARESTMV,
             ref_frames: [LAST_FRAME, NONE_FRAME],
@@ -6552,6 +6582,84 @@ mod tests {
     }
 
     #[test]
+    fn persistent_segment_map_survives_disabled_segmentation_frame() {
+        let probabilities = FrameContext::DEFAULT;
+        let mut counts = SyntaxCounts::default();
+        let mut contexts = TileModeContexts::new(2).unwrap();
+        let mut previous_mode_bytes = [0; STORED_MODE_INFO_BYTES * 4];
+        {
+            let mut previous_modes = ModeInfoViewMut::new(&mut previous_mode_bytes).unwrap();
+            for (index, segment_map_id) in [5, 4, 3, 2].into_iter().enumerate() {
+                previous_modes
+                    .set(
+                        index,
+                        StoredModeInfo {
+                            valid: true,
+                            skip: false,
+                            tx_size: TxSize::Tx8x8,
+                            segment_id: 0,
+                            segment_map_id,
+                            mi_size: BlockSize::Block8x8,
+                            y_mode: ZEROMV,
+                            ref_frames: [LAST_FRAME, NONE_FRAME],
+                            mvs: [MotionVector::ZERO; REF_LISTS],
+                            sub_mvs: [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS],
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut current_mode_bytes = [0; STORED_MODE_INFO_BYTES * 4];
+        {
+            let prev_frame_modes = ModeInfoView::new(&previous_mode_bytes).unwrap();
+            let current_frame_modes = ModeInfoViewMut::new(&mut current_mode_bytes).unwrap();
+            let mut parser = TileParser {
+                decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
+                probabilities: &probabilities,
+                counts: &mut counts,
+                contexts: &mut contexts,
+                tx_mode: TxMode::Only4x4,
+                frame_is_intra: false,
+                frame_width: 16,
+                frame_height: 16,
+                reference_mode: ReferenceMode::Single,
+                compound_reference: None,
+                interpolation_filter: None,
+                allow_high_precision_mv: false,
+                use_prev_frame_mvs: false,
+                ref_frame_sign_bias: [false; 4],
+                lossless: true,
+                dequant: FrameDequant::new(0, 0, 0, 0),
+                segmentation: crate::header::SegmentationParams::disabled(),
+                segment_map_reset: false,
+                mi_rows: 2,
+                mi_cols: 2,
+                tile_col_start: 0,
+                tile_col_end: 2,
+                left_row_base: 0,
+                prev_frame_modes: Some(prev_frame_modes),
+                current_frame_modes: Some(current_frame_modes),
+                reference_frames: None,
+            };
+            let mut block = test_block(true);
+            block.segment_id = 0;
+
+            parser
+                .update_current_frame_modes(0, 0, BlockSize::Block16x16, block)
+                .unwrap();
+        }
+
+        let current_modes = ModeInfoView::new(&current_mode_bytes).unwrap();
+        for (index, segment_map_id) in [5, 4, 3, 2].into_iter().enumerate() {
+            let info = current_modes.get(index).unwrap();
+            assert!(info.valid);
+            assert_eq!(info.segment_id, 0);
+            assert_eq!(info.segment_map_id, segment_map_id);
+        }
+    }
+
+    #[test]
     fn mv_ref_candidate_uses_exact_current_frame_history_for_deep_offsets() {
         let probabilities = FrameContext::DEFAULT;
         let mut contexts = TileModeContexts::new(8).unwrap();
@@ -6580,6 +6688,7 @@ mod tests {
                     skip: false,
                     tx_size: TxSize::Tx4x4,
                     segment_id: 0,
+                    segment_map_id: 0,
                     mi_size: BlockSize::Block8x8,
                     y_mode: NEARESTMV,
                     ref_frames: [LAST_FRAME, NONE_FRAME],

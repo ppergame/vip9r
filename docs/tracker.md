@@ -108,10 +108,10 @@ Drive frame-md5 correctness green. Gated on M2R.
       full decode
 - [x] fix `vp90-2-13-largescaling.webm`: strict wasm-golden green after
       expanding fixed tile-context column storage for 19200px+ frames
-- [ ] fix or classify `vp90-2-19-skip-02.webm`: packet 5 coded frame 0 returns
-      `InvalidBitstream` after the sorted md5-backed sweep passes 275 files
+- [x] fix `vp90-2-19-skip-02.webm`: strict wasm-golden green after preserving
+      `PrevSegmentIds` across frames that do not update the segment map
 - [ ] fix or classify `vp90-2-22-svc_1280x720_3.ivf`: golden runner rejects
-      IVF dimensions `0x0`
+      IVF dimensions `0x0` after the sorted md5-backed sweep passes 304 files
 - [ ] conformance subset green on full frames
 - [ ] webm demux + corpus clips green
 - [ ] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,

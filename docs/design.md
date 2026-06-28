@@ -43,6 +43,13 @@ reverse the `FrameIsIntra` condition. The decoder uses the fixed
 `kf_partition_probs` table for key/intra frame partition syntax, matching the
 table naming and key-frame syntax context.
 
+Segmentation note: current-frame block metadata and the persistent segmentation
+map are related but distinct. `segment_id` feeds current-frame syntax,
+dequantization, and loop filtering. The saved `PrevSegmentIds` map only changes
+when the frame updates the segmentation map, and otherwise persists across
+segmentation-disabled or `update_map == false` frames unless reset by past
+independence.
+
 ### Golden runner
 
 The golden runner decodes a vector frame by frame and compares per-frame md5

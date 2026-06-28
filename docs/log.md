@@ -265,3 +265,14 @@ milestones, and measured optimization results.
   0 mismatched. The sorted md5-backed corpus sweep advances through 275 media
   files and stops at `vp90-2-19-skip-02.webm`, which returns
   `InvalidBitstream` at packet 5 coded frame 0.
+
+## 2026-06-28 — VP9 persistent segment map
+
+- Separated current-frame `segment_id` from the saved `PrevSegmentIds` entry in
+  packed mode history, so frames with segmentation disabled or
+  `segmentation_update_map == false` preserve the prior segment map instead of
+  overwriting it with current syntax IDs.
+- `vp90-2-19-skip-02.webm` now passes strict wasm-golden at 12 matched /
+  0 mismatched. The sorted md5-backed corpus sweep advances through 304 media
+  files and stops at `vp90-2-22-svc_1280x720_3.ivf`, where the golden runner
+  rejects IVF header dimensions `0x0` before decode.
