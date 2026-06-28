@@ -221,3 +221,15 @@ milestones, and measured optimization results.
 - M1 is code-complete for the current supported subset. M2 bring-up now moves to
   conformance vectors and corpus clips; segmentation remains outside the
   implemented tile subset and is still rejected before filtering.
+
+## 2026-06-28 — VP9 MI-rounded reconstruction extents
+
+- rev: jj `opnpvtvo`
+- Changed the workspace frame-pool/current-frame view to reconstruct over the
+  spec MI-rounded luma extent (`MiCols*8` by `MiRows*8`) and matching chroma
+  extent, while keeping public I420 output and reference views clipped to the
+  visible decoded frame dimensions.
+- Strict wasm-golden now passes on the resize vectors that previously failed:
+  `vp90-2-05-resize.ivf` is 10 matched / 0 mismatched, and
+  `vp90-2-18-resize.ivf` is 100 matched / 0 mismatched. `bear-vp9.ivf` remains
+  green at 82 matched / 0 mismatched.

@@ -65,7 +65,7 @@ in {
       require_runner "$runner"
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
-        -p vip9r --release --features wasm-tests
+        --target wasm32-unknown-unknown -p vip9r --release --features wasm-tests
       if [[ $# -eq 1 ]]; then
         exec "${v8.linux64}/d8" "$runner" -- "$wasm_path" "$1"
       fi
@@ -97,7 +97,7 @@ in {
       require_runner "$runner"
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
-        -p vip9r --release
+        --target wasm32-unknown-unknown -p vip9r --release
       if [[ "$allow_mismatch" -eq 1 ]]; then
         exec "${v8.linux64}/d8" "$runner" -- --allow-mismatch "$wasm_path" "$input"
       fi

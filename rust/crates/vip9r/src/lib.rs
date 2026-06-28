@@ -235,12 +235,19 @@ struct FrameLayout {
 
 impl FrameLayout {
     fn new(max_width: u32, max_height: u32) -> Result<Self, DecodeError> {
-        let y_stride = usize::try_from(max_width).map_err(|_| DecodeError::InvalidConfig)?;
-        let uv_width = max_width.div_ceil(2);
-        let uv_height = max_height.div_ceil(2);
+        // Intra prediction and loop filtering operate over the spec's MI grid
+        // (`MiCols * 8` by `MiRows * 8`), even when the visible frame size is
+        // not a multiple of 8. Keep frame slots large enough for those
+        // reconstructed edge samples; output/reference views still expose the
+        // visible dimensions.
+        let padded_width = mi_aligned_pixels(max_width).ok_or(DecodeError::InvalidConfig)?;
+        let padded_height = mi_aligned_pixels(max_height).ok_or(DecodeError::InvalidConfig)?;
+        let y_stride = usize::try_from(padded_width).map_err(|_| DecodeError::InvalidConfig)?;
+        let uv_width = padded_width / 2;
+        let uv_height = padded_height / 2;
         let uv_stride = usize::try_from(uv_width).map_err(|_| DecodeError::InvalidConfig)?;
 
-        let y = PlaneLayout::new(0, PlaneShape::new(max_width, max_height, y_stride))?;
+        let y = PlaneLayout::new(0, PlaneShape::new(padded_width, padded_height, y_stride))?;
         let u = PlaneLayout::new(y.end()?, PlaneShape::new(uv_width, uv_height, uv_stride))?;
         let v = PlaneLayout::new(u.end()?, u.shape)?;
         let frame = Self { y, u, v };
@@ -625,12 +632,18 @@ fn current_frame_view(
     let (y_data, after_y) = frame.split_at_mut(y_len);
     let (u_data, after_u) = after_y.split_at_mut(u_len);
     let (v_data, _) = after_u.split_at_mut(v_len);
-    let chroma_width = width.div_ceil(2);
-    let chroma_height = height.div_ceil(2);
+    // CurrFrame is addressed by intra prediction and loop filtering using
+    // MI-rounded dimensions. This preserves reconstructed samples in partial
+    // right/bottom blocks for later prediction/filtering, while the public
+    // I420 output path slices back to the visible frame size.
+    let padded_width = mi_aligned_pixels(width).ok_or(DecodeError::InvalidConfig)?;
+    let padded_height = mi_aligned_pixels(height).ok_or(DecodeError::InvalidConfig)?;
+    let chroma_width = padded_width / 2;
+    let chroma_height = padded_height / 2;
 
     let y = CurrentPlaneMut::new(
         y_data,
-        PlaneShape::new(width, height, layout.y.shape.stride),
+        PlaneShape::new(padded_width, padded_height, layout.y.shape.stride),
     )
     .map_err(|_| DecodeError::InvalidConfig)?;
     let u = CurrentPlaneMut::new(
@@ -1240,6 +1253,10 @@ fn frame_mi_count(width: u32, height: u32) -> Result<usize, DecodeError> {
         .ok_or(DecodeError::InvalidBitstream)
 }
 
+fn mi_aligned_pixels(pixels: u32) -> Option<u32> {
+    pixels.checked_add(7).map(|value| value & !7)
+}
+
 fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
     if max_width == 0 || max_height == 0 || required_i420_len(max_width, max_height).is_none() {
         return Err(DecodeError::InvalidConfig);
@@ -1320,6 +1337,24 @@ mod tests {
     }
 
     #[test]
+    fn non_mi_multiple_layout_keeps_padded_reconstruction_planes() {
+        let layout = WorkspaceLayout::new(17, 9).unwrap();
+        let frame_bytes = 24 * 16 + 2 * 12 * 8;
+        let mode_history_slot_bytes = 6 * super::tile_syntax::STORED_MODE_INFO_BYTES;
+
+        assert_eq!(layout.max_width(), 17);
+        assert_eq!(layout.max_height(), 9);
+        assert_eq!(layout.frame_pool.frame.y.shape, PlaneShape::new(24, 16, 24));
+        assert_eq!(layout.frame_pool.frame.u.shape, PlaneShape::new(12, 8, 12));
+        assert_eq!(layout.frame_pool.frame.v.shape, PlaneShape::new(12, 8, 12));
+        assert_eq!(layout.frame_pool.current.len, frame_bytes);
+        assert_eq!(
+            layout.total_bytes(),
+            frame_bytes * 9 + 2 * mode_history_slot_bytes
+        );
+    }
+
+    #[test]
     fn decode_workspace_rejects_undersized_arena() {
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut memory = [0; TEST_WORKSPACE_BYTES];
@@ -1367,6 +1402,32 @@ mod tests {
                 frame_index: 0,
                 y_stride: 16,
                 uv_stride: 8,
+            },
+        );
+    }
+
+    #[test]
+    fn decode_coded_frame_outputs_visible_i420_from_padded_layout() {
+        let frame = minimal_lossless_key_frame_with_size(17, 9);
+        let layout = WorkspaceLayout::new(17, 9).unwrap();
+        let mut decoder = Decoder::new(layout);
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(layout);
+
+        let outcome = decoder.decode_coded_frame(&frame, &mut workspace).unwrap();
+        let DecodeOutcome::Output(frame) = outcome else {
+            panic!("shown key frame should output");
+        };
+        assert_default_i420_frame(
+            frame,
+            ExpectedFrame {
+                visible_width: 17,
+                visible_height: 9,
+                render_width: 17,
+                render_height: 9,
+                frame_index: 0,
+                y_stride: 24,
+                uv_stride: 12,
             },
         );
     }

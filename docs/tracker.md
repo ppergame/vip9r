@@ -98,10 +98,11 @@ Drive frame-md5 correctness green. Gated on M2R.
 - [x] first bit-exact frame
 - [x] `bear-vp9.ivf` strict md5 green on host and wasm
 - [x] strict wasm-golden green for `vp90-2-12-droppable_{1,2,3}.ivf`
-- [ ] fix or classify `vp90-2-05-resize.ivf`: resource limit at packet 0 frame 0
+- [x] fix `vp90-2-05-resize.ivf`: strict wasm-golden green after
+      MI-rounded reconstruction extents
 - [ ] fix or classify `vp90-2-09-subpixel-00.ivf`: invalid bitstream at packet 0
       frame 0
-- [ ] fix `vp90-2-18-resize.ivf`: 55 frame-md5 mismatches after successful
+- [x] fix `vp90-2-18-resize.ivf`: 55 frame-md5 mismatches after successful
       full decode
 - [ ] fix or classify `vp90-2-22-svc_1280x720_3.ivf`: golden runner rejects
       IVF dimensions `0x0`
