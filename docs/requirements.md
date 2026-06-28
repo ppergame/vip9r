@@ -120,11 +120,14 @@ moment the session is done.
 The grinder is a batch job. It is ok for the orchestrator to poll it at the
 maximum supported interval.
 
-Previous orchestrator infra failures:
+Previous orchestrator infra failures. Retry unless there have been three
+consecutive failures.
 
 - grinder fails on turn one: malformed `tool_search` arguments with a garbage
   1255-character property name; API rejected the turn
-  - verdict: retry, stop if it fails three consequent times
+  - verdict: retry
+- grinder stuck for 5 or more minutes with no output
+  - verdict: retry
 
 ### Codex implementor
 
