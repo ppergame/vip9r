@@ -29,6 +29,12 @@ type ElementHeader = {
   contentStart: number;
   contentEnd: number;
   unknownSize: boolean;
+  truncatedContent: boolean;
+};
+
+type ReadElementOptions = {
+  allowUnknownSize?: boolean;
+  allowTruncatedContent?: boolean;
 };
 
 type WebmTrack = {
@@ -118,9 +124,15 @@ class WebmParser {
   parse(): WebmFile {
     let offset = 0;
     while (offset < this.data.byteLength) {
-      const element = this.readElement(offset, this.data.byteLength, true);
+      const element = this.readElement(offset, this.data.byteLength, {
+        allowUnknownSize: true,
+        allowTruncatedContent: true,
+      });
       if (element.unknownSize && element.id !== ID.Segment) {
         throw new Error(`element ${hexId(element.id)} has unsupported unknown size`);
+      }
+      if (element.truncatedContent && element.id !== ID.Segment) {
+        throw new Error(`element ${hexId(element.id)} size exceeds parent`);
       }
 
       switch (element.id) {
@@ -386,16 +398,21 @@ class WebmParser {
     return selected[0];
   }
 
-  private readElement(offset: number, parentEnd: number, allowUnknownSize = false): ElementHeader {
-    const element = readElementHeader(this.data, offset, parentEnd);
-    if (element.unknownSize && !allowUnknownSize) {
+  private readElement(offset: number, parentEnd: number, options: ReadElementOptions = {}): ElementHeader {
+    const element = readElementHeader(this.data, offset, parentEnd, options.allowTruncatedContent ?? false);
+    if (element.unknownSize && !(options.allowUnknownSize ?? false)) {
       throw new Error(`element ${hexId(element.id)} has unsupported unknown size`);
     }
     return element;
   }
 }
 
-function readElementHeader(data: Uint8Array, offset: number, parentEnd: number): ElementHeader {
+function readElementHeader(
+  data: Uint8Array,
+  offset: number,
+  parentEnd: number,
+  allowTruncatedContent: boolean,
+): ElementHeader {
   const id = readEbmlVint(data, offset, "id");
   if (id.nextOffset > parentEnd) {
     throw new Error(`element ID at offset ${offset} exceeds parent`);
@@ -408,9 +425,13 @@ function readElementHeader(data: Uint8Array, offset: number, parentEnd: number):
 
   const numericId = toSafeNumber(id.value, "EBML ID");
   const contentStart = size.nextOffset;
-  const contentEnd = size.unknownSize
+  let contentEnd = size.unknownSize
     ? parentEnd
     : checkedAdd(contentStart, toSafeNumber(size.value, "element size"));
+  const truncatedContent = contentEnd > parentEnd;
+  if (truncatedContent && allowTruncatedContent) {
+    contentEnd = parentEnd;
+  }
   if (contentEnd > parentEnd) {
     throw new Error(`element ${hexId(numericId)} size exceeds parent`);
   }
@@ -420,6 +441,7 @@ function readElementHeader(data: Uint8Array, offset: number, parentEnd: number):
     contentStart,
     contentEnd,
     unknownSize: size.unknownSize,
+    truncatedContent,
   };
 }
 

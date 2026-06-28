@@ -89,11 +89,27 @@ describe("webm", () => {
     expect(webm.packets.map((packet) => packet.timestamp)).toEqual([102n, 195n]);
   });
 
+  test("accepts a complete Segment prefix with a declared size beyond EOF", () => {
+    const webm = parseWebm(webmFile({ segmentDeclaredSizeExtra: 10_000 }));
+
+    expect(webm).toMatchObject({
+      codecId: "V_VP9",
+      width: 320,
+      height: 240,
+    });
+    expect(webm.packets).toHaveLength(1);
+    expect([...webm.packets[0].payload]).toEqual([1]);
+  });
+
   test("rejects malformed and truncated WebM input", () => {
     expect(() => parseWebm(new Uint8Array([0x1a, 0x45, 0xdf]))).toThrow("EBML VINT at offset 0 is truncated");
 
     const bytes = webmFile();
     expect(() => parseWebm(bytes.subarray(0, bytes.byteLength - 1))).toThrow(/size exceeds parent|truncated/);
+
+    expect(() =>
+      parseWebm(elementWithSize(ID.EBML, 10_000, stringElement(ID.DocType, "webm"))),
+    ).toThrow("element 0x1a45dfa3 size exceeds parent");
   });
 
   test("rejects missing and duplicate VP9 video tracks", () => {
@@ -139,20 +155,23 @@ function webmFile(
     tracks?: Uint8Array[];
     segmentExtras?: Uint8Array[];
     clusters?: Uint8Array[];
+    segmentDeclaredSizeExtra?: number;
   } = {},
 ): Uint8Array {
   const tracks = options.tracks ?? [vp9Track(1, { width: 320, height: 240 })];
   const clusters = options.clusters ?? [cluster(0, [simpleBlock(1, 0, 0, [1])])];
+  const segmentContent = concat(
+    element(ID.Info, uintElement(ID.TimestampScale, 1_000_000)),
+    element(ID.Tracks, concat(...tracks)),
+    ...(options.segmentExtras ?? []),
+    ...clusters,
+  );
   return concat(
     element(ID.EBML, stringElement(ID.DocType, "webm")),
-    element(
+    elementWithSize(
       ID.Segment,
-      concat(
-        element(ID.Info, uintElement(ID.TimestampScale, 1_000_000)),
-        element(ID.Tracks, concat(...tracks)),
-        ...(options.segmentExtras ?? []),
-        ...clusters,
-      ),
+      segmentContent.byteLength + (options.segmentDeclaredSizeExtra ?? 0),
+      segmentContent,
     ),
   );
 }
@@ -208,7 +227,11 @@ function blockContent(trackNumber: number, relativeTimestamp: number, flags: num
 }
 
 function element(id: number, content: Uint8Array): Uint8Array {
-  return concat(new Uint8Array(idBytes(id)), new Uint8Array(sizeVint(content.byteLength)), content);
+  return elementWithSize(id, content.byteLength, content);
+}
+
+function elementWithSize(id: number, declaredSize: number, content: Uint8Array): Uint8Array {
+  return concat(new Uint8Array(idBytes(id)), new Uint8Array(sizeVint(declaredSize)), content);
 }
 
 function uintElement(id: number, value: number): Uint8Array {
