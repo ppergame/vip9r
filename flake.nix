@@ -51,11 +51,19 @@
       EOF
             exit 1
     '';
+    wasmTools = import ./nix/wasm-tools.nix {
+      inherit pkgs rustToolchain v8;
+    };
     grinder = import ./nix/grinder.nix {
       inherit pkgs rustToolchain v8 codex;
+      inherit (wasmTools) wasmGolden wasmTests;
     };
   in {
-    packages.${system}.grinder = grinder;
+    packages.${system} = {
+      inherit grinder;
+      wasm-golden = wasmTools.wasmGolden;
+      wasm-tests = wasmTools.wasmTests;
+    };
 
     devShells.${system}.default = pkgs.mkShell {
       V8_LINUX64 = "${v8.linux64}";
@@ -95,6 +103,8 @@
         ]
         ++ [
           npmUnavailable
+          wasmTools.wasmGolden
+          wasmTools.wasmTests
         ];
     };
   };

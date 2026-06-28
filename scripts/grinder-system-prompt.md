@@ -43,7 +43,7 @@ Workspace crates:
 ### Inputs (read-only)
 
 - `/specs` - specs.
-- `/media` - VP9 test-vector corpus and frame md5 checksums.
+- `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
 - `wasm-tests` and `wasm-golden` on PATH - scripts that build and test the wasm
   module.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C

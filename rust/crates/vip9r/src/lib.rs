@@ -1260,7 +1260,7 @@ fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
 mod tests {
     use super::{
         DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, OwnedWorkspace,
-        PlaneShape, WorkspaceLayout, required_i420_len, split_packet,
+        PlaneShape, WorkspaceLayout, required_i420_len,
     };
 
     #[test]
@@ -1377,51 +1377,6 @@ mod tests {
                 uv_stride: 8,
             },
         );
-    }
-
-    #[test]
-    fn bear_first_shown_frame_is_not_globally_default_when_media_is_available() {
-        let Ok(ivf) = std::fs::read("/media/chromium/bear-vp9.ivf") else {
-            return;
-        };
-        if ivf.len() < 44 {
-            return;
-        }
-        let width = u16::from_le_bytes([ivf[12], ivf[13]]) as u32;
-        let height = u16::from_le_bytes([ivf[14], ivf[15]]) as u32;
-        let frame_size = u32::from_le_bytes([ivf[32], ivf[33], ivf[34], ivf[35]]) as usize;
-        let Some(packet_end) = 44usize.checked_add(frame_size) else {
-            return;
-        };
-        let Some(packet) = ivf.get(44..packet_end) else {
-            return;
-        };
-
-        let layout = WorkspaceLayout::new(width, height).unwrap();
-        let mut decoder = Decoder::new(layout);
-        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
-        let ranges = split_packet(packet).unwrap();
-
-        for range in ranges.as_slice() {
-            let coded_frame = range.as_slice(packet).unwrap();
-            let mut workspace = owned_workspace.as_workspace();
-            match decoder
-                .decode_coded_frame(coded_frame, &mut workspace)
-                .unwrap()
-            {
-                DecodeOutcome::NoOutput => {}
-                DecodeOutcome::Output(frame) => {
-                    assert!(
-                        !frame.y.data.iter().all(|&sample| sample == 128)
-                            || !frame.u.data.iter().all(|&sample| sample == 128)
-                            || !frame.v.data.iter().all(|&sample| sample == 128)
-                    );
-                    return;
-                }
-            }
-        }
-
-        panic!("first bear packet did not produce a shown frame");
     }
 
     #[test]

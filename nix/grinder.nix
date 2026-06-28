@@ -3,6 +3,8 @@
   rustToolchain,
   v8,
   codex,
+  wasmGolden,
+  wasmTests,
 }: let
   inherit (pkgs) lib;
 
@@ -10,55 +12,6 @@
   caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
-  wasmTests = pkgs.writeShellApplication {
-    name = "wasm-tests";
-    runtimeInputs = [rustToolchain];
-    text = ''
-      set -euo pipefail
-
-      if [[ $# -ne 0 ]]; then
-        echo "usage: wasm-tests" >&2
-        exit 2
-      fi
-
-      d8="''${D8_LINUX64:?D8_LINUX64 is not set}"
-      runner="/run/js/dist/wasm-driver/tests.js"
-      if [[ ! -f "$runner" ]]; then
-        echo "missing prebuilt wasm driver: $runner" >&2
-        echo "ask the orchestrator to build and supply the JS runner artifacts" >&2
-        exit 2
-      fi
-
-      cargo build -p vip9r --target wasm32-unknown-unknown --release --features wasm-tests
-      exec "$d8" "$runner" -- target/wasm32-unknown-unknown/release/vip9r.wasm
-    '';
-  };
-  wasmGolden = pkgs.writeShellApplication {
-    name = "wasm-golden";
-    runtimeInputs = [rustToolchain];
-    text = ''
-      set -euo pipefail
-
-      allow_mismatch=0
-      if [[ $# -gt 0 && "$1" == "--allow-mismatch" ]]; then
-        allow_mismatch=1
-        shift
-      fi
-      if [[ $# -gt 1 ]]; then
-        echo "usage: wasm-golden [--allow-mismatch] [INPUT_IVF]" >&2
-        exit 2
-      fi
-
-      d8="''${D8_LINUX64:?D8_LINUX64 is not set}"
-      runner="/run/js/dist/wasm-driver/golden.js"
-      input="''${1:-/media/chromium/bear-vp9.ivf}"
-      cargo build -p vip9r --target wasm32-unknown-unknown --release
-      if [[ "$allow_mismatch" -eq 1 ]]; then
-        exec "$d8" "$runner" -- --allow-mismatch target/wasm32-unknown-unknown/release/vip9r.wasm "$input"
-      fi
-      exec "$d8" "$runner" -- target/wasm32-unknown-unknown/release/vip9r.wasm "$input"
-    '';
-  };
   sandboxPackages =
     (with pkgs; [
       # Shell and baseline userland.
@@ -212,7 +165,7 @@ in
       mkdir -p "$temp_dir" "$codex_home" "$cargo_home"
       [[ -e "$codex_home/config.toml" ]] || touch "$codex_home/config.toml"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
-      mkdir -p "$run/codex-state" "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/trace"
+      mkdir -p "$run/codex-state" "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/rootfs/bulk/vip9r" "$run/trace"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
       git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
       ln -s "${sandboxEnv}" "$run/tools"
@@ -254,7 +207,7 @@ in
         --volume "$codex_config:/codex-home/config.toml:ro"
         --volume "$cargo_home:/cargo-home:rw"
         --volume "$repo/docs/specs:/specs:ro"
-        --volume "/bulk/vip9r:/media:ro"
+        --volume "/bulk/vip9r:/bulk/vip9r:ro"
       )
       rootfs_arg="$run/rootfs:O"
 

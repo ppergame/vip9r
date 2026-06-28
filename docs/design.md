@@ -68,9 +68,9 @@ wasm-golden
 ```
 
 `wasm-golden` builds the release wasm module and runs d8 against prebuilt JS
-runner artifacts supplied to the sandbox; it does not build or expose the JS
-project. It defaults to `/media/chromium/bear-vp9.ivf` inside grinder and the
-driver defaults the golden path to the `.md5` sidecar. It exits non-zero on
+runner artifacts. It works from the main checkout and inside grinder, defaults
+to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the driver defaults the golden path
+to the `.md5` sidecar. It exits non-zero on
 decode errors, missing/extra shown frames, or md5 mismatches;
 `wasm-golden --allow-mismatch` only permits wrong frame hashes for code-complete
 smoke runs. The current wasm driver parses all 82 coded frames in
@@ -199,8 +199,8 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 
 ## Corpus
 
-Test media is mapped at `/bulk/vip9r` on the host (`/media` inside the grinder
-sandbox). Each vector has a `.md5` golden.
+Test media lives at `/bulk/vip9r` on the host and inside the grinder sandbox.
+Each vector has a `.md5` golden.
 
 - **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset) plus
   `chromium/bear-vp9.ivf` as the IVF bring-up target.
