@@ -307,6 +307,7 @@ mod tests {
             delta_q_uv_ac: 0,
             lossless: true,
             loop_filter: LoopFilterParams::disabled(),
+            segmentation: crate::header::SegmentationParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2,

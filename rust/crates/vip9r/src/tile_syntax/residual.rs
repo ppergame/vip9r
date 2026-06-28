@@ -1,4 +1,4 @@
-use crate::header::UncompressedFrameHeader;
+use crate::header::{SEG_LVL_ALT_Q, SegmentationParams, UncompressedFrameHeader};
 
 use super::{MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType};
 
@@ -183,9 +183,11 @@ pub(super) struct FrameDequant {
     delta_q_y_dc: i32,
     delta_q_uv_dc: i32,
     delta_q_uv_ac: i32,
+    segmentation: SegmentationParams,
 }
 
 impl FrameDequant {
+    #[cfg(feature = "wasm-tests")]
     pub(super) const fn new(
         base_q_idx: u8,
         delta_q_y_dc: i32,
@@ -197,24 +199,65 @@ impl FrameDequant {
             delta_q_y_dc,
             delta_q_uv_dc,
             delta_q_uv_ac,
+            segmentation: SegmentationParams::disabled(),
+        }
+    }
+
+    pub(super) const fn new_with_segmentation(
+        base_q_idx: u8,
+        delta_q_y_dc: i32,
+        delta_q_uv_dc: i32,
+        delta_q_uv_ac: i32,
+        segmentation: SegmentationParams,
+    ) -> Self {
+        Self {
+            base_q_idx,
+            delta_q_y_dc,
+            delta_q_uv_dc,
+            delta_q_uv_ac,
+            segmentation,
         }
     }
 
     pub(super) const fn from_header(header: &UncompressedFrameHeader) -> Self {
-        Self::new(
+        Self::new_with_segmentation(
             header.base_q_idx,
             header.delta_q_y_dc,
             header.delta_q_uv_dc,
             header.delta_q_uv_ac,
+            header.segmentation,
         )
     }
 
+    #[cfg(feature = "wasm-tests")]
     pub(super) const fn get_qindex(self) -> i32 {
-        // Segmentation is rejected by tile parsing for now, so every transform
-        // block uses the frame base quantizer index.
+        self.get_qindex_for_segment(0)
+    }
+
+    pub(super) const fn get_qindex_for_segment(self, segment_id: u8) -> i32 {
+        if self.segmentation.enabled {
+            let segment_index = segment_id as usize;
+            if segment_index < self.segmentation.feature_enabled.len()
+                && self.segmentation.feature_enabled[segment_index][SEG_LVL_ALT_Q]
+            {
+                let mut data = self.segmentation.feature_data[segment_index][SEG_LVL_ALT_Q] as i32;
+                if !self.segmentation.abs_or_delta_update {
+                    data += self.base_q_idx as i32;
+                }
+                return if data < 0 {
+                    0
+                } else if data > 255 {
+                    255
+                } else {
+                    data
+                };
+            }
+        }
+
         self.base_q_idx as i32
     }
 
+    #[cfg(feature = "wasm-tests")]
     pub(super) fn get_dc_quant(self, plane: usize) -> i32 {
         let delta = if plane == 0 {
             self.delta_q_y_dc
@@ -224,17 +267,36 @@ impl FrameDequant {
         dc_q(self.get_qindex() + delta)
     }
 
+    pub(super) fn get_dc_quant_for_segment(self, plane: usize, segment_id: u8) -> i32 {
+        let delta = if plane == 0 {
+            self.delta_q_y_dc
+        } else {
+            self.delta_q_uv_dc
+        };
+        dc_q(self.get_qindex_for_segment(segment_id) + delta)
+    }
+
+    #[cfg(feature = "wasm-tests")]
     pub(super) fn get_ac_quant(self, plane: usize) -> i32 {
         let delta = if plane == 0 { 0 } else { self.delta_q_uv_ac };
         ac_q(self.get_qindex() + delta)
     }
 
-    pub(super) fn dequantize(self, input: &TransformCoefficients) -> DequantizedCoefficients {
+    pub(super) fn get_ac_quant_for_segment(self, plane: usize, segment_id: u8) -> i32 {
+        let delta = if plane == 0 { 0 } else { self.delta_q_uv_ac };
+        ac_q(self.get_qindex_for_segment(segment_id) + delta)
+    }
+
+    pub(super) fn dequantize(
+        self,
+        input: &TransformCoefficients,
+        segment_id: u8,
+    ) -> DequantizedCoefficients {
         let mut output = DequantizedCoefficients::new(input.block, input.eob);
         let count = coefficient_count(input.block.tx_size);
         let dq_denom = dq_denom(input.block.tx_size);
-        let dc_quant = self.get_dc_quant(input.block.plane);
-        let ac_quant = self.get_ac_quant(input.block.plane);
+        let dc_quant = self.get_dc_quant_for_segment(input.block.plane, segment_id);
+        let ac_quant = self.get_ac_quant_for_segment(input.block.plane, segment_id);
 
         for pos in 0..count {
             let quant = if pos == 0 { dc_quant } else { ac_quant };

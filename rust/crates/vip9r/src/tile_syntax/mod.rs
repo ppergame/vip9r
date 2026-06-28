@@ -5,7 +5,10 @@ use crate::compressed_header::{
     CompoundReferenceSetup, CompressedHeader, InterReferenceFrame, ReferenceMode, TxMode,
 };
 use crate::error::ParserError;
-use crate::header::{InterpolationFilter, LoopFilterParams, UncompressedFrameHeader};
+use crate::header::{
+    InterpolationFilter, LoopFilterParams, SEG_LVL_ALT_L, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+    SegmentationParams, UncompressedFrameHeader,
+};
 use crate::probability::{
     CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
 };
@@ -322,10 +325,6 @@ pub(crate) fn parse_intra_tiles(
         return Err(TileSyntaxError::InvalidBitstream);
     }
 
-    if header.segmentation_enabled || header.segmentation_update_map {
-        return Err(TileSyntaxError::Unimplemented);
-    }
-
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
     let mut contexts = TileModeContexts::new(mi_cols)?;
@@ -345,6 +344,8 @@ pub(crate) fn parse_intra_tiles(
             lossless: header.lossless,
             dequant: FrameDequant::from_header(header),
             frame_mis: (mi_rows, mi_cols),
+            segmentation: header.segmentation,
+            segment_map_reset: true,
         };
         parse_tile(
             frame,
@@ -382,10 +383,6 @@ pub(crate) fn parse_inter_tiles(
         return Err(TileSyntaxError::Unimplemented);
     }
 
-    if header.segmentation_enabled || header.segmentation_update_map {
-        return Err(TileSyntaxError::Unimplemented);
-    }
-
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
     let mut contexts = TileModeContexts::new(mi_cols)?;
@@ -408,6 +405,8 @@ pub(crate) fn parse_inter_tiles(
             lossless: header.lossless,
             dequant: FrameDequant::from_header(header),
             frame_mis: (mi_rows, mi_cols),
+            segmentation: header.segmentation,
+            segment_map_reset: header.error_resilient_mode,
         };
         parse_tile(
             frame,
@@ -444,6 +443,8 @@ struct TileParserConfig {
     lossless: bool,
     dequant: FrameDequant,
     frame_mis: (usize, usize),
+    segmentation: SegmentationParams,
+    segment_map_reset: bool,
 }
 
 struct TileParseShared<'a, 'f, 'r> {
@@ -507,6 +508,8 @@ fn parse_tile(
         ref_frame_sign_bias: config.ref_frame_sign_bias,
         lossless: config.lossless,
         dequant: config.dequant,
+        segmentation: config.segmentation,
+        segment_map_reset: config.segment_map_reset,
         mi_rows,
         mi_cols,
         tile_col_start,
@@ -556,6 +559,8 @@ struct TileParser<'a, 'b, 'r> {
     ref_frame_sign_bias: [bool; 4],
     lossless: bool,
     dequant: FrameDequant,
+    segmentation: SegmentationParams,
+    segment_map_reset: bool,
     mi_rows: usize,
     mi_cols: usize,
     tile_col_start: usize,
@@ -765,8 +770,8 @@ impl TileParser<'_, '_, '_> {
         avail_u: bool,
         avail_l: bool,
     ) -> Result<DecodedBlockInfo, TileSyntaxError> {
-        let segment_id = 0;
-        let skip = self.read_skip(row, col, avail_u, avail_l)?;
+        let segment_id = self.intra_segment_id()?;
+        let skip = self.read_skip(row, col, avail_u, avail_l, segment_id)?;
         let tx_size = self.read_tx_size(row, col, block_size, true, avail_u, avail_l)?;
         let (y_mode, sub_modes) = self.read_intra_modes(row, col, block_size, avail_u, avail_l)?;
         let uv_mode = self.read_default_uv_mode(y_mode)?;
@@ -805,9 +810,9 @@ impl TileParser<'_, '_, '_> {
         };
         let left_intra = left.ref_frames[0] == INTRA_FRAME;
         let above_intra = above.ref_frames[0] == INTRA_FRAME;
-        let segment_id = 0;
-        let skip = self.read_skip(row, col, avail_u, avail_l)?;
-        let is_inter = self.read_is_inter(avail_u, avail_l, left_intra, above_intra)?;
+        let segment_id = self.inter_segment_id(row, col, block_size)?;
+        let skip = self.read_skip(row, col, avail_u, avail_l, segment_id)?;
+        let is_inter = self.read_is_inter(avail_u, avail_l, left_intra, above_intra, segment_id)?;
         let tx_size =
             self.read_tx_size(row, col, block_size, !skip || !is_inter, avail_u, avail_l)?;
         let block_context = BlockModeContext {
@@ -828,13 +833,126 @@ impl TileParser<'_, '_, '_> {
         }
     }
 
+    fn intra_segment_id(&mut self) -> Result<u8, TileSyntaxError> {
+        if self.segmentation.enabled && self.segmentation.update_map {
+            self.read_segment_id()
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn inter_segment_id(
+        &mut self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+    ) -> Result<u8, TileSyntaxError> {
+        if !self.segmentation.enabled {
+            return Ok(0);
+        }
+
+        if self.segmentation.update_map {
+            if self.segmentation.temporal_update {
+                let predicted_segment_id = self.predicted_segment_id(row, col, block_size)?;
+                let ctx = self
+                    .contexts
+                    .seg_pred_context(self.left_row_base, row, col)?;
+                let seg_id_predicted = self.decoder.read_bool(self.segmentation.pred_probs[ctx])?;
+                self.contexts.update_seg_pred_context(
+                    self.left_row_base,
+                    row,
+                    col,
+                    block_size,
+                    seg_id_predicted,
+                )?;
+                if seg_id_predicted {
+                    Ok(predicted_segment_id)
+                } else {
+                    self.read_segment_id()
+                }
+            } else {
+                self.read_segment_id()
+            }
+        } else {
+            self.predicted_segment_id(row, col, block_size)
+        }
+    }
+
+    fn read_segment_id(&mut self) -> Result<u8, TileSyntaxError> {
+        let segment_id = self
+            .decoder
+            .read_tree(&SEGMENT_TREE, &self.segmentation.tree_probs)?;
+        if segment_id < 8 {
+            Ok(segment_id)
+        } else {
+            Err(TileSyntaxError::InvalidBitstream)
+        }
+    }
+
+    fn predicted_segment_id(
+        &self,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+    ) -> Result<u8, TileSyntaxError> {
+        if self.segment_map_reset {
+            return Ok(0);
+        }
+
+        let Some(prev_frame_modes) = self.prev_frame_modes else {
+            return Err(TileSyntaxError::Unimplemented);
+        };
+
+        let width = usize::from(block_size.num_8x8_wide());
+        let height = usize::from(block_size.num_8x8_high());
+        let xmis = core::cmp::min(
+            self.mi_cols
+                .checked_sub(col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            width,
+        );
+        let ymis = core::cmp::min(
+            self.mi_rows
+                .checked_sub(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            height,
+        );
+        let mut segment_id = 7u8;
+        for y in 0..ymis {
+            for x in 0..xmis {
+                let mode_row = row
+                    .checked_add(y)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                let mode_col = col
+                    .checked_add(x)
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                let index = mode_row
+                    .checked_mul(self.mi_cols)
+                    .and_then(|value| value.checked_add(mode_col))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                let info = prev_frame_modes.get(index)?;
+                if !info.valid {
+                    return Err(TileSyntaxError::InvalidBitstream);
+                }
+                segment_id = core::cmp::min(segment_id, info.segment_id);
+            }
+        }
+        Ok(segment_id)
+    }
+
     fn read_is_inter(
         &mut self,
         avail_u: bool,
         avail_l: bool,
         left_intra: bool,
         above_intra: bool,
+        segment_id: u8,
     ) -> Result<bool, TileSyntaxError> {
+        if self.seg_feature_active(segment_id, SEG_LVL_REF_FRAME) {
+            let ref_frame = self.seg_feature_data(segment_id, SEG_LVL_REF_FRAME)?;
+            return Ok(ref_frame != i16::from(INTRA_FRAME));
+        }
+
         let ctx = if avail_u && avail_l {
             if left_intra && above_intra {
                 3
@@ -943,6 +1061,7 @@ impl TileParser<'_, '_, '_> {
             above,
             context.col > self.tile_col_start,
             context.row > 0,
+            context.segment_id,
         )?;
         let is_compound = ref_frames[1] > INTRA_FRAME;
         let ref_count = 1 + usize::from(is_compound);
@@ -961,7 +1080,12 @@ impl TileParser<'_, '_, '_> {
 
         let mut y_mode = ZEROMV;
         let mut block_mvs = [[MotionVector::ZERO; SUB_BLOCKS]; REF_LISTS];
-        if context.block_size.is_at_least_8x8() {
+        let seg_skip = self.seg_feature_active(context.segment_id, SEG_LVL_SKIP);
+        if seg_skip {
+            if context.block_size < BlockSize::Block8x8 {
+                return Err(TileSyntaxError::InvalidBitstream);
+            }
+        } else if context.block_size.is_at_least_8x8() {
             let inter_mode = self.read_inter_mode(mv_state[0].mode_context)?;
             y_mode = inter_mode.y_mode();
         }
@@ -1042,7 +1166,12 @@ impl TileParser<'_, '_, '_> {
         col: usize,
         avail_u: bool,
         avail_l: bool,
+        segment_id: u8,
     ) -> Result<bool, TileSyntaxError> {
+        if self.seg_feature_active(segment_id, SEG_LVL_SKIP) {
+            return Ok(true);
+        }
+
         let ctx = self
             .contexts
             .skip_context(self.left_row_base, row, col, avail_u, avail_l)?;
@@ -1238,7 +1367,17 @@ impl TileParser<'_, '_, '_> {
         above: NeighborModeInfo,
         avail_l: bool,
         avail_u: bool,
+        segment_id: u8,
     ) -> Result<[u8; REF_LISTS], TileSyntaxError> {
+        if self.seg_feature_active(segment_id, SEG_LVL_REF_FRAME) {
+            let ref_frame = u8::try_from(self.seg_feature_data(segment_id, SEG_LVL_REF_FRAME)?)
+                .map_err(|_| TileSyntaxError::InvalidBitstream)?;
+            if ref_frame > ALTREF_FRAME {
+                return Err(TileSyntaxError::InvalidBitstream);
+            }
+            return Ok([ref_frame, NONE_FRAME]);
+        }
+
         if self.reference_mode == ReferenceMode::Select {
             let ctx = self.comp_mode_context(left, above, avail_l, avail_u)?;
             let compound = self
@@ -1776,6 +1915,16 @@ impl TileParser<'_, '_, '_> {
             .ok_or(TileSyntaxError::InvalidBitstream)
     }
 
+    fn seg_feature_active(&self, segment_id: u8, feature: usize) -> bool {
+        self.segmentation.feature_active(segment_id, feature)
+    }
+
+    fn seg_feature_data(&self, segment_id: u8, feature: usize) -> Result<i16, TileSyntaxError> {
+        self.segmentation
+            .feature_data(segment_id, feature)
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
     fn decode_residual(
         &mut self,
         row: usize,
@@ -1923,7 +2072,8 @@ impl TileParser<'_, '_, '_> {
                                 block,
                             )?;
                             nonzero = coefficients.nonzero_context();
-                            let mut dequantized = self.dequant.dequantize(&coefficients);
+                            let mut dequantized =
+                                self.dequant.dequantize(&coefficients, block.segment_id);
                             dequantized.inverse_transform(self.lossless)?;
                             reconstruct(current_frame, &dequantized)?;
                         }
@@ -2816,6 +2966,7 @@ fn add_residual_block(
 #[derive(Clone, Copy, Debug)]
 struct LoopFilterConfig<'a> {
     params: LoopFilterParams,
+    segmentation: SegmentationParams,
     modes: ModeInfoView<'a>,
     mi_rows: usize,
     mi_cols: usize,
@@ -2856,6 +3007,7 @@ fn loop_filter_frame(
         .as_view();
     let config = LoopFilterConfig {
         params: header.loop_filter,
+        segmentation: header.segmentation,
         modes,
         mi_rows: mi_size(header.frame_height)?,
         mi_cols: mi_size(header.frame_width)?,
@@ -2975,7 +3127,7 @@ fn loop_filter_superblock(
                 mi_rows: config.mi_rows,
                 mi_cols: config.mi_cols,
             });
-            let strength = loop_filter_strength(config.params, info)?;
+            let strength = loop_filter_strength(config, info)?;
             if strength.lvl == 0 {
                 continue;
             }
@@ -3096,10 +3248,26 @@ fn loop_filter_size(input: LoopFilterSizeInput) -> TxSize {
 }
 
 fn loop_filter_strength(
-    params: LoopFilterParams,
+    config: LoopFilterConfig<'_>,
     info: StoredModeInfo,
 ) -> Result<LoopFilterStrength, TileSyntaxError> {
+    let params = config.params;
     let mut lvl = i32::from(params.level);
+    if config
+        .segmentation
+        .feature_active(info.segment_id, SEG_LVL_ALT_L)
+    {
+        let mut data = i32::from(
+            config
+                .segmentation
+                .feature_data(info.segment_id, SEG_LVL_ALT_L)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        );
+        if !config.segmentation.abs_or_delta_update {
+            data += lvl;
+        }
+        lvl = clip3(0, 63, data);
+    }
     if params.delta_enabled {
         let n_shift = i32::from(params.level >> 5);
         let ref_frame = usize::from(info.ref_frames[0]);
@@ -3767,9 +3935,11 @@ struct TileModeContexts {
     above_partition: [u8; MAX_MI_COLS],
     above_mode: [NeighborModeInfo; MAX_MI_COLS],
     above_nonzero: [[u8; MAX_4X4_COLS]; PLANES],
+    above_seg_pred: [u8; MAX_MI_COLS],
     left_partition: [u8; MI_BLOCK_64],
     left_mode: [NeighborModeInfo; MI_BLOCK_64],
     left_nonzero: [[u8; MI_BLOCK_64 * 2]; PLANES],
+    left_seg_pred: [u8; MI_BLOCK_64],
     mi_cols: usize,
     partition_cols: usize,
 }
@@ -3788,9 +3958,11 @@ impl TileModeContexts {
             above_partition: [0; MAX_MI_COLS],
             above_mode: [NeighborModeInfo::DEFAULT; MAX_MI_COLS],
             above_nonzero: [[0; MAX_4X4_COLS]; PLANES],
+            above_seg_pred: [0; MAX_MI_COLS],
             left_partition: [0; MI_BLOCK_64],
             left_mode: [NeighborModeInfo::DEFAULT; MI_BLOCK_64],
             left_nonzero: [[0; MI_BLOCK_64 * 2]; PLANES],
+            left_seg_pred: [0; MI_BLOCK_64],
             mi_cols,
             partition_cols,
         })
@@ -3800,6 +3972,7 @@ impl TileModeContexts {
         self.left_partition = [0; MI_BLOCK_64];
         self.left_mode = [NeighborModeInfo::DEFAULT; MI_BLOCK_64];
         self.left_nonzero = [[0; MI_BLOCK_64 * 2]; PLANES];
+        self.left_seg_pred = [0; MI_BLOCK_64];
     }
 
     fn partition_context(
@@ -3892,6 +4065,58 @@ impl TileModeContexts {
             ctx += 1;
         }
         Ok(ctx)
+    }
+
+    fn seg_pred_context(
+        &self,
+        left_row_base: usize,
+        row: usize,
+        col: usize,
+    ) -> Result<usize, TileSyntaxError> {
+        let row_offset = row_offset(left_row_base, row)?;
+        let left = *self
+            .left_seg_pred
+            .get(row_offset)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let above = *self
+            .above_seg_pred
+            .get(col)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        Ok(usize::from(left) + usize::from(above))
+    }
+
+    fn update_seg_pred_context(
+        &mut self,
+        left_row_base: usize,
+        row: usize,
+        col: usize,
+        block_size: BlockSize,
+        seg_id_predicted: bool,
+    ) -> Result<(), TileSyntaxError> {
+        let value = u8::from(seg_id_predicted);
+        let width = usize::from(block_size.num_8x8_wide());
+        let height = usize::from(block_size.num_8x8_high());
+        let row_offset = row_offset(left_row_base, row)?;
+
+        for y in 0..height {
+            let left_index = row_offset
+                .checked_add(y)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if left_index < self.left_seg_pred.len() {
+                self.left_seg_pred[left_index] = value;
+            }
+        }
+
+        for x in 0..width {
+            let above_index = col
+                .checked_add(x)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if above_index < self.mi_cols {
+                self.above_seg_pred[above_index] = value;
+            }
+        }
+
+        Ok(())
     }
 
     fn tx_size_context(
@@ -5183,6 +5408,8 @@ const INTER_MODE_TREE: [i8; 6] = [
 
 const INTERP_FILTER_TREE: [i8; 4] = [0, 2, -1, -2];
 
+const SEGMENT_TREE: [i8; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+
 const MV_JOINT_TREE: [i8; 6] = [0, 2, -1, 4, -2, -3];
 
 const MV_CLASS_TREE: [i8; 20] = [
@@ -5637,7 +5864,7 @@ mod tests {
         ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
         REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, STORED_MODE_INFO_BYTES,
         SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
-        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, ZEROMV, add_residual_block,
+        TileParseBuffers, TileParser, TxSize, TxType, ZEROMV, add_residual_block,
         inter_predict_sample, intra_predict_block, parse_intra_tiles, select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
@@ -5921,6 +6148,8 @@ mod tests {
                 ref_frame_sign_bias: [false; 4],
                 lossless: true,
                 dequant: FrameDequant::new(0, 0, 0, 0),
+                segmentation: crate::header::SegmentationParams::disabled(),
+                segment_map_reset: false,
                 mi_rows: 1,
                 mi_cols: 1,
                 tile_col_start: 0,
@@ -6016,6 +6245,8 @@ mod tests {
                 ref_frame_sign_bias: [false; 4],
                 lossless: true,
                 dequant: FrameDequant::new(0, 0, 0, 0),
+                segmentation: crate::header::SegmentationParams::disabled(),
+                segment_map_reset: false,
                 mi_rows: 1,
                 mi_cols: 1,
                 tile_col_start: 0,
@@ -6068,6 +6299,8 @@ mod tests {
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             dequant: FrameDequant::new(0, 0, 0, 0),
+            segmentation: crate::header::SegmentationParams::disabled(),
+            segment_map_reset: false,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -6120,6 +6353,8 @@ mod tests {
                 ref_frame_sign_bias: [false; 4],
                 lossless: true,
                 dequant: FrameDequant::new(0, 0, 0, 0),
+                segmentation: crate::header::SegmentationParams::disabled(),
+                segment_map_reset: false,
                 mi_rows: 1,
                 mi_cols: 1,
                 tile_col_start: 0,
@@ -6179,7 +6414,7 @@ mod tests {
         tx16.set_quantized(1, 4).unwrap();
         tx16.set_eob(2).unwrap();
 
-        let output16 = dequant.dequantize(&tx16);
+        let output16 = dequant.dequantize(&tx16, 0);
         assert_eq!(output16.block, tx16.block);
         assert_eq!(output16.eob, 2);
         assert_eq!(output16.coefficients[0], 24);
@@ -6191,7 +6426,7 @@ mod tests {
         tx32.set_quantized(1, 4).unwrap();
         tx32.set_eob(2).unwrap();
 
-        let output32 = dequant.dequantize(&tx32);
+        let output32 = dequant.dequantize(&tx32, 0);
         assert_eq!(output32.block, tx32.block);
         assert_eq!(output32.eob, 2);
         assert_eq!(output32.coefficients[0], 12);
@@ -6220,6 +6455,8 @@ mod tests {
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             dequant: FrameDequant::new(0, 0, 0, 0),
+            segmentation: crate::header::SegmentationParams::disabled(),
+            segment_map_reset: false,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -6253,6 +6490,8 @@ mod tests {
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             dequant: FrameDequant::new(0, 0, 0, 0),
+            segmentation: crate::header::SegmentationParams::disabled(),
+            segment_map_reset: false,
             mi_rows: 1,
             mi_cols: 1,
             tile_col_start: 0,
@@ -6361,6 +6600,8 @@ mod tests {
             ref_frame_sign_bias: [false; 4],
             lossless: true,
             dequant: FrameDequant::new(0, 0, 0, 0),
+            segmentation: crate::header::SegmentationParams::disabled(),
+            segment_map_reset: false,
             mi_rows: 8,
             mi_cols: 8,
             tile_col_start: 0,
@@ -6379,30 +6620,15 @@ mod tests {
     }
 
     #[test]
-    fn segmentation_enabled_intra_tiles_are_explicitly_unimplemented() {
-        let frame = [0u8; 32];
-        let header = test_header(true);
-        let layout = parse_tile_layout(&frame, &header).unwrap();
-        let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
-        let mut counts = SyntaxCounts::default();
-        let mut current_frame_storage = TestCurrentFrame::new(16, 16);
-        let mut current_frame = current_frame_storage.as_current_frame();
+    fn alt_q_segmentation_adjusts_quantizer_index() {
+        let mut segmentation = crate::header::SegmentationParams::disabled();
+        segmentation.enabled = true;
+        segmentation.feature_enabled[1][crate::header::SEG_LVL_ALT_Q] = true;
+        segmentation.feature_data[1][crate::header::SEG_LVL_ALT_Q] = -25;
+        let dequant = FrameDequant::new_with_segmentation(131, 0, 0, 0, segmentation);
 
-        assert_eq!(
-            parse_intra_tiles(
-                &frame,
-                &header,
-                &compressed_header,
-                &FrameContext::DEFAULT,
-                &layout,
-                TileParseBuffers::new(
-                    &mut counts,
-                    FrameModeBuffers::current(None),
-                    &mut current_frame,
-                ),
-            ),
-            Err(TileSyntaxError::Unimplemented)
-        );
+        assert_eq!(dequant.get_qindex_for_segment(0), 131);
+        assert_eq!(dequant.get_qindex_for_segment(1), 106);
     }
 
     struct TestCurrentFrame {
@@ -6551,6 +6777,7 @@ mod tests {
             delta_q_uv_ac: 0,
             lossless: true,
             loop_filter: LoopFilterParams::disabled(),
+            segmentation: crate::header::SegmentationParams::disabled(),
             segmentation_enabled,
             segmentation_update_map: false,
             tile_cols_log2: 0,

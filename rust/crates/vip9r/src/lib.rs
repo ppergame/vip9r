@@ -524,11 +524,6 @@ impl<'a> DecodeWorkspace<'a> {
         current_slot: ModeHistorySlot,
         mi_count: usize,
     ) -> Result<FrameModeBuffers<'b>, DecodeError> {
-        let previous_slot = if use_prev_frame_mvs {
-            previous_slot
-        } else {
-            None
-        };
         let (previous, mut current) = Self::mode_history_views_from_slice(
             layout,
             history,
@@ -987,7 +982,12 @@ impl Decoder {
             parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
         self.syntax_counts.clear();
         let mi_count = frame_mi_count(header.frame_width, header.frame_height)?;
-        let previous_slot = self.use_prev_frame_mvs(&header);
+        let previous_slot_for_mvs = self.use_prev_frame_mvs(&header);
+        // Previous MVs can only be used from a shown same-sized frame, but
+        // segmentation maps persist across hidden frames too.  Keep the
+        // previous mode grid available for segment-id prediction independently
+        // from MV reuse.
+        let previous_slot = self.previous_mode_history_slot(&header);
         let current_slot = self
             .previous_frame_for_mvs
             .map(|previous| previous.mode_history_slot.other())
@@ -999,7 +999,7 @@ impl Decoder {
                     frame_width: header.frame_width,
                     frame_height: header.frame_height,
                     reference_slots,
-                    use_prev_frame_mvs: previous_slot.is_some(),
+                    use_prev_frame_mvs: previous_slot_for_mvs.is_some(),
                     previous_slot,
                     current_slot,
                     mi_count,
@@ -1128,6 +1128,18 @@ impl Decoder {
         (previous.width == header.frame_width
             && previous.height == header.frame_height
             && previous.show_frame)
+            .then_some(previous.mode_history_slot)
+    }
+
+    fn previous_mode_history_slot(
+        &self,
+        header: &header::UncompressedFrameHeader,
+    ) -> Option<ModeHistorySlot> {
+        if header.frame_is_intra || header.show_existing_frame {
+            return None;
+        }
+        let previous = self.previous_frame_for_mvs?;
+        (previous.width == header.frame_width && previous.height == header.frame_height)
             .then_some(previous.mode_history_slot)
     }
 

@@ -244,3 +244,17 @@ milestones, and measured optimization results.
   media files and stops at the next frontier, `vp90-2-09-aq2.webm`, which
   returns `Unimplemented` at packet 0 coded frame 0 on the segmentation-enabled
   tile path.
+
+## 2026-06-28 — VP9 segmentation map and ALT_Q
+
+- rev: jj `zlryntmz`
+- Added persistent segmentation header state, segment-id tile syntax for
+  intra/inter frames, temporal segment prediction contexts, ALT_Q per-segment
+  dequantization, ALT_L loop-filter level adjustment, and REF_FRAME/SKIP
+  syntax hooks.
+- `vp90-2-09-aq2.webm` now passes strict wasm-golden at 100 matched /
+  0 mismatched. The sorted md5-backed corpus sweep then advances through 232
+  media files and stops at `vp90-2-13-largescaling.webm`, which returns
+  `InvalidBitstream` at packet 0 coded frame 0. The next hypothesis is the
+  current fixed 512-MI-column tile-context cap vs this vector's 19200px+ output
+  frames.

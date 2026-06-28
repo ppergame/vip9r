@@ -6,6 +6,12 @@ const REFS_PER_FRAME: usize = 3;
 const SIGN_BIAS_FRAMES: usize = 4;
 const MAX_REF_FRAMES: usize = 4;
 const MAX_MODE_LF_DELTAS: usize = 2;
+pub(crate) const MAX_SEGMENTS: usize = 8;
+pub(crate) const SEG_LVL_MAX: usize = 4;
+pub(crate) const SEG_LVL_ALT_Q: usize = 0;
+pub(crate) const SEG_LVL_ALT_L: usize = 1;
+pub(crate) const SEG_LVL_REF_FRAME: usize = 2;
+pub(crate) const SEG_LVL_SKIP: usize = 3;
 const LAST_FRAME: usize = 1;
 const MAX_TILE_WIDTH_B64: u32 = 64;
 const MIN_TILE_WIDTH_B64: u32 = 4;
@@ -36,9 +42,84 @@ struct QuantizationParams {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SegmentationParams {
-    enabled: bool,
-    update_map: bool,
+pub(crate) struct SegmentationParams {
+    pub(crate) enabled: bool,
+    pub(crate) update_map: bool,
+    pub(crate) temporal_update: bool,
+    pub(crate) tree_probs: [u8; MAX_SEGMENTS - 1],
+    pub(crate) pred_probs: [u8; 3],
+    pub(crate) abs_or_delta_update: bool,
+    pub(crate) feature_enabled: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+    pub(crate) feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+}
+
+impl SegmentationParams {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            update_map: false,
+            temporal_update: false,
+            tree_probs: [255; MAX_SEGMENTS - 1],
+            pred_probs: [255; 3],
+            abs_or_delta_update: false,
+            feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        }
+    }
+
+    pub(crate) fn feature_active(self, segment_id: u8, feature: usize) -> bool {
+        self.enabled
+            && self
+                .feature_enabled
+                .get(usize::from(segment_id))
+                .and_then(|features| features.get(feature))
+                .copied()
+                .unwrap_or(false)
+    }
+
+    pub(crate) fn feature_data(self, segment_id: u8, feature: usize) -> Option<i16> {
+        self.feature_data
+            .get(usize::from(segment_id))
+            .and_then(|features| features.get(feature))
+            .copied()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SegmentationState {
+    abs_or_delta_update: bool,
+    feature_enabled: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+    feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+}
+
+impl SegmentationState {
+    const fn new() -> Self {
+        Self {
+            abs_or_delta_update: false,
+            feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            feature_data: [[0; SEG_LVL_MAX]; MAX_SEGMENTS],
+        }
+    }
+
+    fn params(
+        self,
+        enabled: bool,
+        update_map: bool,
+        temporal_update: bool,
+        tree_probs: [u8; MAX_SEGMENTS - 1],
+        pred_probs: [u8; 3],
+    ) -> SegmentationParams {
+        SegmentationParams {
+            enabled,
+            update_map,
+            temporal_update,
+            tree_probs,
+            pred_probs,
+            abs_or_delta_update: self.abs_or_delta_update,
+            feature_enabled: self.feature_enabled,
+            feature_data: self.feature_data,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +134,7 @@ pub(crate) struct ReferenceFrameInfo {
 pub(crate) struct HeaderParserState {
     reference_frames: [Option<ReferenceFrameInfo>; NUM_REF_FRAMES],
     loop_filter: LoopFilterState,
+    segmentation: SegmentationState,
 }
 
 impl HeaderParserState {
@@ -60,11 +142,13 @@ impl HeaderParserState {
         Self {
             reference_frames: [None; NUM_REF_FRAMES],
             loop_filter: LoopFilterState::new(),
+            segmentation: SegmentationState::new(),
         }
     }
 
     fn setup_past_independence(&mut self) {
         self.loop_filter = LoopFilterState::new();
+        self.segmentation = SegmentationState::new();
     }
 
     pub(crate) fn update_references(&mut self, header: &UncompressedFrameHeader) {
@@ -160,6 +244,7 @@ pub(crate) struct UncompressedFrameHeader {
     pub(crate) delta_q_uv_ac: i32,
     pub(crate) lossless: bool,
     pub(crate) loop_filter: LoopFilterParams,
+    pub(crate) segmentation: SegmentationParams,
     pub(crate) segmentation_enabled: bool,
     pub(crate) segmentation_update_map: bool,
     pub(crate) tile_cols_log2: u8,
@@ -233,6 +318,7 @@ pub(crate) fn parse_uncompressed_frame_header(
             delta_q_uv_ac: 0,
             lossless: false,
             loop_filter: LoopFilterParams::disabled(),
+            segmentation: SegmentationParams::disabled(),
             segmentation_enabled: false,
             segmentation_update_map: false,
             tile_cols_log2: 0,
@@ -344,7 +430,7 @@ pub(crate) fn parse_uncompressed_frame_header(
 
     let loop_filter = loop_filter_params(&mut reader, &mut state.loop_filter)?;
     let quantization = quantization_params(&mut reader)?;
-    let segmentation = segmentation_params(&mut reader)?;
+    let segmentation = segmentation_params(&mut reader, &mut state.segmentation)?;
     let tile_info = tile_info(&mut reader, frame_width)?;
     let header_size_in_bytes = reader.read_f(16)? as usize;
     let (compressed_header_offset, tile_data_offset) =
@@ -380,6 +466,7 @@ pub(crate) fn parse_uncompressed_frame_header(
         delta_q_uv_ac: quantization.delta_q_uv_ac,
         lossless: quantization.lossless,
         loop_filter,
+        segmentation,
         segmentation_enabled: segmentation.enabled,
         segmentation_update_map: segmentation.update_map,
         tile_cols_log2: tile_info.0,
@@ -576,24 +663,27 @@ fn read_delta_q(reader: &mut FixedBitReader<'_>) -> Result<i32, ParserError> {
     }
 }
 
-fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<SegmentationParams, ParserError> {
+fn segmentation_params(
+    reader: &mut FixedBitReader<'_>,
+    state: &mut SegmentationState,
+) -> Result<SegmentationParams, ParserError> {
     let segmentation_enabled = reader.read_bool()?;
     if !segmentation_enabled {
-        return Ok(SegmentationParams {
-            enabled: false,
-            update_map: false,
-        });
+        return Ok(state.params(false, false, false, [255; MAX_SEGMENTS - 1], [255; 3]));
     }
 
     let segmentation_update_map = reader.read_bool()?;
+    let mut segmentation_tree_probs = [255; MAX_SEGMENTS - 1];
+    let mut segmentation_temporal_update = false;
+    let mut segmentation_pred_prob = [255; 3];
     if segmentation_update_map {
-        for _ in 0..7 {
-            read_prob(reader)?;
+        for prob in &mut segmentation_tree_probs {
+            *prob = read_prob(reader)?;
         }
-        let segmentation_temporal_update = reader.read_bool()?;
+        segmentation_temporal_update = reader.read_bool()?;
         if segmentation_temporal_update {
-            for _ in 0..3 {
-                read_prob(reader)?;
+            for prob in &mut segmentation_pred_prob {
+                *prob = read_prob(reader)?;
             }
         }
     }
@@ -601,13 +691,17 @@ fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<SegmentationPa
     let segmentation_update_data = reader.read_bool()?;
     if segmentation_update_data {
         let segmentation_abs_or_delta_update = reader.read_bool()?;
-        for _segment in 0..8 {
-            for feature in 0..4 {
+        state.abs_or_delta_update = segmentation_abs_or_delta_update;
+        for segment in 0..MAX_SEGMENTS {
+            for feature in 0..SEG_LVL_MAX {
                 let feature_enabled = reader.read_bool()?;
+                state.feature_enabled[segment][feature] = feature_enabled;
+                let mut feature_value = 0i16;
                 if feature_enabled {
                     let bits_to_read = segmentation_feature_bits(feature);
-                    let _feature_value = if bits_to_read > 0 {
-                        reader.read_f(bits_to_read)?
+                    feature_value = if bits_to_read > 0 {
+                        i16::try_from(reader.read_f(bits_to_read)?)
+                            .map_err(|_| ParserError::InvalidBitstream)?
                     } else {
                         0
                     };
@@ -616,16 +710,23 @@ fn segmentation_params(reader: &mut FixedBitReader<'_>) -> Result<SegmentationPa
                         if segmentation_abs_or_delta_update && feature_sign {
                             return Err(ParserError::InvalidBitstream);
                         }
+                        if feature_sign {
+                            feature_value = -feature_value;
+                        }
                     }
                 }
+                state.feature_data[segment][feature] = feature_value;
             }
         }
     }
 
-    Ok(SegmentationParams {
-        enabled: true,
-        update_map: segmentation_update_map,
-    })
+    Ok(state.params(
+        true,
+        segmentation_update_map,
+        segmentation_temporal_update,
+        segmentation_tree_probs,
+        segmentation_pred_prob,
+    ))
 }
 
 fn read_prob(reader: &mut FixedBitReader<'_>) -> Result<u8, ParserError> {

@@ -102,10 +102,13 @@ Drive frame-md5 correctness green. Gated on M2R.
       MI-rounded reconstruction extents
 - [x] fix `vp90-2-09-subpixel-00.ivf`: strict wasm-golden green after
       MSB-first `f(32)` tile-size parsing
-- [ ] fix or classify `vp90-2-09-aq2.webm`: segmentation-enabled tile path
-      returns `Unimplemented` at packet 0 frame 0
+- [x] fix `vp90-2-09-aq2.webm`: strict wasm-golden green after segment-map
+      parsing and ALT_Q dequantization
 - [x] fix `vp90-2-18-resize.ivf`: 55 frame-md5 mismatches after successful
       full decode
+- [ ] fix or classify `vp90-2-13-largescaling.webm`: packet 0 frame 0 returns
+      `InvalidBitstream`; likely fixed tile-context column cap vs 19200px+
+      frames
 - [ ] fix or classify `vp90-2-22-svc_1280x720_3.ivf`: golden runner rejects
       IVF dimensions `0x0`
 - [ ] conformance subset green on full frames
