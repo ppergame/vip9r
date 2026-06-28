@@ -124,7 +124,7 @@ Previous orchestrator infra failures:
 
 - grinder fails on turn one: malformed `tool_search` arguments with a garbage
   1255-character property name; API rejected the turn
-  - verdict: retry three times
+  - verdict: retry, stop if it fails three consequent times
 
 ### Codex implementor
 
