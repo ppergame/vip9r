@@ -10,3 +10,7 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["std"]
 std = []
+wasm-tests = []
+
+[dependencies]
+vip9r-wasm-test-macros = { version = "0.1.0", path = "../vip9r-wasm-test-macros" }

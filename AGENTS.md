@@ -6,3 +6,7 @@ vip9r is an LLM-optimized software VP9 decoder targeting WebAssembly.
 
 For any tasks in this repo, read `docs/requirements.md` first to understand your
 roles and responsibilities.
+
+## Test performance
+
+Use release build for wasm module golden testing, debug build is too slow.

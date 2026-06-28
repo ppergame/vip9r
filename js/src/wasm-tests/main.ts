@@ -16,6 +16,7 @@ type TestResult =
   | { kind: "fail"; message: string };
 
 const TEST_PREFIX = "vip9r_test__";
+const TEST_FAILURE = 1;
 
 function main(args: string[]): void {
   const { wasmPath } = parseArgs(args);
@@ -86,6 +87,9 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
     const value = test();
     if (value === undefined || value === 0) {
       return { kind: "pass" };
+    }
+    if (value === TEST_FAILURE) {
+      return { kind: "fail", message: "failed" };
     }
     if (typeof value === "number") {
       return { kind: "fail", message: `returned ${value}` };

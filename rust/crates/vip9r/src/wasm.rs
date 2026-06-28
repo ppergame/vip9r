@@ -16,6 +16,10 @@ const MAX_CODED_FRAMES: usize = crate::MAX_CODED_FRAMES_PER_PACKET;
 #[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
+    #[cfg(feature = "wasm-tests")]
+    core::arch::wasm32::unreachable();
+
+    #[cfg(not(feature = "wasm-tests"))]
     loop {}
 }
 

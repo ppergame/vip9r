@@ -56,7 +56,7 @@ impl<'a> FixedBitReader<'a> {
     }
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{FixedBitReader, ParserError};
 
@@ -89,11 +89,12 @@ mod tests {
     }
 
     #[test]
-    fn f_reports_truncated_input() {
+    fn f_reports_truncated_input() -> Result<(), ParserError> {
         let mut reader = FixedBitReader::new(&[0xff]);
 
-        assert_eq!(reader.read_f(8), Ok(0xff));
+        assert_eq!(reader.read_f(8)?, 0xff);
         assert_eq!(reader.read_f(1), Err(ParserError::InvalidBitstream));
+        Ok(())
     }
 
     #[test]

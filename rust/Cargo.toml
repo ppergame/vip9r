@@ -2,6 +2,7 @@
 members = [
   "crates/vip9r",
   "crates/vip9r-tools",
+  "crates/vip9r-wasm-test-macros",
 ]
 default-members = [
   "crates/vip9r",
