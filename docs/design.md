@@ -166,20 +166,21 @@ plane descriptors are ephemeral until the next wasm decoder call.
 
 ## Measurement
 
-The trusted harness answers two questions:
+Performance work has two gates:
 
 - does this revision decode correctly?
 - is this revision faster on the target path?
 
 Correctness bring-up runs through wasm/d8 so unit tests, ABI checks, and golden
-checks exercise the target build. Host d8 is the cheap parity and smoke loop;
-device d8 is the performance ground truth, run A/B interleaved against the
-current baseline with enough repetition to report a credible delta. Targeted
+checks exercise the target build. Host d8 is the cheap parity and smoke loop.
+For performance results, run device d8 A/B interleaved against the current
+baseline with enough repetition to report a credible delta. Targeted
 microbenchmarks are allowed when a full-decode result points at a hotspot; their
 wins only count after reconfirming full-decode wall time.
 
-Only rev-built runs — built by the trusted harness from a VCS revision — are
-citable in `docs/log.md`. Ad-hoc blobs are for exploration.
+Record performance results in `docs/log.md` only when the wasm was built by the
+normal harness from a named repo revision. Ad-hoc wasm files are fine for
+exploration, but their timings are not project evidence.
 
 ### V8 artifacts
 
@@ -187,9 +188,12 @@ The devshell pins Google-published V8 canary bundles. Operational details for
 bumping those pins, running Android `d8` under qemu user emulation, and
 extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 
+The first coarse optimization loop is specified in
+[`docs/performance-ratchet.md`](performance-ratchet.md).
+
 ## Work shape
 
-- The interactive session owns intent, trusted harness work, and review.
+- The interactive session owns intent, harness setup, measurement, and review.
 - Implementation agents should receive narrow, reviewable tasks with the needed
   spec excerpts, tests, and oracle handle.
 - Rust implementation state lives in the self-contained Cargo workspace under
