@@ -26,7 +26,7 @@ M0 — decode API and the first frame-md5 golden harness.
 
 Deferrable external inputs for M3 performance work.
 
-- [ ] user: root the Pixel 9a
+- [x] user: root the Pixel 9a
 - [x] user: 720p performance corpus with a held-out clip
 
 ## Later
@@ -117,7 +117,7 @@ Drive frame-md5 correctness green. Gated on M2R.
       `/bulk/vip9r` md5-backed media file, 330/330 total, covering the chromium
       smoke vector, libvpx conformance/perf vectors, and local realworld WebM
       clips
-- [ ] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,
+- [x] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,
       init/media segment split, `SeekHead`, and unknown-size element cases before
       widening parser scope
 
