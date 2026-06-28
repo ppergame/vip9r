@@ -1,5 +1,6 @@
 import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
+import { parseWebm } from "../webm";
 
 export const WasmLogKind = {
   Diagnostic: 0,
@@ -14,20 +15,33 @@ export type WasmLog = {
 
 export type WasmLogSink = (log: WasmLog) => void;
 
-export type IvfPacket = {
+export type Vp9Packet = {
   index: number;
   timestamp: bigint;
   payload: Uint8Array;
 };
 
-export type IvfFile = {
-  fourcc: string;
+export type DemuxedVp9 = {
+  container: "ivf" | "webm";
+  codec: "VP90" | "V_VP9";
   width: number;
   height: number;
+  timebaseDenominator?: number;
+  timebaseNumerator?: number;
+  declaredFrameCount?: number;
+  timestampScale?: number;
+  packets: Vp9Packet[];
+};
+
+export type IvfPacket = Vp9Packet;
+
+export type IvfFile = DemuxedVp9 & {
+  container: "ivf";
+  codec: "VP90";
+  fourcc: "VP90";
   timebaseDenominator: number;
   timebaseNumerator: number;
   declaredFrameCount: number;
-  packets: IvfPacket[];
 };
 
 export type GoldenFrame = {
@@ -56,12 +70,14 @@ export type FrameComparison = {
 export type ComparisonReport = {
   inputPath: string;
   goldenPath: string;
-  fourcc: string;
+  container: "ivf" | "webm";
+  codec: "VP90" | "V_VP9";
   width: number;
   height: number;
-  timebaseDenominator: number;
-  timebaseNumerator: number;
-  declaredFrameCount: number;
+  timebaseDenominator?: number;
+  timebaseNumerator?: number;
+  declaredFrameCount?: number;
+  timestampScale?: number;
   packetCount: number;
   codedFrames: number;
   comparisons: FrameComparison[];
@@ -90,11 +106,12 @@ export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonR
     return instanceMemory(instance);
   }, io.log);
   instance = new WebAssembly.Instance(wasm, imports);
-  const ivf = parseIvf(new Uint8Array(io.readbuffer(args.inputPath)));
+  const input = parseVp9Input(new Uint8Array(io.readbuffer(args.inputPath)));
   const golden = parseGolden(io.read(args.goldenPath));
-  const decoder = new Vp9Decoder(instance, ivf.width, ivf.height);
+  const decoderDimensions = decoderDimensionsForGolden(input, golden);
+  const decoder = new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
 
-  return compareDecodedIvfToGolden(args.inputPath, args.goldenPath, ivf, golden, decoder);
+  return compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder);
 }
 
 export function formatWasmLog(log: WasmLog): string {
@@ -110,16 +127,16 @@ export function formatWasmLog(log: WasmLog): string {
   }
 }
 
-export function compareDecodedIvfToGolden(
+export function compareDecodedVp9ToGolden(
   inputPath: string,
   goldenPath: string,
-  ivf: IvfFile,
+  input: DemuxedVp9,
   golden: GoldenFrame[],
   decoder: FrameDecoder,
 ): ComparisonReport {
   const comparisons: FrameComparison[] = [];
   let coded = 0;
-  for (const packet of ivf.packets) {
+  for (const packet of input.packets) {
     try {
       decoder.beginPacket(packet.payload);
     } catch (error) {
@@ -165,7 +182,33 @@ export function compareDecodedIvfToGolden(
     }
   }
 
-  return makeReport(inputPath, goldenPath, ivf, coded, comparisons, golden.length);
+  return makeReport(inputPath, goldenPath, input, coded, comparisons, golden.length);
+}
+
+export const compareDecodedIvfToGolden = compareDecodedVp9ToGolden;
+
+export function parseVp9Input(data: Uint8Array): DemuxedVp9 {
+  if (data.byteLength >= 4 && ascii(data, 0, 4) === "DKIF") {
+    return parseIvf(data);
+  }
+  if (
+    data.byteLength >= 4 &&
+    data[0] === 0x1a &&
+    data[1] === 0x45 &&
+    data[2] === 0xdf &&
+    data[3] === 0xa3
+  ) {
+    const webm = parseWebm(data);
+    return {
+      container: "webm",
+      codec: webm.codecId,
+      width: webm.width,
+      height: webm.height,
+      timestampScale: webm.timestampScale,
+      packets: webm.packets,
+    };
+  }
+  throw new Error("unsupported input container: expected IVF DKIF or WebM EBML");
 }
 
 export function parseIvf(data: Uint8Array): IvfFile {
@@ -228,6 +271,8 @@ export function parseIvf(data: Uint8Array): IvfFile {
   }
 
   return {
+    container: "ivf",
+    codec: "VP90",
     fourcc,
     width,
     height,
@@ -262,10 +307,54 @@ export function parseGolden(text: string): GoldenFrame[] {
   return frames;
 }
 
+export function decoderDimensionsForGolden(
+  input: Pick<DemuxedVp9, "width" | "height">,
+  golden: GoldenFrame[],
+): { width: number; height: number } {
+  const maxDimensions = maxGoldenDimensions(golden);
+  return {
+    width: Math.max(input.width, maxDimensions?.width ?? 0),
+    height: Math.max(input.height, maxDimensions?.height ?? 0),
+  };
+}
+
+export function maxGoldenDimensions(golden: GoldenFrame[]): { width: number; height: number } | undefined {
+  let width = 0;
+  let height = 0;
+  for (const frame of golden) {
+    const dimensions = dimensionsFromGoldenName(frame.name);
+    if (dimensions === undefined) {
+      continue;
+    }
+    width = Math.max(width, dimensions.width);
+    height = Math.max(height, dimensions.height);
+  }
+  if (width === 0 || height === 0) {
+    return undefined;
+  }
+  return { width, height };
+}
+
+function dimensionsFromGoldenName(name: string): { width: number; height: number } | undefined {
+  const xSeparated = /(?:^|[-_])(\d+)x(\d+)-\d+\.i420$/i.exec(name);
+  const dashSeparated = /(?:^|[-_])(\d+)-(\d+)-\d+\.i420$/i.exec(name);
+  const match = xSeparated ?? dashSeparated;
+  if (match === null) {
+    return undefined;
+  }
+
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+    return undefined;
+  }
+  return { width, height };
+}
+
 export function makeReport(
   inputPath: string,
   goldenPath: string,
-  ivf: IvfFile,
+  input: DemuxedVp9,
   codedFrames: number,
   comparisons: FrameComparison[],
   expectedCount: number,
@@ -273,13 +362,15 @@ export function makeReport(
   return {
     inputPath,
     goldenPath,
-    fourcc: ivf.fourcc,
-    width: ivf.width,
-    height: ivf.height,
-    timebaseDenominator: ivf.timebaseDenominator,
-    timebaseNumerator: ivf.timebaseNumerator,
-    declaredFrameCount: ivf.declaredFrameCount,
-    packetCount: ivf.packets.length,
+    container: input.container,
+    codec: input.codec,
+    width: input.width,
+    height: input.height,
+    timebaseDenominator: input.timebaseDenominator,
+    timebaseNumerator: input.timebaseNumerator,
+    declaredFrameCount: input.declaredFrameCount,
+    timestampScale: input.timestampScale,
+    packetCount: input.packets.length,
     codedFrames,
     comparisons,
     expectedCount,
@@ -317,7 +408,7 @@ export function formatReport(report: ComparisonReport): string[] {
   const lines = [
     `input: ${report.inputPath}`,
     `golden: ${report.goldenPath}`,
-    `ivf: fourcc=${report.fourcc} size=${report.width}x${report.height} timebase=${report.timebaseNumerator}/${report.timebaseDenominator} declared_frames=${report.declaredFrameCount} packets=${report.packetCount}`,
+    formatContainerLine(report),
     `decoder: coded_frames=${report.codedFrames} shown_frames=${report.comparisons.length}`,
     `frames: ${matchedCount(report)} matched, ${mismatchCount(report)} mismatched, ${missingCount(report)} missing, ${extraCount(report)} extra`,
   ];
@@ -329,6 +420,13 @@ export function formatReport(report: ComparisonReport): string[] {
   }
 
   return lines;
+}
+
+function formatContainerLine(report: ComparisonReport): string {
+  if (report.container === "ivf") {
+    return `ivf: fourcc=${report.codec} size=${report.width}x${report.height} timebase=${report.timebaseNumerator}/${report.timebaseDenominator} declared_frames=${report.declaredFrameCount} packets=${report.packetCount}`;
+  }
+  return `webm: codec=${report.codec} size=${report.width}x${report.height} timestamp_scale=${report.timestampScale} packets=${report.packetCount}`;
 }
 
 export function compactI420(decoder: FrameDecoder, frame: NativeFrame): Uint8Array {

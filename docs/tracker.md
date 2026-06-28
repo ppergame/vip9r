@@ -107,6 +107,9 @@ Drive frame-md5 correctness green. Gated on M2R.
       IVF dimensions `0x0`
 - [ ] conformance subset green on full frames
 - [ ] webm demux + corpus clips green
+- [ ] exercise WebM demux on YouTube VOD tracks; classify Track/Cluster ordering,
+      init/media segment split, `SeekHead`, and unknown-size element cases before
+      widening parser scope
 
 ### M3 — Decode, fast (optimize campaign)
 

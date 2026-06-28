@@ -85,7 +85,7 @@ in {
         shift
       fi
       if [[ $# -gt 1 ]]; then
-        echo "usage: wasm-golden [--allow-mismatch] [INPUT_IVF]" >&2
+        echo "usage: wasm-golden [--allow-mismatch] [INPUT_IVF_OR_WEBM]" >&2
         exit 2
       fi
 

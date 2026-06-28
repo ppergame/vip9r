@@ -3,11 +3,14 @@ import { describe, expect, test } from "vitest";
 import type { ComparisonReport, FrameDecoder } from "./golden";
 import {
   compactI420,
-  compareDecodedIvfToGolden,
+  compareDecodedVp9ToGolden,
+  decoderDimensionsForGolden,
   formatReport,
+  maxGoldenDimensions,
   md5Hex,
   parseGolden,
   parseIvf,
+  parseVp9Input,
   passes,
 } from "./golden";
 import type { NativeFrame, Plane } from "../wasm";
@@ -27,6 +30,31 @@ describe("wasm golden runner helpers", () => {
     expect([...ivf.packets[0].payload]).toEqual([1, 2, 3]);
     expect(ivf.packets[1].timestamp).toBe(1n);
     expect([...ivf.packets[1].payload]).toEqual([4, 5]);
+  });
+
+  test("dispatches IVF and WebM inputs by magic bytes", () => {
+    const ivf = parseVp9Input(sampleIvf());
+    expect(ivf).toMatchObject({
+      container: "ivf",
+      codec: "VP90",
+      width: 320,
+      height: 240,
+    });
+
+    const webm = parseVp9Input(sampleWebm());
+    expect(webm).toMatchObject({
+      container: "webm",
+      codec: "V_VP9",
+      width: 160,
+      height: 90,
+      timestampScale: 1_000_000,
+    });
+    expect(webm.packets).toHaveLength(1);
+    expect([...webm.packets[0].payload]).toEqual([9, 8, 7]);
+
+    expect(() => parseVp9Input(new Uint8Array([1, 2, 3, 4]))).toThrow(
+      "unsupported input container: expected IVF DKIF or WebM EBML",
+    );
   });
 
   test("rejects malformed IVF files", () => {
@@ -68,6 +96,44 @@ describe("wasm golden runner helpers", () => {
     expect(formatReport(sampleReport([], 0))).toContain(
       "ivf: fourcc=VP90 size=320x240 timebase=1/1000 declared_frames=2 packets=2",
     );
+  });
+
+  test("formats WebM timestamp-scale metadata", () => {
+    expect(
+      formatReport({
+        ...sampleReport([], 0),
+        container: "webm",
+        codec: "V_VP9",
+        timestampScale: 1_000_000,
+        declaredFrameCount: undefined,
+        timebaseDenominator: undefined,
+        timebaseNumerator: undefined,
+      }),
+    ).toContain("webm: codec=V_VP9 size=320x240 timestamp_scale=1000000 packets=2");
+  });
+
+  test("chooses decoder dimensions from sidecar frame names when larger than container", () => {
+    const golden = parseGolden(
+      "4ff2537e44588e6473e236d8a6fc0054  resize-640x240-0001.i420\n" +
+        "8328efce9d9580304a3833a26a23321a  img-320-480-0002.i420\n" +
+        "d41d8cd98f00b204e9800998ecf8427e  frame.i420\n",
+    );
+
+    expect(maxGoldenDimensions(golden)).toEqual({ width: 640, height: 480 });
+    expect(decoderDimensionsForGolden({ width: 320, height: 240 }, golden)).toEqual({
+      width: 640,
+      height: 480,
+    });
+  });
+
+  test("falls back to container dimensions when sidecar names do not include dimensions", () => {
+    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
+
+    expect(maxGoldenDimensions(golden)).toBeUndefined();
+    expect(decoderDimensionsForGolden({ width: 320, height: 240 }, golden)).toEqual({
+      width: 320,
+      height: 240,
+    });
   });
 
   test("md5 implementation matches known vectors", () => {
@@ -138,7 +204,7 @@ describe("wasm golden runner helpers", () => {
       },
     };
 
-    expect(() => compareDecodedIvfToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
+    expect(() => compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
       "decode packet 0 timestamp 0: bad packet",
     );
   });
@@ -156,7 +222,7 @@ describe("wasm golden runner helpers", () => {
       },
     };
 
-    expect(() => compareDecodedIvfToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
+    expect(() => compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
       "decode packet 0 coded frame 0: bad coded frame",
     );
   });
@@ -166,7 +232,8 @@ function sampleReport(comparisons: ComparisonReport["comparisons"], expectedCoun
   return {
     inputPath: "input.ivf",
     goldenPath: "input.ivf.md5",
-    fourcc: "VP90",
+    container: "ivf",
+    codec: "VP90",
     width: 320,
     height: 240,
     timebaseDenominator: 1000,
@@ -216,6 +283,41 @@ function frameWithPlanes(
   return { decoder, native };
 }
 
+function sampleWebm(): Uint8Array {
+  return webmConcat(
+    webmElement(WEBM_ID.EBML, webmStringElement(WEBM_ID.DocType, "webm")),
+    webmElement(
+      WEBM_ID.Segment,
+      webmConcat(
+        webmElement(WEBM_ID.Info, webmUintElement(WEBM_ID.TimestampScale, 1_000_000)),
+        webmElement(
+          WEBM_ID.Tracks,
+          webmElement(
+            WEBM_ID.TrackEntry,
+            webmConcat(
+              webmUintElement(WEBM_ID.TrackNumber, 1),
+              webmUintElement(WEBM_ID.TrackType, 1),
+              webmStringElement(WEBM_ID.CodecID, "V_VP9"),
+              webmUintElement(WEBM_ID.FlagLacing, 0),
+              webmElement(
+                WEBM_ID.Video,
+                webmConcat(webmUintElement(WEBM_ID.PixelWidth, 160), webmUintElement(WEBM_ID.PixelHeight, 90)),
+              ),
+            ),
+          ),
+        ),
+        webmElement(
+          WEBM_ID.Cluster,
+          webmConcat(
+            webmUintElement(WEBM_ID.Timestamp, 0),
+            webmElement(WEBM_ID.SimpleBlock, new Uint8Array([0x81, 0, 0, 0, 9, 8, 7])),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 function sampleIvf(options: { headerLength?: number } = {}): Uint8Array {
   const headerLength = options.headerLength ?? 32;
   const bytes: number[] = [];
@@ -260,4 +362,87 @@ function le32(bytes: number[], value: number): void {
 function le64(bytes: number[], value: bigint): void {
   le32(bytes, Number(value & 0xffff_ffffn));
   le32(bytes, Number(value >> 32n));
+}
+
+const WEBM_ID = {
+  EBML: 0x1a45dfa3,
+  DocType: 0x4282,
+  Segment: 0x18538067,
+  Info: 0x1549a966,
+  TimestampScale: 0x2ad7b1,
+  Tracks: 0x1654ae6b,
+  TrackEntry: 0xae,
+  TrackNumber: 0xd7,
+  TrackType: 0x83,
+  FlagLacing: 0x9c,
+  CodecID: 0x86,
+  Video: 0xe0,
+  PixelWidth: 0xb0,
+  PixelHeight: 0xba,
+  Cluster: 0x1f43b675,
+  Timestamp: 0xe7,
+  SimpleBlock: 0xa3,
+} as const;
+
+function webmElement(id: number, content: Uint8Array): Uint8Array {
+  return webmConcat(new Uint8Array(webmIdBytes(id)), new Uint8Array(webmSizeVint(content.byteLength)), content);
+}
+
+function webmUintElement(id: number, value: number): Uint8Array {
+  return webmElement(id, new Uint8Array(webmUintBytes(value)));
+}
+
+function webmStringElement(id: number, value: string): Uint8Array {
+  const bytes: number[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    bytes.push(value.charCodeAt(index));
+  }
+  return webmElement(id, new Uint8Array(bytes));
+}
+
+function webmIdBytes(id: number): number[] {
+  const bytes: number[] = [];
+  let started = false;
+  for (let shift = 24; shift >= 0; shift -= 8) {
+    const byte = (id >>> shift) & 0xff;
+    if (byte !== 0 || started) {
+      bytes.push(byte);
+      started = true;
+    }
+  }
+  return bytes;
+}
+
+function webmSizeVint(size: number): number[] {
+  if (size <= 0x7e) {
+    return [0x80 | size];
+  }
+  if (size <= 0x3ffe) {
+    return [0x40 | (size >>> 8), size & 0xff];
+  }
+  throw new Error(`test fixture element is too large: ${size}`);
+}
+
+function webmUintBytes(value: number): number[] {
+  if (value === 0) {
+    return [0];
+  }
+  const bytes: number[] = [];
+  let remaining = value;
+  while (remaining > 0) {
+    bytes.unshift(remaining & 0xff);
+    remaining = Math.floor(remaining / 0x100);
+  }
+  return bytes;
+}
+
+function webmConcat(...parts: Uint8Array[]): Uint8Array {
+  const length = parts.reduce((sum, part) => sum + part.byteLength, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  return out;
 }

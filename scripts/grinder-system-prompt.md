@@ -62,16 +62,17 @@ Depending on the task, you can verify your work with
 
 - Engineering judgement. Self-review the change and decide whether it would
   satisfy the orchestrator and the user.
-- Wasm unit tests: `wasm-tests`, or `wasm-tests TEST_SUBSTRING` for targeted runs
+- Wasm unit tests: `wasm-tests`, or `wasm-tests TEST_SUBSTRING` for targeted
+  runs
 - `cargo clippy`
-- Wasm golden runner, strict: `wasm-golden`
-- Wasm golden runner, smoke mode: `wasm-golden --allow-mismatch`
+- Wasm golden runner: `wasm-golden [--allow-mismatch] [IVF or WebM file]`
 - (WIP) Performance timings
 
 WIP note: benchmarking tooling is not yet available. It will be offered to you
 in a later task/milestone. The strict wasm golden runner is the full-decode
-correctness gate. Smoke mode still fails on decode errors and missing/extra
-shown frames, but allows wrong frame md5 values.
+correctness gate. `--allow-mismatch` still fails on decode errors and
+missing/extra shown frames, but allows wrong frame md5 values. Orchestrator may
+provide a target media file to test with, otherwise the runner uses a default.
 
 ## Monitoring updates
 

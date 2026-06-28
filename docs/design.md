@@ -50,15 +50,12 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
 
 - The hash is over the raw I420 frame: Y (visible `d_w`×`d_h`), then U, then V
   at chroma dims (`⌈w/2⌉`×`⌈h/2⌉`), visible dimensions only — no stride padding.
-- Only _shown_ frames produce a line, in display order. A superframe packs
-  several coded frames into one IVF packet but usually shows one;
+- Only _shown_ frames produce a line, in display order. A VP9 superframe packs
+  several coded frames into one demuxed packet but usually shows one;
   `show_existing_frame` re-emits a stored frame and gets its own line. So output
   frame count ≤ coded frame count.
 - Golden format is one line per shown frame: `<md5hex>  <name>.i420`. Compare
   positionally.
-
-Start target is `bear-vp9.ivf` (320×240, 82 frames) — IVF, so no webm demux is
-needed to begin.
 
 The d8 wasm driver is the canonical golden path and exercises the manual
 boundary used by the shipping path. In grinder sandboxes, use the short command:
@@ -70,12 +67,23 @@ wasm-golden
 `wasm-golden` builds the release wasm module and runs d8 against prebuilt JS
 runner artifacts. It works from the main checkout and inside grinder, defaults
 to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the driver defaults the golden path
-to the `.md5` sidecar. It exits non-zero on
-decode errors, missing/extra shown frames, or md5 mismatches;
-`wasm-golden --allow-mismatch` only permits wrong frame hashes for code-complete
-smoke runs. The current wasm driver parses all 82 coded frames in
+to the `.md5` sidecar. The optional input path may be IVF or WebM. It exits
+non-zero on decode errors, missing/extra shown frames, or md5
+mismatches; `wasm-golden --allow-mismatch` only permits wrong frame hashes for
+code-complete smoke runs. The current wasm driver parses all 82 coded frames in
 `bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
 md5 passes with 82 matched frames and no mismatches/missing/extra frames.
+
+WebM demux is intentionally a narrow harness subset: one `V_VP9` video track is
+selected, non-video tracks are ignored, `SimpleBlock` and `BlockGroup/Block`
+payloads become VP9 packets, and laced VP9 blocks are rejected.
+`Cues`/seeking/index interpretation is skipped by element size for now. The
+parser is single-pass over a complete file-shaped input: it expects `Tracks`
+before `Cluster`, does not follow `SeekHead`, and does not model split
+init/media segments yet. For resize vectors whose `TrackEntry` dimensions are
+smaller than later decoded frames, the harness sizes the decoder from the
+maximum dimensions encoded in the `.md5` sidecar frame names when available,
+falling back to container dimensions.
 
 Decode-path wasm failures are expected to be real core/no-std issues unless
 they happen before `decode_next`, which still implicates the JS/wasm wrapper,
@@ -208,8 +216,8 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 Test media lives at `/bulk/vip9r` on the host and inside the grinder sandbox.
 Each vector has a `.md5` golden.
 
-- **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset) plus
-  `chromium/bear-vp9.ivf` as the IVF bring-up target.
+- **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset, IVF
+  and WebM) plus `chromium/bear-vp9.ivf` as the default IVF smoke target.
 - **Performance:** `realworld/` 720p clips with distinct character (high-motion,
   film grain, screen content, talking head). Keep at least one held out for
   review.
