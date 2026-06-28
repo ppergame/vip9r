@@ -258,3 +258,15 @@ milestones, and measured optimization results.
   `InvalidBitstream` at packet 0 coded frame 0. The next hypothesis is the
   current fixed 512-MI-column tile-context cap vs this vector's 19200px+ output
   frames.
+
+## 2026-06-28 — VP9 large-scaling tile contexts
+
+- rev: jj `ltkqurlu`
+- Raised fixed tile above-context storage from 512 to 2560 MI columns, enough
+  for `vp90-2-13-largescaling.webm`'s 20400px-wide frame after 64x64 partition
+  rounding. Wider fixed-context overflow now reports `ResourceLimit` instead of
+  `InvalidBitstream`.
+- `vp90-2-13-largescaling.webm` now passes strict wasm-golden at 2 matched /
+  0 mismatched. The sorted md5-backed corpus sweep advances through 275 media
+  files and stops at `vp90-2-19-skip-02.webm`, which returns
+  `InvalidBitstream` at packet 5 coded frame 0.

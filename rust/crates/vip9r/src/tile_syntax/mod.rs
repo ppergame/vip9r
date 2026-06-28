@@ -19,10 +19,12 @@ mod tables;
 use residual::{DequantizedCoefficients, FrameDequant, TransformCoefficients};
 use tables::*;
 
-// Above contexts are column-indexed, not frame-MI indexed. 512 MI columns covers
-// 4096px-wide frames, comfortably above the current 720p target and 1080p
-// stretch, while keeping no-std/wasm stack use bounded.
-const MAX_MI_COLS: usize = 512;
+// Above contexts are column-indexed, not frame-MI indexed. This fixed storage
+// covers the local VP9 large-scaling frontier: the largest expected frame is
+// 20400px wide (2550 MI columns), rounded up to 2560 entries for 64x64
+// partition contexts. Wider frames need workspace-backed context storage and
+// are reported as a resource limit instead of an invalid bitstream.
+const MAX_MI_COLS: usize = 2560;
 const MAX_4X4_COLS: usize = MAX_MI_COLS * 2;
 const MI_SIZE_PIXELS: u32 = 8;
 const MI_BLOCK_64: usize = 8;
@@ -66,6 +68,7 @@ const COMPANDED_MVREF_THRESH: i32 = 8;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TileSyntaxError {
     InvalidBitstream,
+    ResourceLimit,
     Unimplemented,
 }
 
@@ -73,6 +76,7 @@ impl TileSyntaxError {
     pub(crate) const fn into_decode_error(self) -> DecodeError {
         match self {
             Self::InvalidBitstream => DecodeError::InvalidBitstream,
+            Self::ResourceLimit => DecodeError::ResourceLimit,
             Self::Unimplemented => DecodeError::Unimplemented,
         }
     }
@@ -3949,9 +3953,12 @@ impl TileModeContexts {
         let partition_cols = mi_cols
             .checked_add(MI_BLOCK_64 - 1)
             .map(|cols| (cols / MI_BLOCK_64) * MI_BLOCK_64)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        if mi_cols == 0 || mi_cols > MAX_MI_COLS || partition_cols > MAX_MI_COLS {
+            .ok_or(TileSyntaxError::ResourceLimit)?;
+        if mi_cols == 0 {
             return Err(TileSyntaxError::InvalidBitstream);
+        }
+        if mi_cols > MAX_MI_COLS || partition_cols > MAX_MI_COLS {
+            return Err(TileSyntaxError::ResourceLimit);
         }
 
         Ok(Self {

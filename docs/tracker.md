@@ -106,9 +106,10 @@ Drive frame-md5 correctness green. Gated on M2R.
       parsing and ALT_Q dequantization
 - [x] fix `vp90-2-18-resize.ivf`: 55 frame-md5 mismatches after successful
       full decode
-- [ ] fix or classify `vp90-2-13-largescaling.webm`: packet 0 frame 0 returns
-      `InvalidBitstream`; likely fixed tile-context column cap vs 19200px+
-      frames
+- [x] fix `vp90-2-13-largescaling.webm`: strict wasm-golden green after
+      expanding fixed tile-context column storage for 19200px+ frames
+- [ ] fix or classify `vp90-2-19-skip-02.webm`: packet 5 coded frame 0 returns
+      `InvalidBitstream` after the sorted md5-backed sweep passes 275 files
 - [ ] fix or classify `vp90-2-22-svc_1280x720_3.ivf`: golden runner rejects
       IVF dimensions `0x0`
 - [ ] conformance subset green on full frames
