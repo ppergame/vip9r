@@ -7,14 +7,12 @@ export default defineConfig({
     outDir: "dist/wasm-driver",
     emptyOutDir: true,
     lib: {
-      entry: "src/wasm-driver/main.ts",
-      formats: ["es"],
-      fileName: () => "main.js",
-    },
-    rollupOptions: {
-      output: {
-        codeSplitting: false,
+      entry: {
+        golden: "src/wasm-driver/main.ts",
+        tests: "src/wasm-tests/main.ts",
       },
+      formats: ["es"],
+      fileName: (_format, entryName) => `${entryName}.js`,
     },
   },
   test: {

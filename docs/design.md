@@ -86,7 +86,7 @@ cd rust
 cargo build -p vip9r --target wasm32-unknown-unknown
 cd ../js
 pnpm build:wasm-driver
-$D8_LINUX64 dist/wasm-driver/main.js -- \
+$D8_LINUX64 dist/wasm-driver/golden.js -- \
   ../rust/target/wasm32-unknown-unknown/debug/vip9r.wasm \
   /bulk/vip9r/chromium/bear-vp9.ivf
 ```

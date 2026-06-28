@@ -75,9 +75,9 @@ M2 beyond `bear-vp9.ivf`. Gated on M1; gates M2.
 
 - [x] collapse the Rust decode implementation and wasm ABI into one implementation
       crate; keep boundaries as modules, not a native-vs-wasm crate split
-- [ ] add a d8 wasm unit-test runner that discovers specially named test exports,
-      runs tests under fresh-enough wasm instances, and reports pass/fail/ignored
-      results without wasmtime
+- [x] add a d8 wasm unit-test runner that discovers specially named test exports,
+      runs tests under fresh-enough wasm instances, and reports pass/fail results
+      without wasmtime
 - [ ] add a `wasm-tests` feature and test-export macro shape; prefer `macro_rules!`
       first, add a proc-macro crate only if attribute syntax earns its cost
 - [ ] add wasm-test print support: static bounded formatting buffer, imported JS

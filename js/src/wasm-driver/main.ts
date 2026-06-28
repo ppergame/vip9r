@@ -120,7 +120,7 @@ function parseArgs(args: string[]): DriverArgs {
 
 function printUsage(): void {
   print(
-    "usage: d8 dist/wasm-driver/main.js -- [--allow-mismatch] vip9r.wasm input.ivf [input.ivf.md5]",
+    "usage: d8 dist/wasm-driver/golden.js -- [--allow-mismatch] vip9r.wasm input.ivf [input.ivf.md5]",
   );
 }
 
