@@ -16,6 +16,6 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["src/webm/**/*.test.ts"],
+    include: ["src/**/*.test.ts"],
   },
 });

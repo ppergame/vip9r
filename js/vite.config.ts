@@ -6,6 +6,6 @@ export default defineConfig({
     outDir: "dist/web",
   },
   test: {
-    include: ["src/webm/**/*.test.ts"],
+    include: ["src/**/*.test.ts"],
   },
 });
