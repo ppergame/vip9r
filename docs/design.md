@@ -140,13 +140,12 @@ The trusted harness answers two questions:
 - does this revision decode correctly?
 - is this revision faster on the target path?
 
-Correctness bring-up runs natively against the core's host `std` build because
-that is the cheapest debugging loop. Wasm/d8 runs cover the exported ABI and the
-shipping build: host d8 for cheap parity and smoke, device d8 as the performance
-ground truth, run A/B interleaved against the current baseline with enough
-repetition to report a credible delta. Targeted microbenchmarks are allowed when
-a full-decode result points at a hotspot; their wins only count after
-reconfirming full-decode wall time.
+Correctness bring-up runs through wasm/d8 so unit tests, ABI checks, and golden
+checks exercise the target build. Host d8 is the cheap parity and smoke loop;
+device d8 is the performance ground truth, run A/B interleaved against the
+current baseline with enough repetition to report a credible delta. Targeted
+microbenchmarks are allowed when a full-decode result points at a hotspot; their
+wins only count after reconfirming full-decode wall time.
 
 Only rev-built runs — built by the trusted harness from a VCS revision — are
 citable in `docs/log.md`. Ad-hoc blobs are for exploration.

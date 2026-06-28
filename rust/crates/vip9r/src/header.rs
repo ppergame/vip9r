@@ -708,7 +708,7 @@ fn finish_uncompressed_header(
     Ok((compressed_header_offset, tile_data_offset))
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{
         FrameType, HeaderParserState, InterpolationFilter, ParserError, ReferenceFrameInfo,

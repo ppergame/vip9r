@@ -36,8 +36,8 @@ before reviewing.
 
 Workspace crates:
 
-- `vip9r` - decoder library, tests, and wasm ABI. Builds for the host with `std`
-  and for `wasm32-unknown-unknown` as a freestanding module.
+- `vip9r` - decoder library, wasm unit tests, and wasm ABI. Builds for
+  `wasm32-unknown-unknown` as a freestanding module.
 - `vip9r-wasm-test-macros` - test helper macro
 
 ### Inputs (read-only)

@@ -1,5 +1,4 @@
-#![cfg_attr(any(target_arch = "wasm32", not(feature = "std")), no_std)]
-#![cfg_attr(not(target_arch = "wasm32"), forbid(unsafe_code))]
+#![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod bitstream;
@@ -11,7 +10,6 @@ mod probability;
 mod superframe;
 mod tile;
 mod tile_syntax;
-#[cfg(target_arch = "wasm32")]
 mod wasm;
 
 use compressed_header::{
@@ -727,30 +725,6 @@ fn frame_plane(
     Ok(Plane { data, shape })
 }
 
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-#[derive(Debug)]
-pub struct OwnedWorkspace {
-    layout: WorkspaceLayout,
-    memory: Vec<u8>,
-}
-
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-impl OwnedWorkspace {
-    pub fn new(layout: WorkspaceLayout) -> Result<Self, DecodeError> {
-        let mut memory = Vec::new();
-        memory
-            .try_reserve_exact(layout.total_bytes())
-            .map_err(|_| DecodeError::ResourceLimit)?;
-        memory.resize(layout.total_bytes(), 0);
-        Ok(Self { memory, layout })
-    }
-
-    pub fn as_workspace(&mut self) -> DecodeWorkspace<'_> {
-        DecodeWorkspace::new(self.layout, &mut self.memory)
-            .expect("owned workspace was allocated from its layout")
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameInfo {
     pub visible_width: u32,
@@ -1256,11 +1230,11 @@ fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{
-        DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, OwnedWorkspace,
-        PlaneShape, WorkspaceLayout, required_i420_len,
+        DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, PlaneShape,
+        WorkspaceLayout, required_i420_len,
     };
 
     #[test]
@@ -1331,10 +1305,11 @@ mod tests {
     #[test]
     fn decode_workspace_rejects_undersized_arena() {
         let layout = WorkspaceLayout::new(16, 16).unwrap();
-        let mut memory = vec![0; layout.total_bytes() - 1];
+        let mut memory = [0; TEST_WORKSPACE_BYTES];
+        let undersized_len = layout.total_bytes() - 1;
 
         assert_eq!(
-            DecodeWorkspace::new(layout, &mut memory).unwrap_err(),
+            DecodeWorkspace::new(layout, &mut memory[..undersized_len]).unwrap_err(),
             DecodeError::ResourceLimit
         );
     }
@@ -1344,8 +1319,8 @@ mod tests {
         let decoder_layout = WorkspaceLayout::new(16, 16).unwrap();
         let workspace_layout = WorkspaceLayout::new(32, 16).unwrap();
         let mut decoder = Decoder::new(decoder_layout);
-        let mut owned_workspace = OwnedWorkspace::new(workspace_layout).unwrap();
-        let mut workspace = owned_workspace.as_workspace();
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(workspace_layout);
 
         assert_eq!(
             decoder.decode_coded_frame(&[], &mut workspace),
@@ -1358,8 +1333,8 @@ mod tests {
         let frame = minimal_lossless_key_frame_with_size(13, 15);
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
-        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
-        let mut workspace = owned_workspace.as_workspace();
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(layout);
 
         let outcome = decoder.decode_coded_frame(&frame, &mut workspace).unwrap();
         let DecodeOutcome::Output(frame) = outcome else {
@@ -1385,8 +1360,8 @@ mod tests {
         let inter_frame = minimal_lossless_inter_frame();
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
-        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
-        let mut workspace = owned_workspace.as_workspace();
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(layout);
 
         assert!(matches!(
             decoder.decode_coded_frame(&key_frame, &mut workspace),
@@ -1404,8 +1379,8 @@ mod tests {
         let show_existing = show_existing_frame(0);
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
-        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
-        let mut workspace = owned_workspace.as_workspace();
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(layout);
 
         assert!(matches!(
             decoder.decode_coded_frame(&key_frame, &mut workspace),
@@ -1438,8 +1413,8 @@ mod tests {
         let show_existing = show_existing_frame(0);
         let layout = WorkspaceLayout::new(16, 16).unwrap();
         let mut decoder = Decoder::new(layout);
-        let mut owned_workspace = OwnedWorkspace::new(layout).unwrap();
-        let mut workspace = owned_workspace.as_workspace();
+        let mut test_workspace = TestWorkspace::new();
+        let mut workspace = test_workspace.as_workspace(layout);
 
         assert_eq!(
             decoder.decode_coded_frame(&hidden_frame, &mut workspace),
@@ -1464,6 +1439,26 @@ mod tests {
                 uv_stride: 8,
             },
         );
+    }
+
+    const TEST_WORKSPACE_BYTES: usize = 8192;
+
+    struct TestWorkspace {
+        memory: [u8; TEST_WORKSPACE_BYTES],
+    }
+
+    impl TestWorkspace {
+        const fn new() -> Self {
+            Self {
+                memory: [0; TEST_WORKSPACE_BYTES],
+            }
+        }
+
+        fn as_workspace(&mut self, layout: WorkspaceLayout) -> DecodeWorkspace<'_> {
+            let len = layout.total_bytes();
+            DecodeWorkspace::new(layout, &mut self.memory[..len])
+                .expect("test workspace should fit known small layouts")
+        }
     }
 
     #[derive(Clone, Copy)]

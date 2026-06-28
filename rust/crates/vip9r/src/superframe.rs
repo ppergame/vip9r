@@ -72,7 +72,7 @@ fn read_le_size(bytes: &[u8]) -> Result<usize, ParserError> {
     usize::try_from(size).map_err(|_| ParserError::InvalidBitstream)
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{ParserError, split_packet};
     use crate::CodedFrameRange;

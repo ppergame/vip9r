@@ -174,7 +174,7 @@ fn read_le_u32(bytes: &[u8]) -> Result<usize, ParserError> {
     usize::try_from(value).map_err(|_| ParserError::InvalidBitstream)
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{ParserError, TileDescriptor, parse_tile_layout};
     use crate::header::{FrameType, LoopFilterParams, UncompressedFrameHeader};

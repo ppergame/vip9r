@@ -1395,7 +1395,7 @@ const DEFAULT_COEF_PROBS: CoefProbs = [
     ],
 ];
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{COUNT_SAT, MAX_UPDATE_FACTOR, merge_prob};
 

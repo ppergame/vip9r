@@ -8,9 +8,8 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
         return compile_error("#[wasm_tests] does not accept arguments");
     }
 
-    let native_module = parse_macro_input!(item as ItemMod);
-    let mut wasm_module = native_module.clone();
-    let Some((_, items)) = &mut wasm_module.content else {
+    let mut module = parse_macro_input!(item as ItemMod);
+    let Some((_, items)) = &mut module.content else {
         return compile_error("#[wasm_tests] must annotate an inline module");
     };
 
@@ -39,7 +38,6 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
         let name = &function.sig.ident;
         let wrapper_name = format_ident!("__vip9r_wasm_test_{name}");
         wrappers.push(quote! {
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-tests"))]
             #[unsafe(export_name = concat!("vip9r_test__", module_path!(), "::", stringify!(#name)))]
             pub extern "C" fn #wrapper_name() -> i32 {
                 __vip9r_wasm_test_run(#name)
@@ -49,13 +47,11 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if !wrappers.is_empty() {
         items.push(parse_quote! {
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-tests"))]
             trait __Vip9rWasmTestReturn {
                 fn __vip9r_wasm_test_finish(self) -> i32;
             }
         });
         items.push(parse_quote! {
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-tests"))]
             impl __Vip9rWasmTestReturn for () {
                 fn __vip9r_wasm_test_finish(self) -> i32 {
                     0
@@ -63,7 +59,6 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
         items.push(parse_quote! {
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-tests"))]
             impl<E: core::fmt::Debug> __Vip9rWasmTestReturn for Result<(), E> {
                 fn __vip9r_wasm_test_finish(self) -> i32 {
                     match self {
@@ -74,7 +69,6 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         });
         items.push(parse_quote! {
-            #[cfg(all(target_arch = "wasm32", feature = "wasm-tests"))]
             fn __vip9r_wasm_test_run<T>(test: fn() -> T) -> i32
             where
                 T: __Vip9rWasmTestReturn,
@@ -88,11 +82,8 @@ pub fn wasm_tests(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     quote! {
-        #[cfg(test)]
-        #native_module
-
-        #[cfg(all(not(test), target_arch = "wasm32", feature = "wasm-tests"))]
-        #wasm_module
+        #[cfg(feature = "wasm-tests")]
+        #module
     }
     .into()
 }

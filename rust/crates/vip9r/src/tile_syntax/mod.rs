@@ -3561,7 +3561,7 @@ pub(crate) struct FrameModeBuffers<'a> {
 }
 
 impl<'a> FrameModeBuffers<'a> {
-    #[cfg(test)]
+    #[cfg(feature = "wasm-tests")]
     pub(crate) const fn current(current_frame_modes: Option<ModeInfoViewMut<'a>>) -> Self {
         Self {
             use_prev_frame_mvs: false,
@@ -5627,7 +5627,7 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
     [102, 19, 66, 162, 182, 122, 35, 59, 128],
 ];
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::residual::{FrameDequant, TransformCoefficients};
     use super::{
@@ -5635,11 +5635,10 @@ mod tests {
         GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, IntraMode, IntraPredictionEdges,
         IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH,
         ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
-        REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, SUB_BLOCKS,
-        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
+        REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, STORED_MODE_INFO_BYTES,
+        SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
         TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, ZEROMV, add_residual_block,
-        inter_predict_sample, intra_predict_block, mode_info_byte_len, parse_intra_tiles,
-        select_inter_mv,
+        inter_predict_sample, intra_predict_block, parse_intra_tiles, select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -5955,7 +5954,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(current_frame_storage.y.iter().all(|&sample| sample == 15));
+        assert!(current_frame_storage.y().iter().all(|&sample| sample == 15));
     }
 
     #[test]
@@ -6297,7 +6296,7 @@ mod tests {
                 ],
             ],
         };
-        let mut bytes = vec![0; mode_info_byte_len(2).unwrap()];
+        let mut bytes = [0; STORED_MODE_INFO_BYTES * 2];
         let mut view = ModeInfoViewMut::new(&mut bytes).unwrap();
 
         view.set(1, info).unwrap();
@@ -6325,7 +6324,7 @@ mod tests {
             MotionVector { row: 5, col: 6 },
             MotionVector { row: 7, col: 8 },
         ];
-        let mut current_mode_bytes = vec![0; mode_info_byte_len(64).unwrap()];
+        let mut current_mode_bytes = [0; STORED_MODE_INFO_BYTES * 64];
         let mut current_modes = ModeInfoViewMut::new(&mut current_mode_bytes).unwrap();
         current_modes
             .set(
@@ -6407,9 +6406,11 @@ mod tests {
     }
 
     struct TestCurrentFrame {
-        y: Vec<u8>,
-        u: Vec<u8>,
-        v: Vec<u8>,
+        y: [u8; 16 * 16],
+        u: [u8; 8 * 8],
+        v: [u8; 8 * 8],
+        y_len: usize,
+        uv_len: usize,
         y_shape: crate::PlaneShape,
         uv_shape: crate::PlaneShape,
     }
@@ -6420,10 +6421,14 @@ mod tests {
             let chroma_width = width.div_ceil(2);
             let chroma_height = height.div_ceil(2);
             let uv_len = usize::try_from(chroma_width * chroma_height).unwrap();
+            assert!(y_len <= 16 * 16);
+            assert!(uv_len <= 8 * 8);
             Self {
-                y: vec![128; y_len],
-                u: vec![128; uv_len],
-                v: vec![128; uv_len],
+                y: [128; 16 * 16],
+                u: [128; 8 * 8],
+                v: [128; 8 * 8],
+                y_len,
+                uv_len,
                 y_shape: crate::PlaneShape::new(width, height, width as usize),
                 uv_shape: crate::PlaneShape::new(
                     chroma_width,
@@ -6435,10 +6440,14 @@ mod tests {
 
         fn as_current_frame(&mut self) -> CurrentFrameMut<'_> {
             CurrentFrameMut::new(
-                CurrentPlaneMut::new(&mut self.y, self.y_shape).unwrap(),
-                CurrentPlaneMut::new(&mut self.u, self.uv_shape).unwrap(),
-                CurrentPlaneMut::new(&mut self.v, self.uv_shape).unwrap(),
+                CurrentPlaneMut::new(&mut self.y[..self.y_len], self.y_shape).unwrap(),
+                CurrentPlaneMut::new(&mut self.u[..self.uv_len], self.uv_shape).unwrap(),
+                CurrentPlaneMut::new(&mut self.v[..self.uv_len], self.uv_shape).unwrap(),
             )
+        }
+
+        fn y(&self) -> &[u8] {
+            &self.y[..self.y_len]
         }
     }
 

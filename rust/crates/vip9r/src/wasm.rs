@@ -8,19 +8,13 @@ use crate::{
 const OK: i32 = 0;
 const INVALID_STATE: i32 = -9;
 const RESOURCE_LIMIT: i32 = -3;
-#[cfg(target_arch = "wasm32")]
 const WASM_PAGE: usize = 64 * 1024;
 const ARENA_ALIGN: usize = 16;
 const MAX_CODED_FRAMES: usize = crate::MAX_CODED_FRAMES_PER_PACKET;
 
-#[cfg(target_arch = "wasm32")]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    #[cfg(feature = "wasm-tests")]
     core::arch::wasm32::unreachable();
-
-    #[cfg(not(feature = "wasm-tests"))]
-    loop {}
 }
 
 #[repr(C)]
@@ -493,34 +487,20 @@ fn bytes_mut(region: Region) -> Result<&'static mut [u8], i32> {
     Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
 }
 
-#[cfg(target_arch = "wasm32")]
 unsafe extern "C" {
     static __heap_base: u8;
 }
 
-#[cfg(target_arch = "wasm32")]
 fn heap_base() -> Result<usize, i32> {
     Ok((&raw const __heap_base) as usize)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn heap_base() -> Result<usize, i32> {
-    Err(RESOURCE_LIMIT)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn memory_len() -> Result<usize, i32> {
     core::arch::wasm32::memory_size(0)
         .checked_mul(WASM_PAGE)
         .ok_or(RESOURCE_LIMIT)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn memory_len() -> Result<usize, i32> {
-    Err(RESOURCE_LIMIT)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn ensure_memory(end: usize) -> Result<(), i32> {
     let current = memory_len()?;
     if end <= current {
@@ -533,9 +513,4 @@ fn ensure_memory(end: usize) -> Result<(), i32> {
         return Err(RESOURCE_LIMIT);
     }
     Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn ensure_memory(_end: usize) -> Result<(), i32> {
-    Err(RESOURCE_LIMIT)
 }

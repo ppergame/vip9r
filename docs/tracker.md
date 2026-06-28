@@ -79,7 +79,7 @@ M2 beyond `bear-vp9.ivf`. Gated on M1; gates M2.
       runs tests under fresh-enough wasm instances, and reports pass/fail results
       without wasmtime
 - [x] add a `wasm-tests` feature and proc-macro `#[wasm_tests]` module shape
-      that owns cfg gating so wasm tests stay inline `#[test]` functions
+      that exports inline `#[test]` functions for the d8 runner
 - [ ] add wasm-test print support: static bounded formatting buffer, imported JS
       sink function, `test_println!`, and a panic handler that prints `PanicInfo`
       before trapping

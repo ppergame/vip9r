@@ -716,7 +716,7 @@ const AC_QLOOKUP_8BIT: [i32; 256] = [
     1451, 1479, 1508, 1537, 1567, 1597, 1628, 1660, 1692, 1725, 1759, 1793, 1828,
 ];
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::*;
 

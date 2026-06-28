@@ -66,7 +66,7 @@ impl<'a> BoolDecoder<'a> {
         Ok(value)
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "wasm-tests")]
     pub(crate) const fn bit_offset(&self) -> usize {
         self.bit_offset
     }
@@ -135,7 +135,7 @@ impl<'a> BoolDecoder<'a> {
     }
 }
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::BoolDecoder;
     use crate::error::ParserError;

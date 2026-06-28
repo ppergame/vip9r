@@ -530,7 +530,7 @@ const INV_MAP_TABLE: [u8; MAX_PROB as usize] = [
     249, 250, 251, 252, 253, 253,
 ];
 
-#[cfg(test)]
+#[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
     use super::{
         InterReferenceFrame, ReferenceMode, TxMode, diff_update_prob, frame_reference_mode,

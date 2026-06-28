@@ -1,7 +1,0 @@
-[alias]
-build-wasm = "build --release --target wasm32-unknown-unknown -p vip9r-wasm"
-check-native = "check --workspace --exclude vip9r-wasm"
-check-wasm = "check --target wasm32-unknown-unknown -p vip9r-wasm"
-
-[target.wasm32-unknown-unknown]
-rustflags = ["-C", "panic=abort"]
