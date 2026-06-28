@@ -2,6 +2,7 @@ import {
   compareWasmToGolden,
   extraCount,
   formatReport,
+  formatProgress,
   matchedCount,
   missingCount,
   mismatchCount,
@@ -28,6 +29,9 @@ function main(args: string[]): void {
     log(log) {
       print(formatWasmLog(log));
     },
+    progress(event) {
+      print(formatProgress(event));
+    },
   });
   for (const line of formatReport(report)) {
     print(line);
@@ -42,6 +46,7 @@ function main(args: string[]): void {
 
 function parseArgs(args: string[]): DriverArgs {
   let allowMismatch = false;
+  let progressFrames: number | undefined;
   const paths: string[] = [];
   for (const arg of args) {
     if (arg === "-h" || arg === "--help") {
@@ -50,6 +55,10 @@ function parseArgs(args: string[]): DriverArgs {
     }
     if (arg === "--allow-mismatch") {
       allowMismatch = true;
+      continue;
+    }
+    if (arg.startsWith("--progress-frames=")) {
+      progressFrames = parsePositiveInteger(arg.slice("--progress-frames=".length), "--progress-frames");
       continue;
     }
     if (arg.startsWith("-")) {
@@ -64,13 +73,24 @@ function parseArgs(args: string[]): DriverArgs {
   }
 
   const [wasmPath, inputPath, goldenPath = `${inputPath}.md5`] = paths;
-  return { allowMismatch, wasmPath, inputPath, goldenPath };
+  return { allowMismatch, wasmPath, inputPath, goldenPath, progressFrames };
 }
 
 function printUsage(): void {
   print(
-    "usage: d8 dist/wasm-driver/golden.js -- [--allow-mismatch] vip9r.wasm input.ivf|input.webm [input.md5]",
+    "usage: d8 dist/wasm-driver/golden.js -- [--allow-mismatch] [--progress-frames=N] vip9r.wasm input.ivf|input.webm [input.md5]",
   );
+}
+
+function parsePositiveInteger(value: string, name: string): number {
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} is too large: ${value}`);
+  }
+  return parsed;
 }
 
 try {

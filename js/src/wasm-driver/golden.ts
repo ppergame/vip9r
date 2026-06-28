@@ -54,6 +54,7 @@ export type DriverArgs = {
   wasmPath: string;
   inputPath: string;
   goldenPath: string;
+  progressFrames?: number;
 };
 
 export type FrameComparison = {
@@ -86,10 +87,25 @@ export type ComparisonReport = {
   expectedCount: number;
 };
 
+export type ProgressEvent = {
+  packetIndex: number;
+  packetCount: number;
+  codedFrames: number;
+  decodedOutputFrames: number;
+  comparedFrames: number;
+  expectedCount: number;
+};
+
+export type CompareOptions = {
+  progressFrames?: number;
+  onProgress?: (event: ProgressEvent) => void;
+};
+
 export type GoldenIo = {
   read(path: string): string;
   readbuffer(path: string): ArrayBuffer;
   log: WasmLogSink;
+  progress?: (event: ProgressEvent) => void;
 };
 
 export type FrameDecoder = {
@@ -113,7 +129,10 @@ export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonR
   const decoderDimensions = decoderDimensionsForGolden(input, golden);
   const decoder = new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
 
-  return compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder);
+  return compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder, {
+    progressFrames: args.progressFrames,
+    onProgress: io.progress,
+  });
 }
 
 export function formatWasmLog(log: WasmLog): string {
@@ -135,9 +154,12 @@ export function compareDecodedVp9ToGolden(
   input: DemuxedVp9,
   golden: GoldenFrame[],
   decoder: FrameDecoder,
+  options: CompareOptions = {},
 ): ComparisonReport {
   const comparisons: FrameComparison[] = [];
   const comparedDimensions = zeroDimensionIvf(input) ? comparedGoldenDimensions(golden) : undefined;
+  const progressFrames = normalizeProgressFrames(options.progressFrames);
+  let nextProgressFrame = progressFrames;
   let coded = 0;
   let decodedOutputFrames = 0;
   let skippedOutputFrames = 0;
@@ -192,6 +214,19 @@ export function compareDecodedVp9ToGolden(
           renderWidth: step.frame.renderWidth,
           renderHeight: step.frame.renderHeight,
         });
+        if (progressFrames !== undefined && nextProgressFrame !== undefined && options.onProgress !== undefined) {
+          while (comparisons.length >= nextProgressFrame) {
+            options.onProgress({
+              packetIndex: packet.index,
+              packetCount: input.packets.length,
+              codedFrames: coded,
+              decodedOutputFrames,
+              comparedFrames: comparisons.length,
+              expectedCount: golden.length,
+            });
+            nextProgressFrame += progressFrames;
+          }
+        }
       }
       if (step.packetDone) {
         break;
@@ -209,6 +244,16 @@ export function compareDecodedVp9ToGolden(
     comparisons,
     golden.length,
   );
+}
+
+function normalizeProgressFrames(progressFrames: number | undefined): number | undefined {
+  if (progressFrames === undefined) {
+    return undefined;
+  }
+  if (!Number.isSafeInteger(progressFrames) || progressFrames <= 0) {
+    throw new Error(`invalid progress frame interval: ${progressFrames}`);
+  }
+  return progressFrames;
 }
 
 export const compareDecodedIvfToGolden = compareDecodedVp9ToGolden;
@@ -473,6 +518,12 @@ export function formatReport(report: ComparisonReport): string[] {
   }
 
   return lines;
+}
+
+export function formatProgress(event: ProgressEvent): string {
+  const percent =
+    event.expectedCount > 0 ? ` ${(event.comparedFrames / event.expectedCount * 100).toFixed(1)}%` : "";
+  return `progress: compared=${event.comparedFrames}/${event.expectedCount}${percent} decoded_outputs=${event.decodedOutputFrames} coded_frames=${event.codedFrames} packet=${event.packetIndex + 1}/${event.packetCount}`;
 }
 
 function formatContainerLine(report: ComparisonReport): string {

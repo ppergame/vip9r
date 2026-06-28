@@ -86,6 +86,8 @@ non-zero on decode errors, missing/extra shown frames, or md5 mismatches;
 smoke runs. The current wasm driver parses all 82 coded frames in
 `bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
 md5 passes with 82 matched frames and no mismatches/missing/extra frames.
+Long corpus vectors can use `wasm-golden --progress-frames=N` to print periodic
+compared-frame progress without changing the final pass/fail criteria.
 
 WebM demux is intentionally a narrow harness subset: one `V_VP9` video track is
 selected, non-video tracks are ignored, `SimpleBlock` and `BlockGroup/Block`

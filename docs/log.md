@@ -296,3 +296,11 @@ milestones, and measured optimization results.
   `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm` (17,895 md5 frames) before this
   orchestrator run stopped the sweep rather than leave a long `d8` process
   running.
+
+## 2026-06-28 — VP9 long-vector validation progress
+
+- Classified `vp90-2-bbb_1280x720_tile_1x4_1310kbps.webm` as a long validation
+  bottleneck, not a correctness failure: strict wasm-golden passed at 17,895
+  matched / 0 mismatched / 0 missing / 0 extra in 1367s.
+- Added optional `wasm-golden --progress-frames=N` output for long corpus runs.
+  Default golden output and pass/fail criteria are unchanged.

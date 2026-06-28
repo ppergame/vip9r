@@ -5,6 +5,7 @@ import {
   compactI420,
   compareDecodedVp9ToGolden,
   decoderDimensionsForGolden,
+  formatProgress,
   formatReport,
   maxGoldenDimensions,
   md5Hex,
@@ -116,6 +117,33 @@ describe("wasm golden runner helpers", () => {
         timebaseNumerator: undefined,
       }),
     ).toContain("webm: codec=V_VP9 size=320x240 timestamp_scale=1000000 packets=2");
+  });
+
+  test("reports optional compared-frame progress", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+    const progress: string[] = [];
+
+    const report = compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, scriptedDecoder(frames), {
+      progressFrames: 2,
+      onProgress(event) {
+        progress.push(formatProgress(event));
+      },
+    });
+
+    expect(passes(report, false)).toBe(true);
+    expect(progress).toEqual([
+      "progress: compared=2/4 50.0% decoded_outputs=2 coded_frames=2 packet=1/2",
+      "progress: compared=4/4 100.0% decoded_outputs=4 coded_frames=4 packet=2/2",
+    ]);
   });
 
   test("chooses decoder dimensions from sidecar frame names when larger than container", () => {
