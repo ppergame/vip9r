@@ -28,8 +28,8 @@ two phases rather than gated incrementally:
   verification was builds, `clippy`, targeted unit tests, engineering judgment,
   and a frame-md5 harness running end to end with output allowed to be wrong.
 - **Bring-up second (M2).** Drive frame-md5 correctness green. The fast host
-  harness has been retired; the d8 wasm driver is the canonical correctness
-  loop and shipping-path parity check. The first frame whose md5 matches is the
+  harness has been retired; the d8 wasm driver is the canonical correctness loop
+  and shipping-path parity check. The first frame whose md5 matches is the
   first-bit-exact milestone; from there it is debugging.
 
 libvpx-generated outputs are useful when the spec or test vectors are not
@@ -68,9 +68,9 @@ wasm-golden
 runner artifacts. It works from the main checkout and inside grinder, defaults
 to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the driver defaults the golden path
 to the `.md5` sidecar. The optional input path may be IVF or WebM. It exits
-non-zero on decode errors, missing/extra shown frames, or md5
-mismatches; `wasm-golden --allow-mismatch` only permits wrong frame hashes for
-code-complete smoke runs. The current wasm driver parses all 82 coded frames in
+non-zero on decode errors, missing/extra shown frames, or md5 mismatches;
+`wasm-golden --allow-mismatch` only permits wrong frame hashes for code-complete
+smoke runs. The current wasm driver parses all 82 coded frames in
 `bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
 md5 passes with 82 matched frames and no mismatches/missing/extra frames.
 
@@ -85,17 +85,17 @@ smaller than later decoded frames, the harness sizes the decoder from the
 maximum dimensions encoded in the `.md5` sidecar frame names when available,
 falling back to container dimensions.
 
-Decode-path wasm failures are expected to be real core/no-std issues unless
-they happen before `decode_next`, which still implicates the JS/wasm wrapper,
+Decode-path wasm failures are expected to be real core/no-std issues unless they
+happen before `decode_next`, which still implicates the JS/wasm wrapper,
 exported ABI, input copying, or packet setup. The JS runner reports packet,
 timestamp, coded-frame, and output-frame context around decode calls.
 
-All d8 frontends instantiate the wasm module with `env.vip9r_log(kind, ptr, len)`.
-Rust `diag!` formats into a bounded stack buffer and the JS sink copies bytes
-synchronously during the import call; callers must not retain the raw wasm span.
-Routine golden and test runs print nothing unless Rust emits diagnostics or
-panics. Log kind `0` is ordinary diagnostics, `1` is wasm test failure output,
-and `2` is panic output.
+All d8 frontends instantiate the wasm module with
+`env.vip9r_log(kind, ptr, len)`. Rust `diag!` formats into a bounded stack
+buffer and the JS sink copies bytes synchronously during the import call;
+callers must not retain the raw wasm span. Routine golden and test runs print
+nothing unless Rust emits diagnostics or panics. Log kind `0` is ordinary
+diagnostics, `1` is wasm test failure output, and `2` is panic output.
 
 ### Decode API
 
@@ -105,11 +105,11 @@ ranges. `Decoder::decode_coded_frame` consumes one range with an explicit
 `DecodeWorkspace` and returns either no output or one shown frame. Packet-level
 helpers are adapters, not the architecture.
 
-`Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to
-the supplied workspace. A decoder session must keep using the same workspace
-memory; previous-frame mode history for MV reference candidates lives there and
-is addressed by decoder-owned slot metadata. `WorkspaceLayout` currently defines
-a fixed arena with one current reconstruction frame slot plus 8 reference frame
+`Decoder` owns VP9 semantic session state. Geometry-sized storage belongs to the
+supplied workspace. A decoder session must keep using the same workspace memory;
+previous-frame mode history for MV reference candidates lives there and is
+addressed by decoder-owned slot metadata. `WorkspaceLayout` currently defines a
+fixed arena with one current reconstruction frame slot plus 8 reference frame
 slots, each using simple 4:2:0 byte capacity derived from instance max
 dimensions, followed by two packed mode-history slots. Additional maps and
 scratch should enter the layout only when implementation code actually consumes
@@ -128,8 +128,8 @@ or decode errors.
 
 ### Wasm boundary
 
-The `vip9r` wasm module exposes the manual integer ABI used by the paired JS binding:
-`vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
+The `vip9r` wasm module exposes the manual integer ABI used by the paired JS
+binding: `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
 `vip9r_begin_packet`, and `vip9r_decode_next`. Mutating exports return `0` for
 success or a negative error code; those codes are binding details, not a stable
 external API.
@@ -206,8 +206,7 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
 
 - `docs/tracker.md` is the ordered backlog and current frontier.
 - `docs/log.md` is the human-facing implementation/optimization record. Entries
-  should cite a revision and either a first-correctness milestone or a measured
-  performance delta.
+  should cite either a correctness milestone or a measured performance delta.
 - Add extra notes only when they prevent rediscovering a real decision or
   failure mode. Avoid ledgers for speculative module pieces.
 

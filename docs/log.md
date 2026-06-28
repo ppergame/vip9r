@@ -213,7 +213,6 @@ milestones, and measured optimization results.
 
 ## 2026-06-27 — VP9 loop filter and first strict green vector
 
-- rev: jj `qmmoswxu`
 - Added profile 0 / 8-bit loop-filter header state, per-MI filter metadata, and
   the final in-loop filter pass before reference refresh/output.
 - `bear-vp9.ivf` strict md5 now passes on both the host golden harness and the
@@ -224,7 +223,6 @@ milestones, and measured optimization results.
 
 ## 2026-06-28 — VP9 MI-rounded reconstruction extents
 
-- rev: jj `opnpvtvo`
 - Changed the workspace frame-pool/current-frame view to reconstruct over the
   spec MI-rounded luma extent (`MiCols*8` by `MiRows*8`) and matching chroma
   extent, while keeping public I420 output and reference views clipped to the
@@ -236,7 +234,6 @@ milestones, and measured optimization results.
 
 ## 2026-06-28 — VP9 tile-size byte order
 
-- rev: jj `rvwqnmuw`
 - Fixed non-final VP9 tile-size parsing to treat the byte-aligned `f(32)` field
   as MSB-first instead of little-endian.
 - `vp90-2-09-subpixel-00.ivf` now passes strict wasm-golden at 20 matched /
@@ -247,7 +244,6 @@ milestones, and measured optimization results.
 
 ## 2026-06-28 — VP9 segmentation map and ALT_Q
 
-- rev: jj `zlryntmz`
 - Added persistent segmentation header state, segment-id tile syntax for
   intra/inter frames, temporal segment prediction contexts, ALT_Q per-segment
   dequantization, ALT_L loop-filter level adjustment, and REF_FRAME/SKIP
@@ -261,7 +257,6 @@ milestones, and measured optimization results.
 
 ## 2026-06-28 — VP9 large-scaling tile contexts
 
-- rev: jj `ltkqurlu`
 - Raised fixed tile above-context storage from 512 to 2560 MI columns, enough
   for `vp90-2-13-largescaling.webm`'s 20400px-wide frame after 64x64 partition
   rounding. Wider fixed-context overflow now reports `ResourceLimit` instead of
