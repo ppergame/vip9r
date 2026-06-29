@@ -66,13 +66,14 @@ Depending on the task, you can verify your work with
   runs
 - `cargo clippy`
 - Wasm golden runner: `wasm-golden [--allow-mismatch] [IVF or WebM file]`
-- (WIP) Performance timings
+- Host full-decode timing: `wasm-golden --bench [IVF or WebM file]`
 
-WIP note: benchmarking tooling is not yet available. It will be offered to you
-in a later task/milestone. The strict wasm golden runner is the full-decode
-correctness gate. `--allow-mismatch` still fails on decode errors and
-missing/extra shown frames, but allows wrong frame md5 values. Orchestrator may
-provide a target media file to test with, otherwise the runner uses a default.
+The strict wasm golden runner is the full-decode correctness gate.
+`--allow-mismatch` still fails on decode errors and missing/extra shown frames,
+but allows wrong frame md5 values. `--bench` validates the selected output window
+with md5 first, then warms up and measures repeated decodes of the same window
+without md5 or output-plane copies. Orchestrator may provide a target media file
+to test with, otherwise the runner uses a default.
 
 ## Monitoring updates
 

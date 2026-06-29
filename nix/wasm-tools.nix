@@ -79,53 +79,25 @@ in {
     text = ''
       set -euo pipefail
 
-      allow_mismatch=0
-      progress_frames=""
-      input=""
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --allow-mismatch)
-            allow_mismatch=1
-            ;;
-          --progress-frames=*)
-            progress_frames="''${1#--progress-frames=}"
-            ;;
-          -*)
-            echo "usage: wasm-golden [--allow-mismatch] [--progress-frames=N] [INPUT_IVF_OR_WEBM]" >&2
-            exit 2
-            ;;
-          *)
-            if [[ -n "$input" ]]; then
-              echo "usage: wasm-golden [--allow-mismatch] [--progress-frames=N] [INPUT_IVF_OR_WEBM]" >&2
-              exit 2
-            fi
-            input="$1"
-            ;;
-        esac
-        shift
+      show_help=0
+      for arg in "$@"; do
+        if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+          show_help=1
+        fi
       done
-      if [[ -n "$progress_frames" && ! "$progress_frames" =~ ^[1-9][0-9]*$ ]]; then
-        echo "progress frame interval must be a positive integer" >&2
-        exit 2
-      fi
 
       ${common}
       locate_project
       select_wasm_target_dir wasm-golden
       runner="$project_root/js/dist/wasm-driver/golden.js"
-      input="''${input:-/bulk/vip9r/chromium/bear-vp9.ivf}"
       require_runner "$runner"
+      if [[ "$show_help" -eq 1 ]]; then
+        exec "${v8.linux64}/d8" --no-liftoff "$runner" -- --help
+      fi
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         --target wasm32-unknown-unknown -p vip9r --release
-      d8_args=()
-      if [[ "$allow_mismatch" -eq 1 ]]; then
-        d8_args+=(--allow-mismatch)
-      fi
-      if [[ -n "$progress_frames" ]]; then
-        d8_args+=("--progress-frames=$progress_frames")
-      fi
-      exec "${v8.linux64}/d8" "$runner" -- "''${d8_args[@]}" "$wasm_path" "$input"
+      exec "${v8.linux64}/d8" --no-liftoff "$runner" -- "$wasm_path" "$@"
     '';
   };
 }

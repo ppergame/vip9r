@@ -1,13 +1,16 @@
 import {
+  benchmarkWasmGolden,
   compareWasmToGolden,
+  DriverUsageError,
   extraCount,
+  formatWasmLog,
   formatReport,
   formatProgress,
   matchedCount,
   missingCount,
   mismatchCount,
+  parseDriverArgs,
   passes,
-  formatWasmLog,
 } from "./golden";
 import type { DriverArgs } from "./golden";
 
@@ -22,7 +25,36 @@ type D8Global = typeof globalThis & {
 };
 
 function main(args: string[]): void {
-  const driverArgs = parseArgs(args);
+  if (args.includes("-h") || args.includes("--help")) {
+    printUsage();
+    quit(0);
+  }
+
+  let driverArgs: DriverArgs;
+  try {
+    driverArgs = parseDriverArgs(args);
+  } catch (error) {
+    if (error instanceof DriverUsageError) {
+      printUsage();
+      quit(2);
+    }
+    throw error;
+  }
+
+  if (driverArgs.bench !== undefined) {
+    const wasmLogs: string[] = [];
+    const report = benchmarkWasmGolden(driverArgs, {
+      read,
+      readbuffer,
+      log(log) {
+        wasmLogs.push(formatWasmLog(log));
+      },
+      now: nowMs,
+    });
+    print(JSON.stringify(wasmLogs.length === 0 ? report : { ...report, wasmLogs }));
+    return;
+  }
+
   const report = compareWasmToGolden(driverArgs, {
     read,
     readbuffer,
@@ -44,53 +76,23 @@ function main(args: string[]): void {
   }
 }
 
-function parseArgs(args: string[]): DriverArgs {
-  let allowMismatch = false;
-  let progressFrames: number | undefined;
-  const paths: string[] = [];
-  for (const arg of args) {
-    if (arg === "-h" || arg === "--help") {
-      printUsage();
-      quit(0);
-    }
-    if (arg === "--allow-mismatch") {
-      allowMismatch = true;
-      continue;
-    }
-    if (arg.startsWith("--progress-frames=")) {
-      progressFrames = parsePositiveInteger(arg.slice("--progress-frames=".length), "--progress-frames");
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      throw new Error(`unknown argument: ${arg}`);
-    }
-    paths.push(arg);
-  }
-
-  if (paths.length < 2 || paths.length > 3) {
-    printUsage();
-    quit(2);
-  }
-
-  const [wasmPath, inputPath, goldenPath = `${inputPath}.md5`] = paths;
-  return { allowMismatch, wasmPath, inputPath, goldenPath, progressFrames };
-}
-
 function printUsage(): void {
   print(
-    "usage: d8 dist/wasm-driver/golden.js -- [--allow-mismatch] [--progress-frames=N] vip9r.wasm input.ivf|input.webm [input.md5]",
+    "usage: wasm-golden [--allow-mismatch] [--progress-frames=N] [input.ivf|input.webm [input.md5]]",
+  );
+  print(
+    "       wasm-golden --bench [--bench-output-offset=N] [--bench-output-frames=N] [--bench-warmup-ms=N] [--bench-target-ms=N] [input.ivf|input.webm [input.md5]]",
+  );
+  print(
+    "       d8 dist/wasm-driver/golden.js -- vip9r.wasm [same options and inputs]",
   );
 }
 
-function parsePositiveInteger(value: string, name: string): number {
-  if (!/^[1-9]\d*$/.test(value)) {
-    throw new Error(`${name} must be a positive integer`);
+function nowMs(): number {
+  if (typeof performance === "object" && typeof performance.now === "function") {
+    return performance.now();
   }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed)) {
-    throw new Error(`${name} is too large: ${value}`);
-  }
-  return parsed;
+  return Date.now();
 }
 
 try {

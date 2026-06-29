@@ -3,13 +3,19 @@ import { describe, expect, test } from "vitest";
 import type { ComparisonReport, FrameDecoder } from "./golden";
 import {
   compactI420,
+  compareDecodedVp9WindowToGolden,
   compareDecodedVp9ToGolden,
   decoderDimensionsForGolden,
+  decodeVp9Window,
+  DEFAULT_BENCHMARK_OPTIONS,
   formatProgress,
   formatReport,
+  matchedCount,
   maxGoldenDimensions,
   md5Hex,
+  missingCount,
   parseGolden,
+  parseDriverArgs,
   parseIvf,
   parseVp9Input,
   passes,
@@ -146,6 +152,66 @@ describe("wasm golden runner helpers", () => {
     ]);
   });
 
+  test("parses default and benchmark driver arguments", () => {
+    expect(parseDriverArgs(["vip9r.wasm", "input.ivf"])).toMatchObject({
+      allowMismatch: false,
+      wasmPath: "vip9r.wasm",
+      inputPath: "input.ivf",
+      goldenPath: "input.ivf.md5",
+      bench: undefined,
+    });
+    expect(parseDriverArgs(["vip9r.wasm"])).toMatchObject({
+      wasmPath: "vip9r.wasm",
+      inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
+      goldenPath: "/bulk/vip9r/chromium/bear-vp9.ivf.md5",
+      bench: undefined,
+    });
+
+    expect(
+      parseDriverArgs([
+        "--bench",
+        "--bench-output-offset=2",
+        "--bench-output-frames=3",
+        "--bench-warmup-ms=4",
+        "--bench-target-ms=5",
+        "vip9r.wasm",
+        "input.webm",
+        "custom.md5",
+      ]),
+    ).toMatchObject({
+      allowMismatch: false,
+      wasmPath: "vip9r.wasm",
+      inputPath: "input.webm",
+      goldenPath: "custom.md5",
+      bench: {
+        outputOffset: 2,
+        outputFrames: 3,
+        warmupMs: 4,
+        targetMs: 5,
+      },
+    });
+
+    expect(parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench).toEqual(DEFAULT_BENCHMARK_OPTIONS);
+    expect(parseDriverArgs(["--bench", "vip9r.wasm"])).toMatchObject({
+      wasmPath: "vip9r.wasm",
+      inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
+      goldenPath: "/bulk/vip9r/chromium/bear-vp9.ivf.md5",
+      bench: DEFAULT_BENCHMARK_OPTIONS,
+    });
+  });
+
+  test("rejects benchmark options that would make output non-benchmark or non-machine-readable", () => {
+    expect(() => parseDriverArgs(["--bench-output-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
+      "benchmark options require --bench",
+    );
+    expect(() => parseDriverArgs(["--bench", "--allow-mismatch", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--allow-mismatch cannot be used with --bench",
+    );
+    expect(() => parseDriverArgs(["--bench", "--progress-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--progress-frames cannot be used with --bench",
+    );
+  });
+
   test("chooses decoder dimensions from sidecar frame names when larger than container", () => {
     const golden = parseGolden(
       "4ff2537e44588e6473e236d8a6fc0054  resize-640x240-0001.i420\n" +
@@ -263,6 +329,94 @@ describe("wasm golden runner helpers", () => {
     expect(passes(report, false)).toBe(true);
   });
 
+  test("decodes benchmark windows from stream start without touching output planes", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+    const decoder: FrameDecoder = {
+      ...scriptedDecoder(frames),
+      planeBytes() {
+        throw new Error("plane bytes should not be read");
+      },
+    };
+    const stats = decodeVp9Window(ivf, golden, decoder, {
+      outputOffset: 1,
+      outputFrames: 2,
+    });
+
+    expect(stats).toEqual({
+      codedFrames: 3,
+      decodedOutputFrames: 3,
+      skippedOutputFrames: 0,
+      selectedOutputFrames: 2,
+    });
+  });
+
+  test("validates only the selected benchmark output window", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+
+    const report = compareDecodedVp9WindowToGolden(
+      "input.ivf",
+      "input.ivf.md5",
+      ivf,
+      golden,
+      scriptedDecoder(frames),
+      {
+        outputOffset: 1,
+        outputFrames: 2,
+      },
+    );
+
+    expect(report.comparisons.map((comparison) => comparison.frameNumber)).toEqual([2, 3]);
+    expect(matchedCount(report)).toBe(2);
+    expect(missingCount(report)).toBe(0);
+    expect(passes(report, false)).toBe(true);
+  });
+
+  test("benchmark window validation reports missing selected outputs", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [scriptedFrame(2, 2, 1, 2, 3, 1), scriptedFrame(2, 2, 4, 5, 6, 10)];
+    const golden = parseGolden(
+      [
+        `${md5Hex(frames[0].compact)}  frame-0001.i420`,
+        `${md5Hex(frames[1].compact)}  frame-0002.i420`,
+        `${md5Hex(frames[1].compact)}  frame-0003.i420`,
+      ].join("\n"),
+    );
+
+    const report = compareDecodedVp9WindowToGolden(
+      "input.ivf",
+      "input.ivf.md5",
+      ivf,
+      golden,
+      scriptedDecoderWithTrailingEnd(frames),
+      {
+        outputOffset: 0,
+        outputFrames: 3,
+      },
+    );
+
+    expect(report.comparisons).toHaveLength(2);
+    expect(missingCount(report)).toBe(1);
+    expect(passes(report, false)).toBe(false);
+  });
+
   test("adds packet context to begin-packet failures without wasm ABI help", () => {
     const ivf = parseIvf(sampleIvf());
     const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
@@ -366,6 +520,14 @@ type ScriptedFrame = {
 };
 
 function scriptedDecoder(frames: ScriptedFrame[]): FrameDecoder {
+  return scriptedDecoderInternal(frames, false);
+}
+
+function scriptedDecoderWithTrailingEnd(frames: ScriptedFrame[]): FrameDecoder {
+  return scriptedDecoderInternal(frames, true);
+}
+
+function scriptedDecoderInternal(frames: ScriptedFrame[], trailingEnd: boolean): FrameDecoder {
   const planeBytes = new Map<number, Uint8Array>();
   for (const frame of frames) {
     for (const [offset, bytes] of frame.planes) {
@@ -377,6 +539,9 @@ function scriptedDecoder(frames: ScriptedFrame[]): FrameDecoder {
     beginPacket() {},
     decodeNext(): DecodeStep {
       if (index >= frames.length) {
+        if (trailingEnd) {
+          return { kind: "no-output", packetDone: true };
+        }
         throw new Error("scripted decoder exhausted");
       }
       const frame = frames[index].native;

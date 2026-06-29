@@ -19,7 +19,7 @@ ad-hoc wasm files are exploration.
 Use the release wasm build. Disable release overflow checks before treating
 numbers as representative; then run the strict golden corpus once.
 
-The benchmark driver should reuse the golden frontend shape:
+`wasm-golden --bench` reuses the golden frontend shape:
 
 1. parse clip and sidecar md5
 2. compile and instantiate wasm
@@ -30,9 +30,9 @@ The benchmark driver should reuse the golden frontend shape:
 
 Defaults:
 
-- clip: `/bulk/vip9r/realworld/test-videos/jellyfish-720p30-1_68mbps.webm`
+- clip: `/bulk/vip9r/chromium/bear-vp9.ivf`
 - output offset: `0`
-- output frames: `300`
+- output frames: `82`
 - warmup: about `1s`
 - measurement target: about `5s`
 - d8 tiering: hardcode top-tier Wasm, initially `--no-liftoff`
@@ -41,8 +41,9 @@ Offset means decode from stream start and discard shown outputs before the
 selected window. Do not fake random access before keyframe/window support
 exists.
 
-Do not use raw `wasm-golden` timing as the ratchet result. Its per-frame plane
-copy and md5 work are validation overhead, not decoder timing.
+Do not use raw correctness-mode `wasm-golden` wall time as the ratchet result.
+Its per-frame plane copy and md5 work are validation overhead, not decoder
+timing.
 
 ## Device state and queue
 

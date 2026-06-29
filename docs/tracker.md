@@ -125,6 +125,7 @@ Drive frame-md5 correctness green. Gated on M2R.
 
 Sustained 720p30 on the pinned big core. Gated on M2 + the M0 device path.
 
+- [ ] user: deslop grinder prompt
 - [ ] optimize measured full-decode hotspots; confirm wins against full-decode
       wall time
 
