@@ -23,6 +23,7 @@ const ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  ReferenceBlock: 0xfb,
   Cues: 0x1c53bb6b,
 } as const;
 
@@ -70,10 +71,37 @@ describe("webm", () => {
     });
     expect(webm.packets).toHaveLength(2);
     expect(webm.packets[0].timestamp).toBe(15n);
+    expect(webm.packets[0].keyframe).toBe(true);
+    expect(webm.packets[0].visible).toBe(true);
     expect([...webm.packets[0].payload]).toEqual([1, 2, 3]);
     expect(webm.packets[0].payload.buffer).toBe(bytes.buffer);
     expect(webm.packets[1].timestamp).toBe(17n);
+    expect(webm.packets[1].keyframe).toBe(true);
+    expect(webm.packets[1].visible).toBe(true);
     expect([...webm.packets[1].payload]).toEqual([4, 5]);
+  });
+
+  test("preserves keyframe and visible block metadata", () => {
+    const webm = parseWebm(
+      webmFile({
+        clusters: [
+          cluster(0, [
+            simpleBlock(1, 0, 0x88, [1]),
+            blockGroup(concat(block(1, 1, 0x08, [2]), intElement(ID.ReferenceBlock, -1))),
+          ]),
+        ],
+      }),
+    );
+
+    expect(webm.packets).toHaveLength(2);
+    expect(webm.packets[0]).toMatchObject({
+      keyframe: true,
+      visible: false,
+    });
+    expect(webm.packets[1]).toMatchObject({
+      keyframe: false,
+      visible: false,
+    });
   });
 
   test("adds cluster timestamp and signed block timestamp", () => {
@@ -238,6 +266,10 @@ function uintElement(id: number, value: number): Uint8Array {
   return element(id, new Uint8Array(uintBytes(value)));
 }
 
+function intElement(id: number, value: number): Uint8Array {
+  return element(id, new Uint8Array(intBytes(value)));
+}
+
 function stringElement(id: number, value: string): Uint8Array {
   const bytes: number[] = [];
   for (let index = 0; index < value.length; index += 1) {
@@ -283,6 +315,13 @@ function uintBytes(value: number): number[] {
     remaining = Math.floor(remaining / 0x100);
   }
   return bytes;
+}
+
+function intBytes(value: number): number[] {
+  if (value < -128 || value > 127) {
+    throw new Error(`test fixture signed integer is out of range: ${value}`);
+  }
+  return [value < 0 ? 0x100 + value : value];
 }
 
 function concat(...parts: Uint8Array[]): Uint8Array {

@@ -81,7 +81,7 @@ function printUsage(): void {
     "usage: wasm-golden [--allow-mismatch] [--progress-frames=N] [input.ivf|input.webm [input.md5]]",
   );
   print(
-    "       wasm-golden --bench [--bench-output-offset=N] [--bench-output-frames=N] [--bench-warmup-ms=N] [--bench-target-ms=N] [input.ivf|input.webm [input.md5]]",
+    "       wasm-golden --bench [--bench-frames START:COUNT] [--bench-warmup-ms=N] [--bench-target-ms=N] [input.ivf|input.webm [input.md5]]",
   );
   print(
     "       d8 dist/wasm-driver/golden.js -- vip9r.wasm [same options and inputs]",

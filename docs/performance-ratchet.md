@@ -19,7 +19,8 @@ ad-hoc wasm files are exploration.
 Use the release wasm build. Disable release overflow checks before treating
 numbers as representative; then run the strict golden corpus once.
 
-`wasm-golden --bench` reuses the golden frontend shape:
+`wasm-golden --bench --bench-frames START:COUNT` reuses the golden frontend
+shape:
 
 1. parse clip and sidecar md5
 2. compile and instantiate wasm
@@ -31,15 +32,16 @@ numbers as representative; then run the strict golden corpus once.
 Defaults:
 
 - clip: `/bulk/vip9r/chromium/bear-vp9.ivf`
-- output offset: `0`
-- output frames: `82`
+- frames: `0:82`
 - warmup: about `1s`
 - measurement target: about `5s`
 - d8 tiering: hardcode top-tier Wasm, initially `--no-liftoff`
 
-Offset means decode from stream start and discard shown outputs before the
-selected window. Do not fake random access before keyframe/window support
-exists.
+`START:COUNT` uses zero-based md5 visible-frame indices. `START` selects the
+first md5 sidecar line to measure and `COUNT` selects how many visible frames to
+measure. Nonzero starts require WebM keyframe metadata; the selected visible
+packet must be marked keyframe, and timed decode starts at that packet. IVF only
+supports start `0`.
 
 Do not use raw correctness-mode `wasm-golden` wall time as the ratchet result.
 Its per-frame plane copy and md5 work are validation overhead, not decoder

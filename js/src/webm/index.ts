@@ -1,6 +1,8 @@
 export type WebmPacket = {
   index: number;
   timestamp: bigint;
+  keyframe: boolean;
+  visible: boolean;
   payload: Uint8Array;
 };
 
@@ -68,6 +70,7 @@ const ID = {
   SimpleBlock: 0xa3,
   BlockGroup: 0xa0,
   Block: 0xa1,
+  ReferenceBlock: 0xfb,
   Void: 0xec,
   CRC32: 0xbf,
 } as const;
@@ -347,21 +350,38 @@ class WebmParser {
   }
 
   private parseBlockGroup(start: number, end: number, clusterTimestamp: bigint, selectedTrackNumber: number): void {
+    const blocks: ElementHeader[] = [];
+    let hasReferenceBlock = false;
     let offset = start;
     while (offset < end) {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.Block:
-          this.parseBlock(element.contentStart, element.contentEnd, clusterTimestamp, selectedTrackNumber);
+          blocks.push(element);
+          break;
+        case ID.ReferenceBlock:
+          hasReferenceBlock = true;
           break;
         default:
           break;
       }
       offset = element.contentEnd;
     }
+
+    for (const block of blocks) {
+      this.parseBlock(block.contentStart, block.contentEnd, clusterTimestamp, selectedTrackNumber, {
+        keyframe: !hasReferenceBlock,
+      });
+    }
   }
 
-  private parseBlock(start: number, end: number, clusterTimestamp: bigint, selectedTrackNumber: number): void {
+  private parseBlock(
+    start: number,
+    end: number,
+    clusterTimestamp: bigint,
+    selectedTrackNumber: number,
+    options: { keyframe?: boolean } = {},
+  ): void {
     const trackNumberVint = readEbmlVint(this.data, start);
     if (trackNumberVint.nextOffset + 3 > end) {
       throw new Error(`block at offset ${start} header is truncated`);
@@ -383,6 +403,8 @@ class WebmParser {
     this.packets.push({
       index: this.packets.length,
       timestamp: clusterTimestamp + BigInt(relativeTimestamp),
+      keyframe: options.keyframe ?? (flags & 0x80) !== 0,
+      visible: (flags & 0x08) === 0,
       payload: this.data.subarray(payloadStart, end),
     });
   }

@@ -18,6 +18,8 @@ export type WasmLogSink = (log: WasmLog) => void;
 export type Vp9Packet = {
   index: number;
   timestamp: bigint;
+  keyframe?: boolean;
+  visible?: boolean;
   payload: Uint8Array;
 };
 
@@ -141,6 +143,12 @@ export type DecodeWindowStats = {
   selectedOutputFrames: number;
 };
 
+export type BenchmarkDecodePlan = {
+  input: DemuxedVp9;
+  decodeWindow: DecodeWindow;
+  goldenOffset: number;
+};
+
 export type BenchmarkTimedPasses = {
   targetMs: number;
   elapsedMs: number;
@@ -195,7 +203,8 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   const benchmarkOptions = { ...DEFAULT_BENCHMARK_OPTIONS };
   const paths: string[] = [];
 
-  for (const arg of args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
     if (arg === "--allow-mismatch") {
       allowMismatch = true;
       continue;
@@ -208,20 +217,23 @@ export function parseDriverArgs(args: string[]): DriverArgs {
       progressFrames = parsePositiveInteger(arg.slice("--progress-frames=".length), "--progress-frames");
       continue;
     }
-    if (arg.startsWith("--bench-output-offset=")) {
+    if (arg === "--bench-frames") {
+      const value = args[index + 1];
+      if (value === undefined) {
+        throw new Error("--bench-frames requires START:COUNT");
+      }
+      index += 1;
       sawBenchmarkOption = true;
-      benchmarkOptions.outputOffset = parseNonNegativeInteger(
-        arg.slice("--bench-output-offset=".length),
-        "--bench-output-offset",
-      );
+      const frameRange = parseBenchmarkFrameRange(value);
+      benchmarkOptions.outputOffset = frameRange.outputOffset;
+      benchmarkOptions.outputFrames = frameRange.outputFrames;
       continue;
     }
-    if (arg.startsWith("--bench-output-frames=")) {
+    if (arg.startsWith("--bench-frames=")) {
       sawBenchmarkOption = true;
-      benchmarkOptions.outputFrames = parsePositiveInteger(
-        arg.slice("--bench-output-frames=".length),
-        "--bench-output-frames",
-      );
+      const frameRange = parseBenchmarkFrameRange(arg.slice("--bench-frames=".length));
+      benchmarkOptions.outputOffset = frameRange.outputOffset;
+      benchmarkOptions.outputFrames = frameRange.outputFrames;
       continue;
     }
     if (arg.startsWith("--bench-warmup-ms=")) {
@@ -291,15 +303,17 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   const warmupMs = validNonNegativeInteger("benchmark warmup ms", args.bench.warmupMs);
   const targetMs = validPositiveIntegerValue("benchmark target ms", args.bench.targetMs);
   validateGoldenWindow(golden, window);
+  const plan = planBenchmarkDecode(input, window);
   const makeDecoder = () => instantiateVp9Decoder(wasm, decoderDimensions, io.log);
 
   const validation = compareDecodedVp9WindowToGolden(
     args.inputPath,
     args.goldenPath,
-    input,
+    plan.input,
     golden,
     makeDecoder(),
-    window,
+    plan.decodeWindow,
+    { goldenOffset: plan.goldenOffset },
   );
   if (!passes(validation, false)) {
     throw new Error(
@@ -308,8 +322,8 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   }
 
   const now = io.now ?? monotonicNow;
-  const warmup = runTimedDecodePasses(input, golden, window, makeDecoder, warmupMs, now, false);
-  const measurement = runTimedDecodePasses(input, golden, window, makeDecoder, targetMs, now, true);
+  const warmup = runTimedDecodePasses(plan.input, golden, plan.decodeWindow, makeDecoder, warmupMs, now, false);
+  const measurement = runTimedDecodePasses(plan.input, golden, plan.decodeWindow, makeDecoder, targetMs, now, true);
 
   return {
     mode: "bench",
@@ -455,9 +469,14 @@ export function compareDecodedVp9WindowToGolden(
   golden: GoldenFrame[],
   decoder: FrameDecoder,
   window: DecodeWindow,
+  options: { goldenOffset?: number } = {},
 ): ComparisonReport {
   const normalizedWindow = normalizeDecodeWindow(window);
-  validateGoldenWindow(golden, normalizedWindow);
+  const goldenOffset =
+    options.goldenOffset === undefined
+      ? normalizedWindow.outputOffset
+      : validNonNegativeInteger("golden output offset", options.goldenOffset);
+  validateGoldenWindow(golden, { outputOffset: goldenOffset, outputFrames: normalizedWindow.outputFrames });
   const comparisons: FrameComparison[] = [];
   const stats = decodeVp9Window(input, golden, decoder, normalizedWindow, (frame, context) => {
     let actual: string;
@@ -466,14 +485,14 @@ export function compareDecodedVp9WindowToGolden(
     } catch (error) {
       throw contextError(
         `decode packet ${context.packetIndex} coded frame ${context.codedFrameIndex} output frame ${
-          context.outputIndex + 1
+          goldenOffset + context.selectedIndex + 1
         }`,
         error,
       );
     }
-    const expected = golden[normalizedWindow.outputOffset + context.selectedIndex];
+    const expected = golden[goldenOffset + context.selectedIndex];
     comparisons.push({
-      frameNumber: context.outputIndex + 1,
+      frameNumber: goldenOffset + context.selectedIndex + 1,
       expectedMd5: expected.md5,
       expectedName: expected.name,
       actualMd5: actual,
@@ -493,6 +512,54 @@ export function compareDecodedVp9WindowToGolden(
     stats.skippedOutputFrames,
     comparisons,
     normalizedWindow.outputFrames,
+  );
+}
+
+export function planBenchmarkDecode(input: DemuxedVp9, window: DecodeWindow): BenchmarkDecodePlan {
+  const normalizedWindow = normalizeDecodeWindow(window);
+  if (normalizedWindow.outputOffset === 0) {
+    return {
+      input,
+      decodeWindow: normalizedWindow,
+      goldenOffset: 0,
+    };
+  }
+
+  if (input.container !== "webm") {
+    throw new Error("nonzero --bench-frames start requires WebM keyframe metadata");
+  }
+
+  let visibleIndex = 0;
+  for (let packetIndex = 0; packetIndex < input.packets.length; packetIndex += 1) {
+    const packet = input.packets[packetIndex];
+    if (packet.visible === false) {
+      continue;
+    }
+
+    if (visibleIndex === normalizedWindow.outputOffset) {
+      if (packet.keyframe !== true) {
+        throw new Error(
+          `benchmark start frame ${normalizedWindow.outputOffset} maps to WebM packet ${packet.index}, which is not marked as a keyframe`,
+        );
+      }
+      return {
+        input: {
+          ...input,
+          packets: input.packets.slice(packetIndex),
+        },
+        decodeWindow: {
+          outputOffset: 0,
+          outputFrames: normalizedWindow.outputFrames,
+        },
+        goldenOffset: normalizedWindow.outputOffset,
+      };
+    }
+
+    visibleIndex += 1;
+  }
+
+  throw new Error(
+    `benchmark start frame ${normalizedWindow.outputOffset} exceeds WebM visible packet count ${visibleIndex}`,
   );
 }
 
@@ -692,6 +759,22 @@ function parseSafeInteger(value: string, name: string): number {
     throw new Error(`${name} is too large: ${value}`);
   }
   return parsed;
+}
+
+function parseBenchmarkFrameRange(value: string): DecodeWindow {
+  const match = /^(\d+):(\d+)$/.exec(value);
+  if (match === null) {
+    throw new Error("--bench-frames must be START:COUNT with non-negative integer start and positive count");
+  }
+  const start = parseSafeInteger(match[1], "--bench-frames start");
+  const count = parseSafeInteger(match[2], "--bench-frames count");
+  if (count <= 0) {
+    throw new Error("--bench-frames count must be positive");
+  }
+  return {
+    outputOffset: start,
+    outputFrames: count,
+  };
 }
 
 function validPositiveIntegerValue(name: string, value: number): number {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import type { ComparisonReport, FrameDecoder } from "./golden";
+import type { ComparisonReport, DemuxedVp9, FrameDecoder } from "./golden";
 import {
   compactI420,
   compareDecodedVp9WindowToGolden,
@@ -18,6 +18,7 @@ import {
   parseDriverArgs,
   parseIvf,
   parseVp9Input,
+  planBenchmarkDecode,
   passes,
 } from "./golden";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
@@ -170,8 +171,8 @@ describe("wasm golden runner helpers", () => {
     expect(
       parseDriverArgs([
         "--bench",
-        "--bench-output-offset=2",
-        "--bench-output-frames=3",
+        "--bench-frames",
+        "2:5",
         "--bench-warmup-ms=4",
         "--bench-target-ms=5",
         "vip9r.wasm",
@@ -185,13 +186,17 @@ describe("wasm golden runner helpers", () => {
       goldenPath: "custom.md5",
       bench: {
         outputOffset: 2,
-        outputFrames: 3,
+        outputFrames: 5,
         warmupMs: 4,
         targetMs: 5,
       },
     });
 
     expect(parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench).toEqual(DEFAULT_BENCHMARK_OPTIONS);
+    expect(parseDriverArgs(["--bench", "--bench-frames=2:5", "vip9r.wasm", "input.ivf"]).bench).toMatchObject({
+      outputOffset: 2,
+      outputFrames: 5,
+    });
     expect(parseDriverArgs(["--bench", "vip9r.wasm"])).toMatchObject({
       wasmPath: "vip9r.wasm",
       inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
@@ -201,7 +206,7 @@ describe("wasm golden runner helpers", () => {
   });
 
   test("rejects benchmark options that would make output non-benchmark or non-machine-readable", () => {
-    expect(() => parseDriverArgs(["--bench-output-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
+    expect(() => parseDriverArgs(["--bench-frames", "0:1", "vip9r.wasm", "input.ivf"])).toThrow(
       "benchmark options require --bench",
     );
     expect(() => parseDriverArgs(["--bench", "--allow-mismatch", "vip9r.wasm", "input.ivf"])).toThrow(
@@ -209,6 +214,12 @@ describe("wasm golden runner helpers", () => {
     );
     expect(() => parseDriverArgs(["--bench", "--progress-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
       "--progress-frames cannot be used with --bench",
+    );
+    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2:0", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--bench-frames count must be positive",
+    );
+    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2+3", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--bench-frames must be START:COUNT with non-negative integer start and positive count",
     );
   });
 
@@ -389,6 +400,90 @@ describe("wasm golden runner helpers", () => {
     expect(passes(report, false)).toBe(true);
   });
 
+  test("validates benchmark windows against an explicit golden offset", () => {
+    const input = sampleDemuxedWebm([
+      samplePacket(2, [7], { keyframe: true, visible: true }),
+      samplePacket(3, [8], { keyframe: false, visible: true }),
+    ]);
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+
+    const report = compareDecodedVp9WindowToGolden(
+      "input.webm",
+      "input.webm.md5",
+      input,
+      golden,
+      scriptedDecoder(frames.slice(2)),
+      {
+        outputOffset: 0,
+        outputFrames: 2,
+      },
+      { goldenOffset: 2 },
+    );
+
+    expect(report.comparisons.map((comparison) => comparison.frameNumber)).toEqual([3, 4]);
+    expect(matchedCount(report)).toBe(2);
+    expect(passes(report, false)).toBe(true);
+  });
+
+  test("plans nonzero WebM benchmark windows from visible keyframe packets", () => {
+    const input = sampleDemuxedWebm([
+      samplePacket(0, [0], { keyframe: true, visible: true }),
+      samplePacket(1, [1], { keyframe: true, visible: false }),
+      samplePacket(2, [2], { keyframe: false, visible: true }),
+      samplePacket(3, [3], { keyframe: true, visible: true }),
+      samplePacket(4, [4], { keyframe: false, visible: false }),
+    ]);
+
+    const plan = planBenchmarkDecode(input, {
+      outputOffset: 2,
+      outputFrames: 5,
+    });
+
+    expect(plan.goldenOffset).toBe(2);
+    expect(plan.decodeWindow).toEqual({
+      outputOffset: 0,
+      outputFrames: 5,
+    });
+    expect(plan.input.packets.map((packet) => packet.index)).toEqual([3, 4]);
+  });
+
+  test("rejects nonzero benchmark starts without selected keyframe metadata", () => {
+    expect(() =>
+      planBenchmarkDecode(parseIvf(sampleIvf()), {
+        outputOffset: 1,
+        outputFrames: 1,
+      }),
+    ).toThrow("nonzero --bench-frames start requires WebM keyframe metadata");
+
+    expect(() =>
+      planBenchmarkDecode(sampleDemuxedWebm([samplePacket(0, [0], { keyframe: false, visible: true })]), {
+        outputOffset: 0,
+        outputFrames: 1,
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      planBenchmarkDecode(
+        sampleDemuxedWebm([
+          samplePacket(0, [0], { keyframe: true, visible: true }),
+          samplePacket(1, [1], { keyframe: false, visible: true }),
+        ]),
+        {
+          outputOffset: 1,
+          outputFrames: 1,
+        },
+      ),
+    ).toThrow("benchmark start frame 1 maps to WebM packet 1, which is not marked as a keyframe");
+  });
+
   test("benchmark window validation reports missing selected outputs", () => {
     const ivf = parseIvf(sampleIvf());
     const frames = [scriptedFrame(2, 2, 1, 2, 3, 1), scriptedFrame(2, 2, 4, 5, 6, 10)];
@@ -473,6 +568,31 @@ function sampleReport(comparisons: ComparisonReport["comparisons"], expectedCoun
     skippedOutputFrames: 0,
     comparisons,
     expectedCount,
+  };
+}
+
+function sampleDemuxedWebm(packets: DemuxedVp9["packets"]): DemuxedVp9 {
+  return {
+    container: "webm",
+    codec: "V_VP9",
+    width: 320,
+    height: 240,
+    timestampScale: 1_000_000,
+    packets,
+  };
+}
+
+function samplePacket(
+  index: number,
+  payload: number[],
+  metadata: { keyframe: boolean; visible: boolean },
+): DemuxedVp9["packets"][number] {
+  return {
+    index,
+    timestamp: BigInt(index),
+    payload: new Uint8Array(payload),
+    keyframe: metadata.keyframe,
+    visible: metadata.visible,
   };
 }
 
