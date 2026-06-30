@@ -24,8 +24,9 @@ shape:
 
 1. parse clip and sidecar md5
 2. compile and instantiate wasm
-3. decode the selected output-frame window once with md5 validation
-4. warm up by decoding the same window without md5
+3. warm up by decoding the selected output-frame window; the first warmup pass
+   also performs md5 validation
+4. continue warmup without md5 if the first pass did not reach the warmup target
 5. measure repeated decodes of the same window without md5 until target duration
 6. report frames, outputs, elapsed time, ms/frame, and fps
 
@@ -36,6 +37,15 @@ Defaults:
 - warmup: about `1s`
 - measurement target: about `5s`
 - d8 tiering: hardcode top-tier Wasm, initially `--no-liftoff`
+
+The measurement target is also the maximum admissible time for one complete
+decode pass through the selected window. Timed warmup and measurement both fail
+if a pass exceeds that limit before producing the selected output frames.
+Measurement may still overshoot the phase target by finishing a final whole
+pass; bounded complete passes are preferable to partial-window timing.
+Benchmark validation is part of the first timed warmup pass, so an oversized
+window fails there instead of spending unbounded time on a standalone validation
+decode.
 
 `START:LAST` uses zero-based md5 visible-frame indices, inclusive. `START`
 selects the first md5 sidecar line to measure and `LAST` selects the last.

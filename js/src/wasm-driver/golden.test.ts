@@ -367,6 +367,87 @@ describe("wasm golden runner helpers", () => {
     });
   });
 
+  test("aborts benchmark window decode when pass deadline expires", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const nowSamples = [0, 1, 6];
+    const now = () => {
+      const sample = nowSamples.shift();
+      if (sample === undefined) {
+        throw new Error("unexpected clock read");
+      }
+      return sample;
+    };
+
+    expect(() =>
+      decodeVp9Window(
+        ivf,
+        [],
+        scriptedDecoder(frames),
+        {
+          outputOffset: 0,
+          outputFrames: 4,
+        },
+        undefined,
+        {
+          phase: "measurement",
+          pass: 1,
+          startMs: 0,
+          limitMs: 5,
+          now,
+        },
+      ),
+    ).toThrow(
+      "benchmark measurement pass 1 exceeded 5ms before completing decode window: selected 2/4 output frames",
+    );
+  });
+
+  test("aborts benchmark window validation when pass deadline expires", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [scriptedFrame(2, 2, 1, 2, 3, 1), scriptedFrame(2, 2, 4, 5, 6, 10)];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+    const nowSamples = [0, 6];
+    const now = () => {
+      const sample = nowSamples.shift();
+      if (sample === undefined) {
+        throw new Error("unexpected clock read");
+      }
+      return sample;
+    };
+
+    expect(() =>
+      compareDecodedVp9WindowToGolden(
+        "input.ivf",
+        "input.ivf.md5",
+        ivf,
+        golden,
+        scriptedDecoder(frames),
+        {
+          outputOffset: 0,
+          outputFrames: 2,
+        },
+        {
+          deadline: {
+            phase: "warmup validation",
+            pass: 1,
+            startMs: 0,
+            limitMs: 5,
+            now,
+          },
+        },
+      ),
+    ).toThrow(
+      "benchmark warmup validation pass 1 exceeded 5ms before completing decode window: selected 1/2 output frames",
+    );
+  });
+
   test("validates only the selected benchmark output window", () => {
     const ivf = parseIvf(sampleIvf());
     const frames = [

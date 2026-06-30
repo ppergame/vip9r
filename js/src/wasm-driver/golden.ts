@@ -143,6 +143,14 @@ export type DecodeWindowStats = {
   selectedOutputFrames: number;
 };
 
+type DecodeWindowDeadline = {
+  phase: string;
+  pass: number;
+  startMs: number;
+  limitMs: number;
+  now: () => number;
+};
+
 export type BenchmarkDecodePlan = {
   input: DemuxedVp9;
   decodeWindow: DecodeWindow;
@@ -292,25 +300,32 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   validateGoldenWindow(golden, window);
   const plan = planBenchmarkDecode(input, window);
   const makeDecoder = () => instantiateVp9Decoder(wasm, decoderDimensions, io.log);
+  const now = io.now ?? monotonicNow;
 
-  const validation = compareDecodedVp9WindowToGolden(
+  const { validation, warmup } = runTimedWarmupValidation(
     args.inputPath,
     args.goldenPath,
     plan.input,
     golden,
-    makeDecoder(),
     plan.decodeWindow,
-    { goldenOffset: plan.goldenOffset },
+    plan.goldenOffset,
+    makeDecoder,
+    warmupMs,
+    targetMs,
+    now,
   );
-  if (!passes(validation, false)) {
-    throw new Error(
-      `benchmark validation failed: ${matchedCount(validation)} matched, ${mismatchCount(validation)} mismatched, ${missingCount(validation)} missing, ${extraCount(validation)} extra`,
-    );
-  }
 
-  const now = io.now ?? monotonicNow;
-  const warmup = runTimedDecodePasses(plan.input, golden, plan.decodeWindow, makeDecoder, warmupMs, now, false);
-  const measurement = runTimedDecodePasses(plan.input, golden, plan.decodeWindow, makeDecoder, targetMs, now, true);
+  const measurement = runTimedDecodePasses(
+    plan.input,
+    golden,
+    plan.decodeWindow,
+    makeDecoder,
+    targetMs,
+    targetMs,
+    now,
+    true,
+    "measurement",
+  );
 
   return {
     mode: "bench",
@@ -456,7 +471,7 @@ export function compareDecodedVp9WindowToGolden(
   golden: GoldenFrame[],
   decoder: FrameDecoder,
   window: DecodeWindow,
-  options: { goldenOffset?: number } = {},
+  options: { goldenOffset?: number; deadline?: DecodeWindowDeadline } = {},
 ): ComparisonReport {
   const normalizedWindow = normalizeDecodeWindow(window);
   const goldenOffset =
@@ -465,30 +480,37 @@ export function compareDecodedVp9WindowToGolden(
       : validNonNegativeInteger("golden output offset", options.goldenOffset);
   validateGoldenWindow(golden, { outputOffset: goldenOffset, outputFrames: normalizedWindow.outputFrames });
   const comparisons: FrameComparison[] = [];
-  const stats = decodeVp9Window(input, golden, decoder, normalizedWindow, (frame, context) => {
-    let actual: string;
-    try {
-      actual = md5Hex(compactI420(decoder, frame));
-    } catch (error) {
-      throw contextError(
-        `decode packet ${context.packetIndex} coded frame ${context.codedFrameIndex} output frame ${
-          goldenOffset + context.selectedIndex + 1
-        }`,
-        error,
-      );
-    }
-    const expected = golden[goldenOffset + context.selectedIndex];
-    comparisons.push({
-      frameNumber: goldenOffset + context.selectedIndex + 1,
-      expectedMd5: expected.md5,
-      expectedName: expected.name,
-      actualMd5: actual,
-      decodedWidth: frame.decodedWidth,
-      decodedHeight: frame.decodedHeight,
-      renderWidth: frame.renderWidth,
-      renderHeight: frame.renderHeight,
-    });
-  });
+  const stats = decodeVp9Window(
+    input,
+    golden,
+    decoder,
+    normalizedWindow,
+    (frame, context) => {
+      let actual: string;
+      try {
+        actual = md5Hex(compactI420(decoder, frame));
+      } catch (error) {
+        throw contextError(
+          `decode packet ${context.packetIndex} coded frame ${context.codedFrameIndex} output frame ${
+            goldenOffset + context.selectedIndex + 1
+          }`,
+          error,
+        );
+      }
+      const expected = golden[goldenOffset + context.selectedIndex];
+      comparisons.push({
+        frameNumber: goldenOffset + context.selectedIndex + 1,
+        expectedMd5: expected.md5,
+        expectedName: expected.name,
+        actualMd5: actual,
+        decodedWidth: frame.decodedWidth,
+        decodedHeight: frame.decodedHeight,
+        renderWidth: frame.renderWidth,
+        renderHeight: frame.renderHeight,
+      });
+    },
+    options.deadline,
+  );
 
   return makeReport(
     inputPath,
@@ -556,6 +578,7 @@ export function decodeVp9Window(
   decoder: FrameDecoder,
   window: DecodeWindow,
   onSelectedOutput?: (frame: NativeFrame, context: WindowOutputContext) => void,
+  deadline?: DecodeWindowDeadline,
 ): DecodeWindowStats {
   const normalizedWindow = normalizeDecodeWindow(window);
   const comparedDimensions = zeroDimensionIvf(input) ? comparedGoldenDimensions(golden) : undefined;
@@ -572,12 +595,28 @@ export function decodeVp9Window(
     selectedOutputFrames,
   });
 
+  const checkDeadline = (): void => {
+    if (deadline === undefined) {
+      return;
+    }
+    const elapsedMs = deadline.now() - deadline.startMs;
+    if (elapsedMs < 0) {
+      throw new Error("benchmark clock moved backwards");
+    }
+    if (elapsedMs > deadline.limitMs) {
+      throw new Error(
+        `benchmark ${deadline.phase} pass ${deadline.pass} exceeded ${deadline.limitMs}ms before completing decode window: selected ${selectedOutputFrames}/${normalizedWindow.outputFrames} output frames, decoded ${decodedOutputFrames} outputs, coded ${codedFrames} frames, elapsed ${elapsedMs}ms`,
+      );
+    }
+  };
+
   for (const packet of input.packets) {
     try {
       decoder.beginPacket(packet.payload);
     } catch (error) {
       throw contextError(`decode packet ${packet.index} timestamp ${packet.timestamp}`, error);
     }
+    checkDeadline();
 
     let codedIndex = 0;
     while (true) {
@@ -597,6 +636,7 @@ export function decodeVp9Window(
           !comparedDimensions.has(dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight))
         ) {
           skippedOutputFrames += 1;
+          checkDeadline();
           if (step.packetDone) {
             break;
           }
@@ -605,6 +645,7 @@ export function decodeVp9Window(
 
         const outputIndex = comparableOutputFrames;
         comparableOutputFrames += 1;
+        let windowComplete = false;
         if (outputIndex >= normalizedWindow.outputOffset && selectedOutputFrames < normalizedWindow.outputFrames) {
           const selectedIndex = selectedOutputFrames;
           selectedOutputFrames += 1;
@@ -614,10 +655,14 @@ export function decodeVp9Window(
             outputIndex,
             selectedIndex,
           });
-          if (selectedOutputFrames >= normalizedWindow.outputFrames) {
-            return stats();
-          }
+          windowComplete = selectedOutputFrames >= normalizedWindow.outputFrames;
         }
+        checkDeadline();
+        if (windowComplete) {
+          return stats();
+        }
+      } else {
+        checkDeadline();
       }
       if (step.packetDone) {
         break;
@@ -660,14 +705,119 @@ function validateGoldenWindow(golden: GoldenFrame[], window: DecodeWindow): void
   }
 }
 
+function runTimedWarmupValidation(
+  inputPath: string,
+  goldenPath: string,
+  input: DemuxedVp9,
+  golden: GoldenFrame[],
+  window: DecodeWindow,
+  goldenOffset: number,
+  makeDecoder: () => FrameDecoder,
+  warmupMs: number,
+  passLimitMs: number,
+  now: () => number,
+): { validation: ComparisonReport; warmup: BenchmarkTimedPasses } {
+  const start = now();
+  let elapsedMs = 0;
+  let passCount = 0;
+  let codedFrames = 0;
+  let decodedOutputFrames = 0;
+  let outputFrames = 0;
+  let skippedOutputFrames = 0;
+
+  const recordPass = (stats: DecodeWindowStats): void => {
+    passCount += 1;
+    codedFrames += stats.codedFrames;
+    decodedOutputFrames += stats.decodedOutputFrames;
+    outputFrames += stats.selectedOutputFrames;
+    skippedOutputFrames += stats.skippedOutputFrames;
+    elapsedMs = now() - start;
+    if (elapsedMs < 0) {
+      throw new Error("benchmark clock moved backwards");
+    }
+  };
+
+  const passStart = now();
+  if (passStart - start < 0) {
+    throw new Error("benchmark clock moved backwards");
+  }
+  const validation = compareDecodedVp9WindowToGolden(
+    inputPath,
+    goldenPath,
+    input,
+    golden,
+    makeDecoder(),
+    window,
+    {
+      goldenOffset,
+      deadline: {
+        phase: "warmup validation",
+        pass: 1,
+        startMs: passStart,
+        limitMs: passLimitMs,
+        now,
+      },
+    },
+  );
+  if (!passes(validation, false)) {
+    throw new Error(
+      `benchmark validation failed: ${matchedCount(validation)} matched, ${mismatchCount(validation)} mismatched, ${missingCount(validation)} missing, ${extraCount(validation)} extra`,
+    );
+  }
+  recordPass({
+    codedFrames: validation.codedFrames,
+    decodedOutputFrames: validation.decodedOutputFrames,
+    skippedOutputFrames: validation.skippedOutputFrames,
+    selectedOutputFrames: validation.comparisons.length,
+  });
+
+  while (elapsedMs < warmupMs) {
+    const warmupPassStart = now();
+    if (warmupPassStart - start < 0) {
+      throw new Error("benchmark clock moved backwards");
+    }
+    const stats = decodeVp9Window(input, golden, makeDecoder(), window, undefined, {
+      phase: "warmup",
+      pass: passCount + 1,
+      startMs: warmupPassStart,
+      limitMs: passLimitMs,
+      now,
+    });
+    if (stats.selectedOutputFrames !== window.outputFrames) {
+      throw new Error(
+        `benchmark decode window incomplete: selected ${stats.selectedOutputFrames}/${window.outputFrames} output frames`,
+      );
+    }
+    recordPass(stats);
+  }
+
+  return {
+    validation,
+    warmup: {
+      targetMs: warmupMs,
+      elapsedMs,
+      passes: passCount,
+      codedFrames,
+      decodedOutputFrames,
+      outputFrames,
+      skippedOutputFrames,
+      codedFramesPerPass: codedFrames / passCount,
+      outputFramesPerPass: outputFrames / passCount,
+      ...frameRate(outputFrames, elapsedMs),
+    },
+  };
+}
+
 function runTimedDecodePasses(
   input: DemuxedVp9,
   golden: GoldenFrame[],
   window: DecodeWindow,
   makeDecoder: () => FrameDecoder,
   targetMs: number,
+  passLimitMs: number,
   now: () => number,
   runAtLeastOnce: boolean,
+  phase: string,
 ): BenchmarkTimedPasses {
   const start = now();
   let elapsedMs = 0;
@@ -678,7 +828,17 @@ function runTimedDecodePasses(
   let skippedOutputFrames = 0;
 
   while ((runAtLeastOnce && passes === 0) || elapsedMs < targetMs) {
-    const stats = decodeVp9Window(input, golden, makeDecoder(), window);
+    const passStart = now();
+    if (passStart - start < 0) {
+      throw new Error("benchmark clock moved backwards");
+    }
+    const stats = decodeVp9Window(input, golden, makeDecoder(), window, undefined, {
+      phase,
+      pass: passes + 1,
+      startMs: passStart,
+      limitMs: passLimitMs,
+      now,
+    });
     if (stats.selectedOutputFrames !== window.outputFrames) {
       throw new Error(
         `benchmark decode window incomplete: selected ${stats.selectedOutputFrames}/${window.outputFrames} output frames`,
