@@ -42,7 +42,8 @@ Workspace crates:
 
 ### Inputs (read-only)
 
-- `/specs` - specs.
+- `/specs` - specs. Arm ISA XML lives under `/specs/arm-isa/a64` and
+  `/specs/arm-isa/aarch32-t32`.
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
 - `wasm-tests` and `wasm-golden` on PATH - scripts that build and test the wasm
   module.

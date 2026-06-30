@@ -3,6 +3,7 @@
   rustToolchain,
   v8,
   codex,
+  armIsaXml,
   wasmGolden,
   wasmTests,
 }: let
@@ -165,7 +166,7 @@ in
       mkdir -p "$temp_dir" "$codex_home" "$cargo_home"
       [[ -e "$codex_home/config.toml" ]] || touch "$codex_home/config.toml"
       run="$(mktemp -d -p "$temp_dir" grinder.XXXXXX)"
-      mkdir -p "$run/codex-state" "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/rootfs/bulk/vip9r" "$run/trace"
+      mkdir -p "$run/codex-state" "$run/home" "$run/rootfs/bin" "$run/rootfs/usr/bin" "$run/rootfs/bulk/vip9r" "$run/rootfs/specs/arm-isa" "$run/trace"
       git config --file "$run/home/.gitconfig" user.name vip9r-implementor
       git config --file "$run/home/.gitconfig" user.email vip9r-implementor@example.invalid
       ln -s "${sandboxEnv}" "$run/tools"
@@ -207,6 +208,7 @@ in
         --volume "$codex_config:/codex-home/config.toml:ro"
         --volume "$cargo_home:/cargo-home:rw"
         --volume "$repo/docs/specs:/specs:ro"
+        --volume "${armIsaXml}:/specs/arm-isa:ro"
         --volume "/bulk/vip9r:/bulk/vip9r:ro"
       )
       rootfs_arg="$run/rootfs:O"

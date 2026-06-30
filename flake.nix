@@ -31,6 +31,7 @@
     };
     v8 = import ./nix/v8.nix {inherit pkgs;};
     ffmpegVp9 = import ./nix/ffmpeg-vp9.nix {inherit pkgs;};
+    armIsaXml = import ./nix/arm-isa-xml.nix {inherit pkgs;};
     codex = import ./nix/codex.nix {inherit pkgs;};
     rustToolchain =
       pkgs.rust-bin.stable.latest.default.override
@@ -55,7 +56,7 @@
       inherit pkgs rustToolchain v8;
     };
     grinder = import ./nix/grinder.nix {
-      inherit pkgs rustToolchain v8 codex;
+      inherit pkgs rustToolchain v8 codex armIsaXml;
       inherit (wasmTools) wasmGolden wasmTests;
     };
   in {
