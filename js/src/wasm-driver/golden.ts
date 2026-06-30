@@ -236,26 +236,13 @@ export function parseDriverArgs(args: string[]): DriverArgs {
       benchmarkOptions.outputFrames = frameRange.outputFrames;
       continue;
     }
-    if (arg.startsWith("--bench-warmup-ms=")) {
-      sawBenchmarkOption = true;
-      benchmarkOptions.warmupMs = parseNonNegativeInteger(
-        arg.slice("--bench-warmup-ms=".length),
-        "--bench-warmup-ms",
-      );
-      continue;
-    }
-    if (arg.startsWith("--bench-target-ms=")) {
-      sawBenchmarkOption = true;
-      benchmarkOptions.targetMs = parsePositiveInteger(arg.slice("--bench-target-ms=".length), "--bench-target-ms");
-      continue;
-    }
     if (arg.startsWith("-")) {
       throw new Error(`unknown argument: ${arg}`);
     }
     paths.push(arg);
   }
 
-  if (paths.length < 1 || paths.length > 3) {
+  if (paths.length < 1 || paths.length > 2) {
     throw new DriverUsageError("invalid path count");
   }
   if (sawBenchmarkOption && !bench) {
@@ -268,9 +255,9 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     throw new Error("--progress-frames cannot be used with --bench");
   }
 
-  const [wasmPath, explicitInputPath, explicitGoldenPath] = paths;
+  const [wasmPath, explicitInputPath] = paths;
   const inputPath = explicitInputPath ?? (bench ? DEFAULT_BENCHMARK_INPUT : DEFAULT_GOLDEN_INPUT);
-  const goldenPath = explicitGoldenPath ?? `${inputPath}.md5`;
+  const goldenPath = `${inputPath}.md5`;
   return {
     allowMismatch,
     wasmPath,
@@ -742,13 +729,6 @@ function frameRate(frames: number, elapsedMs: number): { msPerFrame: number; fps
 function parsePositiveInteger(value: string, name: string): number {
   if (!/^[1-9]\d*$/.test(value)) {
     throw new Error(`${name} must be a positive integer`);
-  }
-  return parseSafeInteger(value, name);
-}
-
-function parseNonNegativeInteger(value: string, name: string): number {
-  if (!/^(0|[1-9]\d*)$/.test(value)) {
-    throw new Error(`${name} must be a non-negative integer`);
   }
   return parseSafeInteger(value, name);
 }

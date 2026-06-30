@@ -10,4 +10,13 @@ roles and responsibilities.
 ## Performance testing
 
 - Use release build for wasm module measurements, debug build is too slow.
-- With multiple samples, the most favorable sample is more important than the average.
+- With multiple timing samples, the most favorable sample is more important than
+  the average.
+
+## Taste reminders
+
+- Do not add "nice to have" features, unused generic tooling affordances, or
+  backwards compatibility schemes. Everything in this project is a development
+  convenience.
+- UX drives and justifies implementation. If existing implementation conflicts
+  with desired UX, prioritize the UX.

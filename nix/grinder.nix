@@ -5,6 +5,7 @@
   codex,
   armIsaXml,
   wasmGolden,
+  wasmMicrobench,
   wasmTests,
 }: let
   inherit (pkgs) lib;
@@ -64,7 +65,7 @@
       # Debugging and host inspection.
       strace
     ])
-    ++ [codex wasmGolden wasmTests];
+    ++ [codex wasmGolden wasmMicrobench wasmTests];
   sandboxEnv = pkgs.buildEnv {
     name = "vip9r-grinder-env";
     paths = sandboxPackages;
@@ -154,7 +155,7 @@ in
       perf_submit="$repo/scripts/vip9r-perf-submit.py"
       perf_socket="$repo/temp/vip9r-perf.sock"
       wasm_driver_dist="$repo/js/dist/wasm-driver"
-      for artifact in golden.js tests.js; do
+      for artifact in golden.js microbench.js tests.js; do
         if [[ ! -f "$wasm_driver_dist/$artifact" ]]; then
           echo "missing prebuilt wasm driver artifact: $wasm_driver_dist/$artifact" >&2
           echo "run: cd js && pnpm build:wasm-driver" >&2

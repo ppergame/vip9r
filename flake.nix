@@ -57,12 +57,13 @@
     };
     grinder = import ./nix/grinder.nix {
       inherit pkgs rustToolchain v8 codex armIsaXml;
-      inherit (wasmTools) wasmGolden wasmTests;
+      inherit (wasmTools) wasmGolden wasmMicrobench wasmTests;
     };
   in {
     packages.${system} = {
       inherit grinder;
       wasm-golden = wasmTools.wasmGolden;
+      wasm-microbench = wasmTools.wasmMicrobench;
       wasm-tests = wasmTools.wasmTests;
     };
 
@@ -106,6 +107,7 @@
         ++ [
           npmUnavailable
           wasmTools.wasmGolden
+          wasmTools.wasmMicrobench
           wasmTools.wasmTests
         ];
     };

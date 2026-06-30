@@ -13,11 +13,13 @@ from pathlib import Path
 
 SOCKET_PATH = Path("temp/vip9r-perf.sock")
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/golden.js"
+GOLDEN_RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/golden.js"
+MICROBENCH_RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/microbench.js"
 MEDIA_ROOT = Path("/bulk/vip9r")
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+U32_MAX = 2**32 - 1
 
 
 @dataclass
@@ -172,7 +174,7 @@ def handle_request(
 
     kind = request.get("kind")
     if kind == "microbench":
-        return {"ok": False, "error": "microbench requests are not implemented yet"}
+        return handle_microbench_request(args, request, candidate)
     if kind != "decode":
         return {"ok": False, "error": f"unsupported request kind: {kind!r}"}
 
@@ -195,6 +197,32 @@ def handle_request(
         "serial": args.serial,
         "host": {
             "baseline": baseline,
+            "candidate": candidate_result,
+        },
+    }
+
+
+def handle_microbench_request(
+    args: argparse.Namespace,
+    request: dict[str, object],
+    candidate: bytes,
+) -> dict[str, object]:
+    try:
+        microbench = microbench_from_request(request)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+
+    candidate_fd = memfd_from_bytes("vip9r-candidate.wasm", candidate)
+    try:
+        candidate_result = run_host_microbench("candidate", candidate_fd, microbench)
+    finally:
+        os.close(candidate_fd)
+
+    return {
+        "ok": candidate_result.get("ok") is True,
+        "kind": "microbench",
+        "serial": args.serial,
+        "host": {
             "candidate": candidate_result,
         },
     }
@@ -225,6 +253,15 @@ def frame_range_from_request(request: dict[str, object]) -> tuple[int, int] | No
     return offset, last
 
 
+def microbench_from_request(request: dict[str, object]) -> dict[str, int]:
+    slot = request.get("slot")
+    if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
+        raise ValueError("slot must be a non-negative integer")
+    if slot > U32_MAX:
+        raise ValueError(f"slot must be less than or equal to {U32_MAX}")
+    return {"slot": slot}
+
+
 def run_host_bench(
     label: str,
     wasm_fd: int,
@@ -235,7 +272,7 @@ def run_host_bench(
     cmd = [
         os.environ.get("D8_LINUX64", "d8"),
         "--no-liftoff",
-        str(RUNNER_PATH),
+        str(GOLDEN_RUNNER_PATH),
         "--",
         proc_fd_path(wasm_fd),
         "--bench",
@@ -261,6 +298,45 @@ def run_host_bench(
             "ok": False,
             "label": label,
             "error": f"invalid benchmark JSON: {error}",
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+    return {"ok": True, "label": label, "report": report, "stderr": completed.stderr}
+
+
+def run_host_microbench(
+    label: str,
+    wasm_fd: int,
+    microbench: dict[str, int],
+) -> dict[str, object]:
+    os.lseek(wasm_fd, 0, os.SEEK_SET)
+    cmd = [
+        os.environ.get("D8_LINUX64", "d8"),
+        "--no-liftoff",
+        str(MICROBENCH_RUNNER_PATH),
+        "--",
+        proc_fd_path(wasm_fd),
+        "--slot",
+        str(microbench["slot"]),
+    ]
+
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        return {
+            "ok": False,
+            "label": label,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        return {
+            "ok": False,
+            "label": label,
+            "error": f"invalid microbenchmark JSON: {error}",
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }

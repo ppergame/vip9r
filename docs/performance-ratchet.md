@@ -66,7 +66,7 @@ Multiple grinders may submit device work concurrently, but device access is
 serialized by a small daemon. The submit interface is blocking:
 
 ```sh
-vip9r-perf-submit candidate.wasm
+vip9r-perf-submit candidate.wasm --media realworld/clip.webm
 ```
 
 The command returns result JSON when the queued run finishes. No async status API
@@ -109,13 +109,18 @@ may add an ad-hoc export:
 pub extern "C" fn vip9r_bench_run(slot: u32, inner_iters: u32) -> u32
 ```
 
-`vip9r-perf-submit --slot N` runs that export instead of the full-decode loop.
+`wasm-microbench --slot N` runs that export directly. `vip9r-perf-submit
+candidate.wasm --slot N` submits the same candidate-only run through the daemon.
 The slot is a task-owned linear list, not a stable Wasm function index. The task
 or final report must say what each slot means.
 
 JS owns warmup duration, target duration, and timed batches. Wasm owns the tight
 inner loop so tiny operations do not measure JS-to-Wasm call overhead. The
 return value is a sink.
+
+Microbench JSON is a single stdout object. Unlike full-decode benchmarking,
+daemon microbenchmarks do not run the baseline wasm. They are attribution tools,
+not ratchet evidence.
 
 No v0 setup call or fixture protocol. A transient slot may lazily initialize
 data, reuse state left by validation decode, or hardcode a fixture. Standardize

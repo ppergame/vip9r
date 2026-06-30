@@ -48,15 +48,12 @@ in {
     text = ''
       set -euo pipefail
 
-      if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
-        echo "usage: wasm-tests [TEST_SUBSTRING]" >&2
-        exit 0
-      fi
-
-      if [[ $# -gt 1 ]]; then
-        echo "usage: wasm-tests [TEST_SUBSTRING]" >&2
-        exit 2
-      fi
+      for arg in "$@"; do
+        if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+          echo "usage: wasm-tests [--json] [TEST_SUBSTRING]" >&2
+          exit 0
+        fi
+      done
 
       ${common}
       locate_project
@@ -66,10 +63,35 @@ in {
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         --target wasm32-unknown-unknown -p vip9r --release --features wasm-tests
-      if [[ $# -eq 1 ]]; then
-        exec "${v8.linux64}/d8" "$runner" -- "$wasm_path" "$1"
+      exec "${v8.linux64}/d8" "$runner" -- "$wasm_path" "$@"
+    '';
+  };
+
+  wasmMicrobench = pkgs.writeShellApplication {
+    name = "wasm-microbench";
+    runtimeInputs = [pkgs.git rustToolchain];
+    text = ''
+      set -euo pipefail
+
+      show_help=0
+      for arg in "$@"; do
+        if [[ "$arg" == "-h" || "$arg" == "--help" ]]; then
+          show_help=1
+        fi
+      done
+
+      ${common}
+      locate_project
+      select_wasm_target_dir wasm-golden
+      runner="$project_root/js/dist/wasm-driver/microbench.js"
+      require_runner "$runner"
+      if [[ "$show_help" -eq 1 ]]; then
+        exec "${v8.linux64}/d8" --no-liftoff "$runner" -- --help
       fi
-      exec "${v8.linux64}/d8" "$runner" -- "$wasm_path"
+
+      cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
+        --target wasm32-unknown-unknown -p vip9r --release
+      exec "${v8.linux64}/d8" --no-liftoff "$runner" -- "$wasm_path" "$@"
     '';
   };
 

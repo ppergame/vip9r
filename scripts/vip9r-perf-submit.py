@@ -10,6 +10,7 @@ GRINDER_SOCKET_PATH = Path("/run/vip9r-perf.sock")
 HOST_SOCKET_PATH = Path("temp/vip9r-perf.sock")
 MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
+U32_MAX = 2**32 - 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--slot",
-        type=int,
+        type=parse_u32,
         help="microbenchmark slot to run instead of a media decode",
     )
     parser.add_argument(
@@ -127,6 +128,19 @@ def parse_frame_range(value: str) -> tuple[int, int]:
     if last < offset:
         raise argparse.ArgumentTypeError("last must be greater than or equal to offset")
     return offset, last
+
+
+def parse_non_negative_int(value: str) -> int:
+    if not re.fullmatch(r"0|[1-9]\d*", value):
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return int(value)
+
+
+def parse_u32(value: str) -> int:
+    parsed = parse_non_negative_int(value)
+    if parsed > U32_MAX:
+        raise argparse.ArgumentTypeError("must fit in u32")
+    return parsed
 
 
 if __name__ == "__main__":

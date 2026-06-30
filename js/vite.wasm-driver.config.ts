@@ -9,6 +9,7 @@ export default defineConfig({
     lib: {
       entry: {
         golden: "src/wasm-driver/main.ts",
+        microbench: "src/wasm-driver/microbench.ts",
         tests: "src/wasm-tests/main.ts",
       },
       formats: ["es"],

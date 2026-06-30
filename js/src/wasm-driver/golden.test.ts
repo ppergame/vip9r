@@ -173,22 +173,19 @@ describe("wasm golden runner helpers", () => {
         "--bench",
         "--bench-frames",
         "2:6",
-        "--bench-warmup-ms=4",
-        "--bench-target-ms=5",
         "vip9r.wasm",
         "input.webm",
-        "custom.md5",
       ]),
     ).toMatchObject({
       allowMismatch: false,
       wasmPath: "vip9r.wasm",
       inputPath: "input.webm",
-      goldenPath: "custom.md5",
+      goldenPath: "input.webm.md5",
       bench: {
         outputOffset: 2,
         outputFrames: 5,
-        warmupMs: 4,
-        targetMs: 5,
+        warmupMs: DEFAULT_BENCHMARK_OPTIONS.warmupMs,
+        targetMs: DEFAULT_BENCHMARK_OPTIONS.targetMs,
       },
     });
 

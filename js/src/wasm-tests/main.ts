@@ -2,6 +2,8 @@ declare const readbuffer: (path: string) => ArrayBuffer;
 declare const print: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
+export {};
+
 const WasmLogKind = {
   Diagnostic: 0,
   TestFailure: 1,
@@ -22,6 +24,7 @@ type D8Global = typeof globalThis & {
 
 type RunnerArgs = {
   wasmPath: string;
+  json: boolean;
   testFilter?: string;
 };
 
@@ -29,11 +32,30 @@ type TestResult =
   | { kind: "pass"; logs: WasmLog[] }
   | { kind: "fail"; message: string; logs: WasmLog[] };
 
+type TestFailureReport = {
+  name: string;
+  message: string;
+  logs: WasmLog[];
+};
+
+type TestReport = {
+  mode: "tests";
+  ok: boolean;
+  filter?: string;
+  discovered: number;
+  selected: number;
+  passed: number;
+  failed: number;
+  filtered: number;
+  failures: TestFailureReport[];
+  error?: string;
+};
+
 const TEST_PREFIX = "vip9r_test__";
 const TEST_FAILURE = 1;
 
 function main(args: string[]): void {
-  const { wasmPath, testFilter } = parseArgs(args);
+  const { wasmPath, json, testFilter } = parseArgs(args);
   const module = new WebAssembly.Module(readbuffer(wasmPath));
   const testNames = discoverTests(module);
   const selectedTestNames = selectTests(testNames, testFilter);
@@ -42,26 +64,62 @@ function main(args: string[]): void {
     const filtered = testNames.length - selectedTestNames.length;
     const filterLabel = JSON.stringify(testFilter);
     if (selectedTestNames.length === 0) {
-      print(`no tests matched substring ${filterLabel} (${testNames.length} discovered)`);
+      const report = emptyFilteredReport(testFilter, testNames.length);
+      if (json) {
+        print(JSON.stringify(report));
+      } else {
+        print(`no tests matched substring ${filterLabel} (${testNames.length} discovered)`);
+      }
       quit(1);
     }
-    print(
-      `running ${selectedTestNames.length} of ${testNames.length} tests matching ${filterLabel} (${filtered} filtered out)`,
-    );
+    if (!json) {
+      print(
+        `running ${selectedTestNames.length} of ${testNames.length} tests matching ${filterLabel} (${filtered} filtered out)`,
+      );
+    }
   }
 
   let passed = 0;
   let failed = 0;
+  const failures: TestFailureReport[] = [];
   for (const testName of selectedTestNames) {
     const result = runTest(module, testName);
-    printDiagnosticLogs(testName, result.logs);
     if (result.kind === "pass") {
       passed += 1;
-      print(`test ${testName} ... ok`);
+      if (!json) {
+        printDiagnosticLogs(testName, result.logs);
+        print(`test ${testName} ... ok`);
+      }
     } else {
       failed += 1;
-      print(`test ${testName} ... FAILED: ${result.message}`);
+      failures.push({ name: testName, message: result.message, logs: result.logs });
+      if (!json) {
+        printDiagnosticLogs(testName, result.logs);
+        print(`test ${testName} ... FAILED: ${result.message}`);
+      }
     }
+  }
+
+  const report: TestReport = {
+    mode: "tests",
+    ok: failed === 0,
+    discovered: testNames.length,
+    selected: selectedTestNames.length,
+    passed,
+    failed,
+    filtered: testNames.length - selectedTestNames.length,
+    failures,
+  };
+  if (testFilter !== undefined) {
+    report.filter = testFilter;
+  }
+
+  if (json) {
+    print(JSON.stringify(report));
+    if (!report.ok) {
+      quit(1);
+    }
+    return;
   }
 
   if (failed === 0) {
@@ -74,20 +132,28 @@ function main(args: string[]): void {
 }
 
 function parseArgs(args: string[]): RunnerArgs {
-  if (args.length === 1 && (args[0] === "-h" || args[0] === "--help")) {
-    printUsage();
-    quit(0);
+  let json = false;
+  const positional: string[] = [];
+  for (const arg of args) {
+    if (arg === "-h" || arg === "--help") {
+      printUsage();
+      quit(0);
+    }
+    if (arg === "--json") {
+      json = true;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      throw new UsageError(`unknown argument: ${arg}`);
+    }
+    positional.push(arg);
   }
-  if (args.length < 1 || args.length > 2) {
-    printUsage();
+
+  if (positional.length < 1 || positional.length > 2) {
     throw new UsageError("expected wasm path and optional test substring");
   }
-  const [wasmPath, testFilter] = args;
-  if (wasmPath.startsWith("-")) {
-    printUsage();
-    throw new UsageError(`unknown argument: ${wasmPath}`);
-  }
-  const runnerArgs: RunnerArgs = { wasmPath };
+  const [wasmPath, testFilter] = positional;
+  const runnerArgs: RunnerArgs = { wasmPath, json };
   if (testFilter !== undefined) {
     runnerArgs.testFilter = testFilter;
   }
@@ -95,7 +161,7 @@ function parseArgs(args: string[]): RunnerArgs {
 }
 
 function printUsage(): void {
-  print("usage: d8 dist/wasm-driver/tests.js -- vip9r.wasm [TEST_SUBSTRING]");
+  print("usage: wasm-tests [--json] [TEST_SUBSTRING]");
 }
 
 function discoverTests(module: WebAssembly.Module): string[] {
@@ -121,6 +187,21 @@ function formatResult(status: "ok" | "FAILED", passed: number, failed: number, f
     return base;
   }
   return `${base}; ${filtered} filtered out`;
+}
+
+function emptyFilteredReport(testFilter: string, discovered: number): TestReport {
+  return {
+    mode: "tests",
+    ok: false,
+    filter: testFilter,
+    discovered,
+    selected: 0,
+    passed: 0,
+    failed: 0,
+    filtered: discovered,
+    failures: [],
+    error: `no tests matched substring ${JSON.stringify(testFilter)} (${discovered} discovered)`,
+  };
 }
 
 function runTest(module: WebAssembly.Module, testName: string): TestResult {
@@ -245,12 +326,25 @@ class UsageError extends Error {}
 
 try {
   const d8 = globalThis as D8Global;
-  main(d8.scriptArgs ?? d8.arguments ?? []);
+  const args = d8.scriptArgs ?? d8.arguments ?? [];
+  main(args);
 } catch (error) {
+  const d8 = globalThis as D8Global;
+  const args = d8.scriptArgs ?? d8.arguments ?? [];
+  const json = args.includes("--json");
   if (error instanceof UsageError) {
-    print(error.message);
+    if (json) {
+      print(JSON.stringify({ mode: "tests", ok: false, error: error.message }));
+    } else {
+      printUsage();
+      print(error.message);
+    }
     quit(2);
   }
-  print(error instanceof Error && error.stack ? error.stack : String(error));
+  if (json) {
+    print(JSON.stringify({ mode: "tests", ok: false, error: errorMessage(error) }));
+  } else {
+    print(errorMessage(error));
+  }
   quit(1);
 }

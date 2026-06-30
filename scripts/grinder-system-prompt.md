@@ -45,8 +45,8 @@ Workspace crates:
 - `/specs` - specs. Arm ISA XML lives under `/specs/arm-isa/a64` and
   `/specs/arm-isa/aarch32-t32`.
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
-- `wasm-tests` and `wasm-golden` on PATH - scripts that build and test the wasm
-  module.
+- `wasm-tests`, `wasm-golden`, and `wasm-microbench` on PATH - scripts that
+  build and test the wasm module.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -65,6 +65,8 @@ Depending on the task, you can verify your work with
   satisfy the orchestrator and the user.
 - Wasm unit tests: `wasm-tests`, or `wasm-tests TEST_SUBSTRING` for targeted
   runs
+- Wasm microbench slots: `wasm-microbench --slot N` for an ad-hoc
+  `vip9r_bench_run(slot, inner_iters)` export
 - `cargo clippy`
 - Wasm golden runner: `wasm-golden [--allow-mismatch] [IVF or WebM file]`
 - Host full-decode timing: `wasm-golden --bench [IVF or WebM file]`
