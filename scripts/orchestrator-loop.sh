@@ -32,7 +32,7 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd -- "$script_dir/.." && pwd)"
-codex_events="$repo/scripts/codex-events.mjs"
+codex_events="$repo/scripts/codex-events.py"
 stop_marker_rel="temp/orchestrator-loop.stop"
 stop_marker="$repo/$stop_marker_rel"
 
@@ -122,7 +122,7 @@ while :; do
     -C "$repo" \
     -- \
     "$prompt" \
-    | node "$codex_events" stream --reasoning "$codex_jsonl"
+    | "$codex_events" stream --reasoning "$codex_jsonl"
   pipeline_status=("${PIPESTATUS[@]}")
   status="${pipeline_status[0]}"
   renderer_status="${pipeline_status[1]:-0}"

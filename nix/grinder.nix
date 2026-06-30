@@ -92,8 +92,8 @@ in
     runtimeInputs = [
       pkgs.coreutils
       pkgs.git
-      pkgs.nodejs
       pkgs.podman
+      pkgs.python3
     ];
 
     text = ''
@@ -121,7 +121,7 @@ in
       esac
 
       if [[ "$mode" == inspect ]]; then
-        exec node "$repo/scripts/codex-events.mjs" inspect --repo "$repo" "$@"
+        exec "$repo/scripts/codex-events.py" inspect --repo "$repo" "$@"
       fi
 
       task_file=""
@@ -150,7 +150,7 @@ in
 
       system_prompt="$repo/scripts/grinder-system-prompt.md"
       codex_config="$repo/scripts/grinder-codex-config.toml"
-      codex_events="$repo/scripts/codex-events.mjs"
+      codex_events="$repo/scripts/codex-events.py"
       wasm_driver_dist="$repo/js/dist/wasm-driver"
       for artifact in golden.js tests.js; do
         if [[ ! -f "$wasm_driver_dist/$artifact" ]]; then
@@ -228,7 +228,7 @@ in
               -o /run/trace/final.md \
               - \
               < "$run/task.md" \
-            | node "$codex_events" stream "$run/trace/codex.jsonl"
+            | "$codex_events" stream "$run/trace/codex.jsonl"
           pipeline_status=("''${PIPESTATUS[@]}")
           status="''${pipeline_status[0]}"
           renderer_status="''${pipeline_status[1]:-0}"
@@ -254,7 +254,7 @@ in
           fi
           context_summary=""
           if [[ -s "$run/trace/rollout.jsonl" ]]; then
-            context_summary="$(node "$codex_events" context "$run/trace/rollout.jsonl" || true)"
+            context_summary="$("$codex_events" context "$run/trace/rollout.jsonl" || true)"
           fi
           if [[ -f "$run/trace/final.md" ]]; then
             cat "$run/trace/final.md"

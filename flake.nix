@@ -96,6 +96,7 @@
           libvpx
           nodejs
           pnpm
+          python3
           ripgrep
           rustToolchain
           wabt
