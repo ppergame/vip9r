@@ -4,7 +4,7 @@ import json
 import re
 import socket
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 GRINDER_SOCKET_PATH = Path("/run/vip9r-perf.sock")
 HOST_SOCKET_PATH = Path("temp/vip9r-perf.sock")
@@ -30,12 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--media",
-        help="media path relative to /bulk/vip9r",
+        type=parse_media_path,
+        help="corpus-relative media path",
     )
     parser.add_argument(
         "--frames",
         type=parse_frame_range,
         help="output-frame selection as OFFSET:LAST",
+    )
+    parser.add_argument(
+        "--pin",
+        help="device CPU pin: any, all, cpu:N, or mask:HEX",
     )
     return parser
 
@@ -57,9 +62,11 @@ def main(argv: list[str] | None = None) -> int:
         request["slot"] = args.slot
     else:
         request["kind"] = "decode"
-        request["media"] = args.media
+        request["media"] = str(args.media)
         if args.frames is not None:
             request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
+    if args.pin is not None:
+        request["pin"] = args.pin
 
     response = submit_request(request, args.candidate.read_bytes())
     print(json.dumps(response, indent=2))
@@ -125,6 +132,13 @@ def parse_frame_range(value: str) -> tuple[int, int]:
     if last < offset:
         raise argparse.ArgumentTypeError("last must be greater than or equal to offset")
     return offset, last
+
+
+def parse_media_path(value: str) -> PurePosixPath:
+    path = PurePosixPath(value)
+    if path.is_absolute() or path == PurePosixPath(".") or ".." in path.parts:
+        raise argparse.ArgumentTypeError("must be a corpus-relative path without '..'")
+    return path
 
 
 def parse_non_negative_int(value: str) -> int:

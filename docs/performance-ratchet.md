@@ -68,9 +68,25 @@ Use a persistent device root:
   runs/     # per-run bench.js, vip9r.wasm, result.json
 ```
 
-Assume installed binaries and copied media remain stable while grinder jobs run.
-Dedicated sync commands can copy `bin/` and `media/`; each benchmark run should
-copy only its JS driver and wasm into a fresh run directory.
+Device setup is external to the daemon: `bin/` must contain the V8 payload, and
+`media/` must contain the needed corpus files plus `.md5` sidecars. Assume those
+files remain stable while grinder jobs run. Each benchmark run should copy only
+its JS driver bundle and wasm into a fresh run directory.
+
+`vip9r-perf-daemon --serial SERIAL` runs Android `d8` from the persistent
+`bin/` directory and refuses to start if `d8`, `icudtl.dat`, or
+`snapshot_blob.bin` are missing. Benchmark requests verify that the requested
+media file and its `.md5` sidecar already exist under persistent `media/`;
+daemon runs do not copy media or V8 payloads. The daemon may cache its stable
+baseline wasm under `runs/_cache/`, while each request copies only the small JS
+driver bundle and candidate wasm into a fresh `runs/` directory.
+
+Device CPU affinity is a daemon/request-level selection, not a thermal,
+frequency, or topology policy. Use `--pin any|all|cpu:N|mask:HEX` on the daemon
+for a default, or on `vip9r-perf-submit` for a per-job override. Non-`any` pins
+resolve to an explicit CPU mask. The daemon verifies the effective
+`Cpus_allowed_list` before running d8 and reports the requested mask, requested
+CPU list, and verified CPU list in result JSON.
 
 Multiple grinders may submit device work concurrently, but device access is
 serialized by a small daemon. The submit interface is blocking:

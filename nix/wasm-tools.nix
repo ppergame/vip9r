@@ -63,7 +63,7 @@ in {
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         --target wasm32-unknown-unknown -p vip9r --release --features wasm-tests
-      exec "${v8.linux64}/d8" "$runner" -- "$wasm_path" "$@"
+      exec "${v8.linux64}/d8" --module "$runner" -- "$wasm_path" "$@"
     '';
   };
 
@@ -86,12 +86,12 @@ in {
       runner="$project_root/js/dist/wasm-driver/microbench.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
-        exec "${v8.linux64}/d8" --no-liftoff "$runner" -- --help
+        exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- --help
       fi
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         --target wasm32-unknown-unknown -p vip9r --release
-      exec "${v8.linux64}/d8" --no-liftoff "$runner" -- "$wasm_path" "$@"
+      exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };
 
@@ -114,12 +114,12 @@ in {
       runner="$project_root/js/dist/wasm-driver/golden.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
-        exec "${v8.linux64}/d8" --no-liftoff "$runner" -- --help
+        exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- --help
       fi
 
       cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
         --target wasm32-unknown-unknown -p vip9r --release
-      exec "${v8.linux64}/d8" --no-liftoff "$runner" -- "$wasm_path" "$@"
+      exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };
 }
