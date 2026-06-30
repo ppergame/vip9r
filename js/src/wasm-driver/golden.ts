@@ -1,19 +1,11 @@
 import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 import { parseWebm } from "../webm";
+import { instanceMemory, makeVip9rImports } from "./wasm-env";
+import type { WasmLog, WasmLogSink } from "./wasm-env";
 
-export const WasmLogKind = {
-  Diagnostic: 0,
-  TestFailure: 1,
-  Panic: 2,
-} as const;
-
-export type WasmLog = {
-  kind: number;
-  message: string;
-};
-
-export type WasmLogSink = (log: WasmLog) => void;
+export { formatWasmLog, WasmLogKind } from "./wasm-env";
+export type { WasmLog, WasmLogSink } from "./wasm-env";
 
 export type Vp9Packet = {
   index: number;
@@ -351,19 +343,6 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
     warmup,
     measurement,
   };
-}
-
-export function formatWasmLog(log: WasmLog): string {
-  switch (log.kind) {
-    case WasmLogKind.Diagnostic:
-      return `wasm diag: ${log.message}`;
-    case WasmLogKind.TestFailure:
-      return `wasm test failure: ${log.message}`;
-    case WasmLogKind.Panic:
-      return `wasm panic: ${log.message}`;
-    default:
-      return `wasm log ${log.kind}: ${log.message}`;
-  }
 }
 
 export function compareDecodedVp9ToGolden(
@@ -931,8 +910,6 @@ function validNonNegativeInteger(name: string, value: number): number {
   return value;
 }
 
-export const compareDecodedIvfToGolden = compareDecodedVp9ToGolden;
-
 function zeroDimensionIvf(input: DemuxedVp9): boolean {
   return input.container === "ivf" && input.width === 0 && input.height === 0;
 }
@@ -1477,47 +1454,4 @@ function monotonicNow(): number {
     return performance.now();
   }
   return Date.now();
-}
-
-const utf8Decoder = typeof TextDecoder === "function" ? new TextDecoder("utf-8") : undefined;
-
-function makeVip9rImports(
-  getMemory: () => WebAssembly.Memory,
-  sink: WasmLogSink,
-): WebAssembly.Imports {
-  return {
-    env: {
-      vip9r_log(kind: number, ptr: number, len: number): void {
-        const memory = getMemory();
-        if (!Number.isInteger(ptr) || !Number.isInteger(len) || ptr < 0 || len < 0) {
-          throw new Error(`invalid wasm log span: ptr=${ptr} len=${len}`);
-        }
-        if (ptr + len > memory.buffer.byteLength) {
-          throw new Error(`wasm log span out of bounds: ptr=${ptr} len=${len}`);
-        }
-        const bytes = new Uint8Array(memory.buffer, ptr, len);
-        sink({ kind, message: decodeUtf8(bytes) });
-      },
-    },
-  };
-}
-
-function instanceMemory(instance: WebAssembly.Instance): WebAssembly.Memory {
-  const memory = instance.exports.memory;
-  if (!(memory instanceof WebAssembly.Memory)) {
-    throw new Error("missing wasm export: memory");
-  }
-  return memory;
-}
-
-function decodeUtf8(bytes: Uint8Array): string {
-  if (utf8Decoder !== undefined) {
-    return utf8Decoder.decode(bytes);
-  }
-
-  let text = "";
-  for (const byte of bytes) {
-    text += String.fromCharCode(byte);
-  }
-  return text;
 }

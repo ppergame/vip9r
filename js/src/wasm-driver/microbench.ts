@@ -2,16 +2,14 @@ declare const readbuffer: (path: string) => ArrayBuffer;
 declare const print: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
+import { instanceMemory, makeVip9rImports } from "./wasm-env";
+import type { WasmLog } from "./wasm-env";
+
 export {};
 
 type D8Global = typeof globalThis & {
   arguments?: string[];
   scriptArgs?: string[];
-};
-
-type WasmLog = {
-  kind: number;
-  message: string;
 };
 
 type MicrobenchArgs = {
@@ -192,49 +190,6 @@ function microbenchRate(
     nsPerInnerIter: (elapsedMs * 1_000_000) / totalInnerIters,
     innerItersPerSecond: (totalInnerIters * 1000) / elapsedMs,
   };
-}
-
-function makeVip9rImports(
-  getMemory: () => WebAssembly.Memory,
-  sink: (log: WasmLog) => void,
-): WebAssembly.Imports {
-  return {
-    env: {
-      vip9r_log(kind: number, ptr: number, len: number): void {
-        const memory = getMemory();
-        if (!Number.isInteger(ptr) || !Number.isInteger(len) || ptr < 0 || len < 0) {
-          throw new Error(`invalid wasm log span: ptr=${ptr} len=${len}`);
-        }
-        if (ptr + len > memory.buffer.byteLength) {
-          throw new Error(`wasm log span out of bounds: ptr=${ptr} len=${len}`);
-        }
-        const bytes = new Uint8Array(memory.buffer, ptr, len);
-        sink({ kind, message: decodeUtf8(bytes) });
-      },
-    },
-  };
-}
-
-function instanceMemory(instance: WebAssembly.Instance): WebAssembly.Memory {
-  const memory = instance.exports.memory;
-  if (!(memory instanceof WebAssembly.Memory)) {
-    throw new Error("missing wasm export: memory");
-  }
-  return memory;
-}
-
-const utf8Decoder = typeof TextDecoder === "function" ? new TextDecoder("utf-8") : undefined;
-
-function decodeUtf8(bytes: Uint8Array): string {
-  if (utf8Decoder !== undefined) {
-    return utf8Decoder.decode(bytes);
-  }
-
-  let text = "";
-  for (const byte of bytes) {
-    text += String.fromCharCode(byte);
-  }
-  return text;
 }
 
 function parseU32(value: string, name: string): number {

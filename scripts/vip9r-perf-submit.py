@@ -51,10 +51,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.media is None:
             parser.error("--media is required unless --slot is set")
 
-    request: dict[str, object] = {
-        "version": 1,
-        "candidate": str(args.candidate),
-    }
+    request: dict[str, object] = {}
     if args.slot is not None:
         request["kind"] = "microbench"
         request["slot"] = args.slot

@@ -776,10 +776,6 @@ impl FrameInfo {
             frame_index,
         })
     }
-
-    pub fn i420_len(self) -> Option<usize> {
-        required_i420_len(self.visible_width, self.visible_height)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1241,7 +1237,7 @@ impl Decoder {
     }
 }
 
-pub fn required_i420_len(width: u32, height: u32) -> Option<usize> {
+fn required_i420_len(width: u32, height: u32) -> Option<usize> {
     if width == 0 || height == 0 {
         return None;
     }

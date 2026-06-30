@@ -27,16 +27,12 @@ def usage(exit_code: int = 2) -> None:
     out = sys.stdout if exit_code == 0 else sys.stderr
     out.write(
         """usage:
-  codex-events stream [options] CODEX_JSONL
+  codex-events stream [--reasoning] CODEX_JSONL
   codex-events context ROLLOUT_JSONL
-  codex-events inspect [options] [CODEX_JSONL_OR_TRACE_DIR]
+  codex-events inspect [-f|--follow] [--verbose] [--repo DIR] [CODEX_JSONL_OR_TRACE_DIR]
 
 Options:
-  -f, --follow     Follow appended events.
-      --reasoning  Show reasoning summary events.
-      --verbose    Also print successful command output and full unknown-event blocks.
-      --repo DIR   Repository root for auto-discovery.
-  -h, --help       Show this help.
+  -h, --help  Show this help.
 
 """
     )
