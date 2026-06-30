@@ -172,7 +172,7 @@ describe("wasm golden runner helpers", () => {
       parseDriverArgs([
         "--bench",
         "--bench-frames",
-        "2:5",
+        "2:6",
         "--bench-warmup-ms=4",
         "--bench-target-ms=5",
         "vip9r.wasm",
@@ -193,7 +193,7 @@ describe("wasm golden runner helpers", () => {
     });
 
     expect(parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench).toEqual(DEFAULT_BENCHMARK_OPTIONS);
-    expect(parseDriverArgs(["--bench", "--bench-frames=2:5", "vip9r.wasm", "input.ivf"]).bench).toMatchObject({
+    expect(parseDriverArgs(["--bench", "--bench-frames=2:6", "vip9r.wasm", "input.ivf"]).bench).toMatchObject({
       outputOffset: 2,
       outputFrames: 5,
     });
@@ -215,11 +215,11 @@ describe("wasm golden runner helpers", () => {
     expect(() => parseDriverArgs(["--bench", "--progress-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
       "--progress-frames cannot be used with --bench",
     );
-    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2:0", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--bench-frames count must be positive",
+    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2:1", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--bench-frames last must be greater than or equal to start",
     );
     expect(() => parseDriverArgs(["--bench", "--bench-frames", "2+3", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--bench-frames must be START:COUNT with non-negative integer start and positive count",
+      "--bench-frames must be START:LAST with non-negative integer start and last",
     );
   });
 

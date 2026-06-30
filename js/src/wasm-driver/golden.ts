@@ -220,7 +220,7 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     if (arg === "--bench-frames") {
       const value = args[index + 1];
       if (value === undefined) {
-        throw new Error("--bench-frames requires START:COUNT");
+        throw new Error("--bench-frames requires START:LAST");
       }
       index += 1;
       sawBenchmarkOption = true;
@@ -764,16 +764,16 @@ function parseSafeInteger(value: string, name: string): number {
 function parseBenchmarkFrameRange(value: string): DecodeWindow {
   const match = /^(\d+):(\d+)$/.exec(value);
   if (match === null) {
-    throw new Error("--bench-frames must be START:COUNT with non-negative integer start and positive count");
+    throw new Error("--bench-frames must be START:LAST with non-negative integer start and last");
   }
   const start = parseSafeInteger(match[1], "--bench-frames start");
-  const count = parseSafeInteger(match[2], "--bench-frames count");
-  if (count <= 0) {
-    throw new Error("--bench-frames count must be positive");
+  const last = parseSafeInteger(match[2], "--bench-frames last");
+  if (last < start) {
+    throw new Error("--bench-frames last must be greater than or equal to start");
   }
   return {
     outputOffset: start,
-    outputFrames: count,
+    outputFrames: checkedAdd(last - start, 1, "benchmark output frame count"),
   };
 }
 

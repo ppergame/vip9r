@@ -151,6 +151,8 @@ in
       system_prompt="$repo/scripts/grinder-system-prompt.md"
       codex_config="$repo/scripts/grinder-codex-config.toml"
       codex_events="$repo/scripts/codex-events.py"
+      perf_submit="$repo/scripts/vip9r-perf-submit.py"
+      perf_socket="$repo/temp/vip9r-perf.sock"
       wasm_driver_dist="$repo/js/dist/wasm-driver"
       for artifact in golden.js tests.js; do
         if [[ ! -f "$wasm_driver_dist/$artifact" ]]; then
@@ -173,6 +175,7 @@ in
       ln -s "${bash}" "$run/rootfs/bin/bash"
       ln -s "${bash}" "$run/rootfs/bin/sh"
       ln -s "${env}" "$run/rootfs/usr/bin/env"
+      cp -a "$perf_submit" "$run/rootfs/usr/bin/vip9r-perf-submit"
 
       mkdir -p "$run/rust"
       shopt -s dotglob nullglob
@@ -211,6 +214,9 @@ in
         --volume "${armIsaXml}:/specs/arm-isa:ro"
         --volume "/bulk/vip9r:/bulk/vip9r:ro"
       )
+      if [[ -S "$perf_socket" ]]; then
+        podman_args+=(--volume "$perf_socket:/run/vip9r-perf.sock:rw")
+      fi
       rootfs_arg="$run/rootfs:O"
 
       status=0
