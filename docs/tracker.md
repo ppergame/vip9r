@@ -36,6 +36,8 @@ Deferrable external inputs for M3 performance work.
 - [ ] device oracle that serializes access to adb and hardware
 - [ ] host and ARM d8 paths for wasm inspection and timing, JIT tier control
 - [ ] repeatable device timing protocol with CPU control and confidence checks
+- [ ] systemize wasm runner JSON output; likely make JSON the default so daemon
+      device runs can persist one `result.json`
 
 ### M1 — Decode, code-complete (implement campaign)
 

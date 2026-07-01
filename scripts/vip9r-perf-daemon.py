@@ -3,12 +3,12 @@ import argparse
 from collections import deque
 from dataclasses import dataclass
 import errno
-import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,8 +29,6 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 ACCEPT_HANDSHAKE_TIMEOUT_SECONDS = 10
 RESPONSE_STRING_HEAD_BYTES = 8 * 1024
 RESPONSE_STRING_TAIL_BYTES = 8 * 1024
-RESPONSE_LIST_HEAD_ITEMS = 64
-RESPONSE_LIST_TAIL_ITEMS = 16
 U32_MAX = 2**32 - 1
 PIN_HELP = "any, all, cpu:N, or mask:HEX"
 HOST_D8_TIMEOUT_SECONDS = 180
@@ -83,6 +81,12 @@ class DeviceContext:
     online_cpus: list[int]
     taskset: str | None
     d8_version: str
+
+
+@dataclass(frozen=True)
+class DeviceSession:
+    path: str
+    baseline_path: str
 
 
 class JobQueue:
@@ -148,12 +152,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve = subparsers.add_parser("serve", help="start the performance queue")
     serve.add_argument(
-        "--baseline",
-        required=True,
-        type=Path,
-        help="baseline wasm module built by the orchestrator",
-    )
-    serve.add_argument(
         "--serial",
         help="adb device serial; omit to run host-only",
     )
@@ -210,6 +208,47 @@ def run_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_baseline(daemon_dir: Path) -> Path:
+    source = build_release_wasm()
+    path = daemon_dir / "baseline.wasm"
+    shutil.copyfile(source, path)
+    return path
+
+
+def build_release_wasm() -> Path:
+    rust_root = rust_workspace_root()
+    target_dir = rust_root / "target/wasm-release"
+    wasm_path = target_dir / "wasm32-unknown-unknown/release/vip9r.wasm"
+    cmd = [
+        "cargo",
+        "build",
+        "--manifest-path",
+        str(rust_root / "Cargo.toml"),
+        "--target-dir",
+        str(target_dir),
+        "--target",
+        "wasm32-unknown-unknown",
+        "-p",
+        "vip9r",
+        "--release",
+    ]
+    completed = subprocess.run(cmd, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(f"baseline wasm build exited {completed.returncode}")
+    if not wasm_path.is_file():
+        raise RuntimeError(f"baseline wasm build did not create {wasm_path}")
+    return wasm_path
+
+
+def rust_workspace_root() -> Path:
+    rust_root = REPO_ROOT / "rust"
+    if (rust_root / "Cargo.toml").is_file():
+        return rust_root
+    if (REPO_ROOT / "Cargo.toml").is_file():
+        return REPO_ROOT
+    raise RuntimeError(f"could not find vip9r Cargo workspace from {REPO_ROOT}")
+
+
 def run_serve(args: argparse.Namespace) -> int:
     if args.serial is None and args.pin is not None:
         print("--pin requires --serial", file=sys.stderr)
@@ -218,97 +257,111 @@ def run_serve(args: argparse.Namespace) -> int:
         print("--pin is required with --serial", file=sys.stderr)
         return 2
 
-    try:
-        verify_local_wasm_runners()
-        host_d8 = verify_host_runtime()
-        baseline_bytes = args.baseline.read_bytes()
-        baseline_fd = memfd_from_bytes("vip9r-baseline.wasm", baseline_bytes)
-    except Exception as error:
-        print(f"host setup: {error}", file=sys.stderr)
-        return 2
-    device: DeviceContext | None = None
     args.pin = args.pin or "any"
-    default_pin_selection: PinSelection | None = None
-    if args.serial is not None:
+    with tempfile.TemporaryDirectory(prefix="vip9r-perf-daemon-") as daemon_temp:
+        daemon_dir = Path(daemon_temp)
         try:
-            device = probe_device(args.serial, DEFAULT_DEVICE_ROOT)
-            default_pin_selection = resolve_and_verify_pin(device, args.pin)
+            verify_local_wasm_runners()
+            host_d8 = verify_host_runtime()
+            baseline_path = build_baseline(daemon_dir)
         except Exception as error:
-            os.close(baseline_fd)
-            print(f"device setup: {error}", file=sys.stderr)
+            print(f"host setup: {error}", file=sys.stderr)
             return 2
 
-    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
-    try:
-        server.bind(str(SOCKET_PATH))
-    except OSError as error:
-        server.close()
-        os.close(baseline_fd)
-        if error.errno == errno.EADDRINUSE:
-            print(f"socket already exists: {SOCKET_PATH}", file=sys.stderr)
-            return 2
-        raise
+        device: DeviceContext | None = None
+        device_session: DeviceSession | None = None
+        default_pin_selection: PinSelection | None = None
+        if args.serial is not None:
+            try:
+                device = probe_device(args.serial, DEFAULT_DEVICE_ROOT)
+                default_pin_selection = resolve_and_verify_pin(device, args.pin)
+            except Exception as error:
+                print(f"device setup: {error}", file=sys.stderr)
+                return 2
 
-    host_jobs = JobQueue("host")
-    device_jobs = JobQueue("device")
-    host_worker = threading.Thread(
-        target=run_worker,
-        args=("host", args, host_jobs, baseline_fd, baseline_bytes, device),
-        daemon=True,
-    )
-    device_worker = threading.Thread(
-        target=run_worker,
-        args=("device", args, device_jobs, baseline_fd, baseline_bytes, device),
-        daemon=True,
-    )
-    host_worker.start()
-    device_worker.start()
-
-    try:
-        server.listen()
-        print(
-            json.dumps(
-                {
-                    "baseline": str(args.baseline),
-                    "ok": True,
-                    "socket": str(SOCKET_PATH),
-                    "host": {
-                        "available": True,
-                        "d8": host_d8,
-                        "timeout_seconds": HOST_D8_TIMEOUT_SECONDS,
-                    },
-                    "device": {
-                        "serial": device.serial,
-                        "model": device.props.get("model"),
-                        "pin": pin_summary(default_pin_selection),
-                        "timeout_seconds": DEVICE_D8_TIMEOUT_SECONDS,
-                        "adb_timeout_seconds": ADB_D8_TIMEOUT_SECONDS,
-                    }
-                    if device is not None and default_pin_selection is not None
-                    else None,
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
-        while True:
-            conn, _ = server.accept()
-            conn.settimeout(ACCEPT_HANDSHAKE_TIMEOUT_SECONDS)
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
-            accept_one(conn, host_jobs, device_jobs)
-    except KeyboardInterrupt:
-        return 130
-    finally:
-        server.close()
-        os.close(baseline_fd)
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
         try:
-            SOCKET_PATH.unlink()
-        except FileNotFoundError:
-            pass
+            server.bind(str(SOCKET_PATH))
+            server.listen()
+        except OSError as error:
+            server.close()
+            if error.errno == errno.EADDRINUSE:
+                print(f"socket already exists: {SOCKET_PATH}", file=sys.stderr)
+                return 2
+            raise
+
+        if device is not None:
+            try:
+                device_session = create_device_session(device, baseline_path)
+            except Exception as error:
+                server.close()
+                try:
+                    SOCKET_PATH.unlink()
+                except FileNotFoundError:
+                    pass
+                print(f"device session setup: {error}", file=sys.stderr)
+                return 2
+
+        host_jobs = JobQueue("host")
+        device_jobs = JobQueue("device")
+        host_worker = threading.Thread(
+            target=run_worker,
+            args=("host", host_jobs, baseline_path, device, device_session, args.pin, daemon_dir),
+            daemon=True,
+        )
+        device_worker = threading.Thread(
+            target=run_worker,
+            args=("device", device_jobs, baseline_path, device, device_session, args.pin, daemon_dir),
+            daemon=True,
+        )
+        host_worker.start()
+        device_worker.start()
+
+        try:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "socket": str(SOCKET_PATH),
+                        "host": {
+                            "available": True,
+                            "d8": host_d8,
+                            "timeout_seconds": HOST_D8_TIMEOUT_SECONDS,
+                        },
+                        "device": {
+                            "serial": device.serial,
+                            "model": device.props.get("model"),
+                            "pin": pin_summary(default_pin_selection),
+                            "session_dir": device_session.path,
+                            "timeout_seconds": DEVICE_D8_TIMEOUT_SECONDS,
+                            "adb_timeout_seconds": ADB_D8_TIMEOUT_SECONDS,
+                        }
+                        if device is not None
+                        and device_session is not None
+                        and default_pin_selection is not None
+                        else None,
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+            while True:
+                conn, _ = server.accept()
+                conn.settimeout(ACCEPT_HANDSHAKE_TIMEOUT_SECONDS)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
+                accept_one(conn, host_jobs, device_jobs)
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            server.close()
+            try:
+                SOCKET_PATH.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) -> None:
@@ -345,25 +398,29 @@ def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) 
 
 def run_worker(
     target: str,
-    args: argparse.Namespace,
     jobs: JobQueue,
-    baseline_fd: int,
-    baseline_bytes: bytes,
+    baseline_path: Path,
     device: DeviceContext | None,
+    device_session: DeviceSession | None,
+    default_pin: str,
+    daemon_dir: Path,
 ) -> None:
     while True:
         job = jobs.pop()
         try:
             send_json(job.conn, {"type": "started", "target": target})
-            response = handle_request(
-                target,
-                args,
-                baseline_fd,
-                baseline_bytes,
-                device,
-                job.request,
-                job.candidate,
-            )
+            with tempfile.TemporaryDirectory(prefix=f"{target}-job-", dir=daemon_dir) as job_temp:
+                candidate_path = Path(job_temp) / "candidate.wasm"
+                candidate_path.write_bytes(job.candidate)
+                response = handle_request(
+                    target,
+                    baseline_path,
+                    device,
+                    device_session,
+                    default_pin,
+                    job.request,
+                    candidate_path,
+                )
         except Exception as error:
             response = {"ok": False, "error": str(error)}
         try:
@@ -375,12 +432,12 @@ def run_worker(
 
 def handle_request(
     target: str,
-    args: argparse.Namespace,
-    baseline_fd: int,
-    baseline_bytes: bytes,
+    baseline_path: Path,
     device: DeviceContext | None,
+    device_session: DeviceSession | None,
+    default_pin: str,
     request: object,
-    candidate: bytes,
+    candidate_path: Path,
 ) -> dict[str, object]:
     if not isinstance(request, dict):
         return {"ok": False, "error": "request must be a JSON object"}
@@ -405,8 +462,8 @@ def handle_request(
         except ValueError as error:
             return {"ok": False, "kind": "validate", "target": target, "error": str(error)}
         if target == "host":
-            return handle_host_validate_request(candidate, MEDIA_ROOT / media, validation)
-        if device is None:
+            return handle_host_validate_request(candidate_path, MEDIA_ROOT / media, validation)
+        if device is None or device_session is None:
             return {
                 "ok": False,
                 "kind": "validate",
@@ -414,20 +471,21 @@ def handle_request(
                 "error": "target device requires a daemon started with --serial",
             }
         try:
-            pin_name = pin_from_request(request, args.pin)
+            pin_name = pin_from_request(request, default_pin)
         except ValueError as error:
             return {"ok": False, "kind": "validate", "target": "device", "error": str(error)}
         return handle_device_validate_request(
             device,
-            candidate,
+            device_session,
+            candidate_path,
             media,
             validation,
             pin_name,
         )
     if kind == "tests":
         if target == "host":
-            return handle_host_tests_request(request, candidate)
-        if device is None:
+            return handle_host_tests_request(request, candidate_path)
+        if device is None or device_session is None:
             return {
                 "ok": False,
                 "kind": "tests",
@@ -435,20 +493,21 @@ def handle_request(
                 "error": "target device requires a daemon started with --serial",
             }
         try:
-            pin_name = pin_from_request(request, args.pin)
+            pin_name = pin_from_request(request, default_pin)
             tests = tests_from_request(request)
         except ValueError as error:
             return {"ok": False, "kind": "tests", "target": "device", "error": str(error)}
         return handle_device_tests_request(
             device,
-            candidate,
+            device_session,
+            candidate_path,
             tests,
             pin_name,
         )
     if kind == "microbench":
         if target == "host":
-            return handle_host_microbench_request(request, candidate)
-        if device is None:
+            return handle_host_microbench_request(request, candidate_path)
+        if device is None or device_session is None:
             return {
                 "ok": False,
                 "kind": "microbench",
@@ -456,13 +515,14 @@ def handle_request(
                 "error": "target device requires a daemon started with --serial",
             }
         try:
-            pin_name = pin_from_request(request, args.pin)
+            pin_name = pin_from_request(request, default_pin)
             microbench = microbench_from_request(request)
         except ValueError as error:
             return {"ok": False, "kind": "microbench", "target": "device", "error": str(error)}
         return handle_device_microbench_request(
             device,
-            candidate,
+            device_session,
+            candidate_path,
             microbench,
             pin_name,
         )
@@ -476,9 +536,9 @@ def handle_request(
         return {"ok": False, "error": str(error)}
 
     if target == "host":
-        return handle_host_bench_request(args, baseline_fd, candidate, MEDIA_ROOT / media, frame_range)
+        return handle_host_bench_request(baseline_path, candidate_path, MEDIA_ROOT / media, frame_range)
 
-    if device is None:
+    if device is None or device_session is None:
         return {
             "ok": False,
             "kind": "bench",
@@ -486,14 +546,13 @@ def handle_request(
             "error": "target device requires a daemon started with --serial",
         }
     try:
-        pin_name = pin_from_request(request, args.pin)
+        pin_name = pin_from_request(request, default_pin)
     except ValueError as error:
         return {"ok": False, "kind": "bench", "target": "device", "error": str(error)}
     return handle_device_bench_request(
-        args,
-        baseline_bytes,
         device,
-        candidate,
+        device_session,
+        candidate_path,
         media,
         frame_range,
         pin_name,
@@ -501,47 +560,35 @@ def handle_request(
 
 
 def handle_host_bench_request(
-    args: argparse.Namespace,
-    baseline_fd: int,
-    candidate: bytes,
+    baseline_path: Path,
+    candidate_path: Path,
     media_path: Path,
     frame_range: tuple[int, int] | None,
 ) -> dict[str, object]:
-    candidate_fd = memfd_from_bytes("vip9r-candidate.wasm", candidate)
-    try:
-        baseline = run_host_bench("baseline", baseline_fd, media_path, frame_range)
-        candidate_result = run_host_bench("candidate", candidate_fd, media_path, frame_range)
-    finally:
-        os.close(candidate_fd)
+    baseline_result = run_host_bench(baseline_path, media_path, frame_range)
+    candidate_result = run_host_bench(candidate_path, media_path, frame_range)
     return {
-        "ok": baseline.get("ok") is True and candidate_result.get("ok") is True,
+        "ok": baseline_result.get("ok") is True and candidate_result.get("ok") is True,
         "kind": "bench",
         "target": "host",
-        "baseline": str(args.baseline),
-        "serial": None,
         "host": {
             "media": str(media_path),
-            "baseline": baseline,
+            "baseline": baseline_result,
             "candidate": candidate_result,
         },
     }
 
 
 def handle_host_validate_request(
-    candidate: bytes,
+    candidate_path: Path,
     media_path: Path,
     validation: dict[str, object],
 ) -> dict[str, object]:
-    candidate_fd = memfd_from_bytes("vip9r-candidate.wasm", candidate)
-    try:
-        candidate_result = run_host_validation("candidate", candidate_fd, media_path, validation)
-    finally:
-        os.close(candidate_fd)
+    candidate_result = run_host_validation(candidate_path, media_path, validation)
     return {
         "ok": candidate_result.get("ok") is True,
         "kind": "validate",
         "target": "host",
-        "serial": None,
         "host": {
             "media": str(media_path),
             "allow_mismatch": validation.get("allow_mismatch") is True,
@@ -552,24 +599,19 @@ def handle_host_validate_request(
 
 def handle_host_microbench_request(
     request: dict[str, object],
-    candidate: bytes,
+    candidate_path: Path,
 ) -> dict[str, object]:
     try:
         microbench = microbench_from_request(request)
     except ValueError as error:
         return {"ok": False, "error": str(error)}
 
-    candidate_fd = memfd_from_bytes("vip9r-candidate.wasm", candidate)
-    try:
-        candidate_result = run_host_microbench("candidate", candidate_fd, microbench)
-    finally:
-        os.close(candidate_fd)
+    candidate_result = run_host_microbench(candidate_path, microbench)
 
     return {
         "ok": candidate_result.get("ok") is True,
         "kind": "microbench",
         "target": "host",
-        "serial": None,
         "host": {
             "candidate": candidate_result,
         },
@@ -578,24 +620,19 @@ def handle_host_microbench_request(
 
 def handle_host_tests_request(
     request: dict[str, object],
-    candidate: bytes,
+    candidate_path: Path,
 ) -> dict[str, object]:
     try:
         tests = tests_from_request(request)
     except ValueError as error:
         return {"ok": False, "error": str(error)}
 
-    candidate_fd = memfd_from_bytes("vip9r-candidate-tests.wasm", candidate)
-    try:
-        candidate_result = run_host_tests("candidate", candidate_fd, tests)
-    finally:
-        os.close(candidate_fd)
+    candidate_result = run_host_tests(candidate_path, tests)
 
     return {
         "ok": candidate_result.get("ok") is True,
         "kind": "tests",
         "target": "host",
-        "serial": None,
         "host": {
             "candidate": candidate_result,
         },
@@ -663,10 +700,9 @@ def pin_from_request(request: dict[str, object], default: str) -> str:
 
 
 def handle_device_bench_request(
-    args: argparse.Namespace,
-    baseline_bytes: bytes,
     device: DeviceContext,
-    candidate: bytes,
+    session: DeviceSession,
+    local_candidate_path: Path,
     media: PurePosixPath,
     frame_range: tuple[int, int] | None,
     pin_name: str,
@@ -675,45 +711,47 @@ def handle_device_bench_request(
         pin = resolve_and_verify_pin(device, pin_name)
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
-        run_dir = create_device_run_dir(device, "bench")
-        runner_path = push_wasm_driver_to_device(device, GOLDEN_RUNNER_PATH, run_dir)
+        run_dir = create_device_run_dir(device, session, "bench")
         candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
-        baseline_path = ensure_device_baseline(device, baseline_bytes)
-        push_bytes_to_device(device, candidate, candidate_path)
-        baseline = run_device_bench(
+        baseline_result_path = str(PurePosixPath(run_dir) / "baseline-result.json")
+        result_path = str(PurePosixPath(run_dir) / "result.json")
+        push_file_to_device(device, local_candidate_path, candidate_path)
+        baseline_result = run_device_bench(
             device,
-            "baseline",
-            runner_path,
-            baseline_path,
+            device_session_path(session, GOLDEN_RUNNER_PATH),
+            session.baseline_path,
             media_path,
             frame_range,
             pin,
+            baseline_result_path,
         )
         candidate_result = run_device_bench(
             device,
-            "candidate",
-            runner_path,
+            device_session_path(session, GOLDEN_RUNNER_PATH),
             candidate_path,
             media_path,
             frame_range,
             pin,
+            result_path,
         )
     except (DeviceError, ValueError) as error:
         return {"ok": False, "kind": "bench", "target": "device", "serial": device.serial, "error": str(error)}
 
     return {
-        "ok": baseline.get("ok") is True and candidate_result.get("ok") is True,
+        "ok": baseline_result.get("ok") is True and candidate_result.get("ok") is True,
         "kind": "bench",
         "target": "device",
-        "baseline": str(args.baseline),
         "serial": device.serial,
         "device": {
             "summary": device_summary(device),
             "pin": pin_summary(pin),
+            "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
-            "baseline_wasm": baseline_path,
-            "baseline": baseline,
+            "result": result_path,
+            "baseline_result": baseline_result_path,
+            "baseline_wasm": session.baseline_path,
+            "baseline": baseline_result,
             "candidate": candidate_result,
         },
     }
@@ -721,23 +759,24 @@ def handle_device_bench_request(
 
 def handle_device_microbench_request(
     device: DeviceContext,
-    candidate: bytes,
+    session: DeviceSession,
+    local_candidate_path: Path,
     microbench: dict[str, int],
     pin_name: str,
 ) -> dict[str, object]:
     try:
         pin = resolve_and_verify_pin(device, pin_name)
-        run_dir = create_device_run_dir(device, "microbench")
-        runner_path = push_wasm_driver_to_device(device, MICROBENCH_RUNNER_PATH, run_dir)
+        run_dir = create_device_run_dir(device, session, "microbench")
         candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
-        push_bytes_to_device(device, candidate, candidate_path)
+        result_path = str(PurePosixPath(run_dir) / "result.json")
+        push_file_to_device(device, local_candidate_path, candidate_path)
         candidate_result = run_device_microbench(
             device,
-            "candidate",
-            runner_path,
+            device_session_path(session, MICROBENCH_RUNNER_PATH),
             candidate_path,
             microbench,
             pin,
+            result_path,
         )
     except (DeviceError, ValueError) as error:
         return {"ok": False, "kind": "microbench", "target": "device", "serial": device.serial, "error": str(error)}
@@ -750,7 +789,9 @@ def handle_device_microbench_request(
         "device": {
             "summary": device_summary(device),
             "pin": pin_summary(pin),
+            "session_dir": session.path,
             "run_dir": run_dir,
+            "result": result_path,
             "candidate": candidate_result,
         },
     }
@@ -758,23 +799,24 @@ def handle_device_microbench_request(
 
 def handle_device_tests_request(
     device: DeviceContext,
-    candidate: bytes,
+    session: DeviceSession,
+    local_candidate_path: Path,
     tests: dict[str, str],
     pin_name: str,
 ) -> dict[str, object]:
     try:
         pin = resolve_and_verify_pin(device, pin_name)
-        run_dir = create_device_run_dir(device, "tests")
-        runner_path = push_wasm_driver_to_device(device, TESTS_RUNNER_PATH, run_dir)
+        run_dir = create_device_run_dir(device, session, "tests")
         candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
-        push_bytes_to_device(device, candidate, candidate_path)
+        result_path = str(PurePosixPath(run_dir) / "result.json")
+        push_file_to_device(device, local_candidate_path, candidate_path)
         candidate_result = run_device_tests(
             device,
-            "candidate",
-            runner_path,
+            device_session_path(session, TESTS_RUNNER_PATH),
             candidate_path,
             tests,
             pin,
+            result_path,
         )
     except (DeviceError, ValueError) as error:
         return {"ok": False, "kind": "tests", "target": "device", "serial": device.serial, "error": str(error)}
@@ -787,7 +829,9 @@ def handle_device_tests_request(
         "device": {
             "summary": device_summary(device),
             "pin": pin_summary(pin),
+            "session_dir": session.path,
             "run_dir": run_dir,
+            "result": result_path,
             "candidate": candidate_result,
         },
     }
@@ -795,7 +839,8 @@ def handle_device_tests_request(
 
 def handle_device_validate_request(
     device: DeviceContext,
-    candidate: bytes,
+    session: DeviceSession,
+    local_candidate_path: Path,
     media: PurePosixPath,
     validation: dict[str, object],
     pin_name: str,
@@ -804,18 +849,18 @@ def handle_device_validate_request(
         pin = resolve_and_verify_pin(device, pin_name)
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
-        run_dir = create_device_run_dir(device, "validate")
-        runner_path = push_wasm_driver_to_device(device, GOLDEN_RUNNER_PATH, run_dir)
+        run_dir = create_device_run_dir(device, session, "validate")
         candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
-        push_bytes_to_device(device, candidate, candidate_path)
+        result_path = str(PurePosixPath(run_dir) / "result.txt")
+        push_file_to_device(device, local_candidate_path, candidate_path)
         candidate_result = run_device_validation(
             device,
-            "candidate",
-            runner_path,
+            device_session_path(session, GOLDEN_RUNNER_PATH),
             candidate_path,
             media_path,
             validation,
             pin,
+            result_path,
         )
     except (DeviceError, ValueError) as error:
         return {"ok": False, "kind": "validate", "target": "device", "serial": device.serial, "error": str(error)}
@@ -828,8 +873,10 @@ def handle_device_validate_request(
         "device": {
             "summary": device_summary(device),
             "pin": pin_summary(pin),
+            "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
+            "result": result_path,
             "allow_mismatch": validation.get("allow_mismatch") is True,
             "candidate": candidate_result,
         },
@@ -848,12 +895,12 @@ def media_from_request(request: dict[str, object]) -> PurePosixPath:
 
 def run_device_bench(
     device: DeviceContext,
-    label: str,
     runner_path: str,
     wasm_path: str,
     media_path: str,
     frame_range: tuple[int, int] | None,
     pin: PinSelection,
+    result_path: str,
 ) -> dict[str, object]:
     d8_args = [
         "./d8",
@@ -868,17 +915,17 @@ def run_device_bench(
         start, last = frame_range
         d8_args.extend(["--bench-frames", f"{start}:{last}"])
     d8_args.append(media_path)
-    return run_device_json(device, label, d8_args, pin, "benchmark")
+    return run_device_json(device, d8_args, pin, "benchmark", result_path)
 
 
 def run_device_validation(
     device: DeviceContext,
-    label: str,
     runner_path: str,
     wasm_path: str,
     media_path: str,
     validation: dict[str, object],
     pin: PinSelection,
+    result_path: str,
 ) -> dict[str, object]:
     d8_args = [
         "./d8",
@@ -891,16 +938,16 @@ def run_device_validation(
     if validation.get("allow_mismatch") is True:
         d8_args.append("--allow-mismatch")
     d8_args.append(media_path)
-    return run_device_text(device, label, d8_args, pin)
+    return run_device_text(device, d8_args, pin, result_path)
 
 
 def run_device_microbench(
     device: DeviceContext,
-    label: str,
     runner_path: str,
     wasm_path: str,
     microbench: dict[str, int],
     pin: PinSelection,
+    result_path: str,
 ) -> dict[str, object]:
     d8_args = [
         "./d8",
@@ -912,16 +959,16 @@ def run_device_microbench(
         "--slot",
         str(microbench["slot"]),
     ]
-    return run_device_json(device, label, d8_args, pin, "microbenchmark")
+    return run_device_json(device, d8_args, pin, "microbenchmark", result_path)
 
 
 def run_device_tests(
     device: DeviceContext,
-    label: str,
     runner_path: str,
     wasm_path: str,
     tests: dict[str, str],
     pin: PinSelection,
+    result_path: str,
 ) -> dict[str, object]:
     d8_args = [
         "./d8",
@@ -934,44 +981,27 @@ def run_device_tests(
     test_filter = tests.get("filter")
     if test_filter is not None:
         d8_args.append(test_filter)
-    try:
-        completed = adb_shell_completed(
-            device.serial,
-            device_d8_shell_command(device, d8_args, pin),
-            timeout=ADB_D8_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "adb shell", ADB_D8_TIMEOUT_SECONDS, error)
-    if completed.returncode == DEVICE_TIMEOUT_EXIT_CODE:
-        return {
-            "ok": False,
-            "label": label,
-            "returncode": completed.returncode,
-            "timeout": True,
-            "timeout_kind": "device d8",
-            "timeout_seconds": DEVICE_D8_TIMEOUT_SECONDS,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-    return json_stdout_result(completed, label, "test")
+    return run_device_json(device, d8_args, pin, "test", result_path)
 
 
 def run_device_text(
     device: DeviceContext,
-    label: str,
     d8_args: list[str],
     pin: PinSelection,
+    result_path: str,
 ) -> dict[str, object]:
     try:
         completed = adb_shell_completed(
             device.serial,
-            device_d8_shell_command(device, d8_args, pin),
+            device_d8_shell_command(device, d8_args, pin, result_path),
             timeout=ADB_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "adb shell", ADB_D8_TIMEOUT_SECONDS, error)
-    result = completed_text_result(completed, label)
-    if completed.returncode == DEVICE_TIMEOUT_EXIT_CODE:
+        return timeout_result("adb shell", ADB_D8_TIMEOUT_SECONDS, error)
+    stdout, read_error = read_remote_text_file(device, result_path)
+    returncode, stderr = device_result_status(completed.returncode, completed.stderr, read_error)
+    result = text_result(returncode, stdout, stderr)
+    if returncode == DEVICE_TIMEOUT_EXIT_CODE:
         result["timeout"] = True
         result["timeout_kind"] = "device d8"
         result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
@@ -980,48 +1010,74 @@ def run_device_text(
 
 def run_device_json(
     device: DeviceContext,
-    label: str,
     d8_args: list[str],
     pin: PinSelection,
     json_label: str,
+    result_path: str,
 ) -> dict[str, object]:
     try:
         completed = adb_shell_completed(
             device.serial,
-            device_d8_shell_command(device, d8_args, pin),
+            device_d8_shell_command(device, d8_args, pin, result_path),
             timeout=ADB_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "adb shell", ADB_D8_TIMEOUT_SECONDS, error)
-    if completed.returncode != 0:
+        return timeout_result("adb shell", ADB_D8_TIMEOUT_SECONDS, error)
+    stdout, read_error = read_remote_text_file(device, result_path)
+    returncode, stderr = device_result_status(completed.returncode, completed.stderr, read_error)
+    if returncode != 0:
         result = {
             "ok": False,
-            "label": label,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "returncode": returncode,
+            "stdout": stdout,
+            "stderr": stderr,
         }
-        if completed.returncode == DEVICE_TIMEOUT_EXIT_CODE:
+        if returncode == DEVICE_TIMEOUT_EXIT_CODE:
             result["timeout"] = True
             result["timeout_kind"] = "device d8"
             result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
         return result
 
     try:
-        report = json.loads(completed.stdout)
+        report = json.loads(stdout)
     except json.JSONDecodeError as error:
         return {
             "ok": False,
-            "label": label,
             "error": f"invalid {json_label} JSON: {error}",
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
         }
-    return {"ok": True, "label": label, "report": report, "stderr": completed.stderr}
+    return {"ok": True, "report": report, "stderr": stderr}
 
 
-def device_d8_shell_command(device: DeviceContext, d8_args: list[str], pin: PinSelection) -> str:
+def device_result_status(
+    returncode: int,
+    stderr: str,
+    read_error: str | None,
+) -> tuple[int, str]:
+    if read_error is not None:
+        stderr = "\n".join(part for part in [stderr, read_error] if part)
+        if returncode == 0:
+            returncode = 1
+    return returncode, stderr
+
+
+def read_remote_text_file(device: DeviceContext, path: str) -> tuple[str, str | None]:
+    completed = adb_shell_completed(device.serial, f"cat {shlex.quote(path)}")
+    if completed.returncode == 0:
+        return completed.stdout, None
+    output = completed.stderr or completed.stdout or f"exit {completed.returncode}"
+    return "", f"read device file {path}: {output.strip()}"
+
+
+def device_d8_shell_command(
+    device: DeviceContext,
+    d8_args: list[str],
+    pin: PinSelection,
+    stdout_path: str,
+) -> str:
     command = " ".join(shlex.quote(arg) for arg in d8_args)
+    command = f"{command} > {shlex.quote(stdout_path)}"
     if pin.mask is not None:
         command = f"taskset {shlex.quote(pin.mask)} {command}"
     timed_command = f"timeout {DEVICE_D8_TIMEOUT_SECONDS} sh -c {shlex.quote('exec ' + command)}"
@@ -1397,24 +1453,39 @@ def parse_pin_mask(pin_name: str) -> int:
     return int(value, 16)
 
 
-def create_device_run_dir(device: DeviceContext, kind: str) -> str:
-    run_id = (
-        f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
-        f"{os.getpid()}-{time.time_ns() % 1_000_000_000:09d}-{kind}"
+def create_device_session(device: DeviceContext, baseline_path: Path) -> DeviceSession:
+    session_dir = str(device.root / "runs" / unique_run_name("session"))
+    ensure_remote_dir(device, session_dir)
+
+    remote_baseline_path = str(PurePosixPath(session_dir) / "baseline.wasm")
+    push_file_to_device(device, baseline_path, remote_baseline_path)
+    for local_path in sorted(GOLDEN_RUNNER_PATH.parent.glob("*.js")):
+        push_file_to_device(device, local_path, str(PurePosixPath(session_dir) / local_path.name))
+
+    return DeviceSession(
+        path=session_dir,
+        baseline_path=remote_baseline_path,
     )
-    run_dir = str(device.root / "runs" / run_id)
+
+
+def device_session_path(session: DeviceSession, local_path: Path) -> str:
+    return str(PurePosixPath(session.path) / local_path.name)
+
+
+def create_device_run_dir(device: DeviceContext, session: DeviceSession, kind: str) -> str:
+    run_dir = str(PurePosixPath(session.path) / unique_run_name("run", kind))
     ensure_remote_dir(device, run_dir)
     return run_dir
 
 
-def ensure_device_baseline(device: DeviceContext, baseline: bytes) -> str:
-    digest = hashlib.sha256(baseline).hexdigest()[:24]
-    cache_dir = str(device.root / "runs" / "_cache")
-    remote_path = str(PurePosixPath(cache_dir) / f"baseline-{digest}.wasm")
-    ensure_remote_dir(device, cache_dir)
-    if not remote_file_has_size(device, remote_path, len(baseline)):
-        push_bytes_to_device(device, baseline, remote_path)
-    return remote_path
+def unique_run_name(prefix: str, kind: str | None = None) -> str:
+    name = (
+        f"{prefix}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-"
+        f"{os.getpid()}-{time.time_ns() % 1_000_000_000:09d}"
+    )
+    if kind is not None:
+        name = f"{name}-{kind}"
+    return name
 
 
 def verify_remote_files(device: DeviceContext, paths: list[str]) -> None:
@@ -1447,25 +1518,6 @@ def ensure_remote_dir(device: DeviceContext, path: str) -> None:
         raise DeviceError(f"create device directory {path}: {completed.stderr or completed.stdout}".strip())
 
 
-def remote_file_has_size(device: DeviceContext, path: str, size: int) -> bool:
-    completed = adb_shell_completed(
-        device.serial,
-        f"[ -f {shlex.quote(path)} ] && wc -c < {shlex.quote(path)}",
-    )
-    if completed.returncode != 0:
-        return False
-    try:
-        return int(completed.stdout.strip()) == size
-    except ValueError:
-        return False
-
-
-def push_wasm_driver_to_device(device: DeviceContext, main_runner: Path, run_dir: str) -> str:
-    for local_path in sorted(main_runner.parent.glob("*.js")):
-        push_file_to_device(device, local_path, str(PurePosixPath(run_dir) / local_path.name))
-    return str(PurePosixPath(run_dir) / main_runner.name)
-
-
 def push_file_to_device(device: DeviceContext, local_path: Path, remote_path: str) -> None:
     completed = subprocess.run(
         ["adb", "-s", device.serial, "push", str(local_path), remote_path],
@@ -1475,19 +1527,6 @@ def push_file_to_device(device: DeviceContext, local_path: Path, remote_path: st
     )
     if completed.returncode != 0:
         raise DeviceError(f"adb push {local_path} {remote_path}: {completed.stderr or completed.stdout}".strip())
-
-
-def push_bytes_to_device(
-    device: DeviceContext,
-    data: bytes,
-    remote_path: str,
-    *,
-    suffix: str = ".wasm",
-) -> None:
-    with tempfile.NamedTemporaryFile(prefix="vip9r-perf-", suffix=suffix) as temp:
-        temp.write(data)
-        temp.flush()
-        push_file_to_device(device, Path(temp.name), remote_path)
 
 
 def adb_shell_completed(
@@ -1694,19 +1733,17 @@ def verify_host_runtime() -> str:
 
 
 def run_host_bench(
-    label: str,
-    wasm_fd: int,
+    wasm_path: Path,
     media_path: Path,
     frame_range: tuple[int, int] | None,
 ) -> dict[str, object]:
-    os.lseek(wasm_fd, 0, os.SEEK_SET)
     cmd = [
         host_d8_path(),
         "--no-liftoff",
         "--module",
         str(GOLDEN_RUNNER_PATH),
         "--",
-        proc_fd_path(wasm_fd),
+        str(wasm_path),
         "--bench",
     ]
     if frame_range is not None:
@@ -1722,11 +1759,10 @@ def run_host_bench(
             timeout=HOST_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "host d8", HOST_D8_TIMEOUT_SECONDS, error)
+        return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
     if completed.returncode != 0:
         return {
             "ok": False,
-            "label": label,
             "returncode": completed.returncode,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
@@ -1737,28 +1773,25 @@ def run_host_bench(
     except json.JSONDecodeError as error:
         return {
             "ok": False,
-            "label": label,
             "error": f"invalid benchmark JSON: {error}",
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }
-    return {"ok": True, "label": label, "report": report, "stderr": completed.stderr}
+    return {"ok": True, "report": report, "stderr": completed.stderr}
 
 
 def run_host_validation(
-    label: str,
-    wasm_fd: int,
+    wasm_path: Path,
     media_path: Path,
     validation: dict[str, object],
 ) -> dict[str, object]:
-    os.lseek(wasm_fd, 0, os.SEEK_SET)
     cmd = [
         host_d8_path(),
         "--no-liftoff",
         "--module",
         str(GOLDEN_RUNNER_PATH),
         "--",
-        proc_fd_path(wasm_fd),
+        str(wasm_path),
     ]
     if validation.get("allow_mismatch") is True:
         cmd.append("--allow-mismatch")
@@ -1772,23 +1805,21 @@ def run_host_validation(
             timeout=HOST_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "host d8", HOST_D8_TIMEOUT_SECONDS, error)
-    return completed_text_result(completed, label)
+        return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
+    return completed_text_result(completed)
 
 
 def run_host_microbench(
-    label: str,
-    wasm_fd: int,
+    wasm_path: Path,
     microbench: dict[str, int],
 ) -> dict[str, object]:
-    os.lseek(wasm_fd, 0, os.SEEK_SET)
     cmd = [
         host_d8_path(),
         "--no-liftoff",
         "--module",
         str(MICROBENCH_RUNNER_PATH),
         "--",
-        proc_fd_path(wasm_fd),
+        str(wasm_path),
         "--slot",
         str(microbench["slot"]),
     ]
@@ -1802,11 +1833,10 @@ def run_host_microbench(
             timeout=HOST_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "host d8", HOST_D8_TIMEOUT_SECONDS, error)
+        return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
     if completed.returncode != 0:
         return {
             "ok": False,
-            "label": label,
             "returncode": completed.returncode,
             "stdout": completed.stdout,
             "stderr": completed.stderr,
@@ -1817,26 +1847,23 @@ def run_host_microbench(
     except json.JSONDecodeError as error:
         return {
             "ok": False,
-            "label": label,
             "error": f"invalid microbenchmark JSON: {error}",
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }
-    return {"ok": True, "label": label, "report": report, "stderr": completed.stderr}
+    return {"ok": True, "report": report, "stderr": completed.stderr}
 
 
 def run_host_tests(
-    label: str,
-    wasm_fd: int,
+    wasm_path: Path,
     tests: dict[str, str],
 ) -> dict[str, object]:
-    os.lseek(wasm_fd, 0, os.SEEK_SET)
     cmd = [
         host_d8_path(),
         "--module",
         str(TESTS_RUNNER_PATH),
         "--",
-        proc_fd_path(wasm_fd),
+        str(wasm_path),
         "--json",
     ]
     test_filter = tests.get("filter")
@@ -1852,28 +1879,33 @@ def run_host_tests(
             timeout=HOST_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
-        return timeout_result(label, "host d8", HOST_D8_TIMEOUT_SECONDS, error)
-    return json_stdout_result(completed, label, "test")
+        return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
+    return json_stdout_result(completed, "test")
 
 
 def completed_text_result(
     completed: subprocess.CompletedProcess[str],
-    label: str,
+) -> dict[str, object]:
+    return text_result(completed.returncode, completed.stdout, completed.stderr)
+
+
+def text_result(
+    returncode: int,
+    stdout: str,
+    stderr: str,
 ) -> dict[str, object]:
     result: dict[str, object] = {
-        "ok": completed.returncode == 0,
-        "label": label,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "ok": returncode == 0,
+        "stdout": stdout,
+        "stderr": stderr,
     }
-    if completed.returncode != 0:
-        result["returncode"] = completed.returncode
+    if returncode != 0:
+        result["returncode"] = returncode
     return result
 
 
 def json_stdout_result(
     completed: subprocess.CompletedProcess[str],
-    label: str,
     json_label: str,
 ) -> dict[str, object]:
     try:
@@ -1881,7 +1913,6 @@ def json_stdout_result(
     except json.JSONDecodeError as error:
         result = {
             "ok": False,
-            "label": label,
             "error": f"invalid {json_label} JSON: {error}",
             "stdout": completed.stdout,
             "stderr": completed.stderr,
@@ -1892,7 +1923,6 @@ def json_stdout_result(
 
     result = {
         "ok": completed.returncode == 0 and report.get("ok") is True,
-        "label": label,
         "report": report,
         "stderr": completed.stderr,
     }
@@ -1902,14 +1932,12 @@ def json_stdout_result(
 
 
 def timeout_result(
-    label: str,
     timeout_kind: str,
     timeout_seconds: int,
     error: subprocess.TimeoutExpired,
 ) -> dict[str, object]:
     return {
         "ok": False,
-        "label": label,
         "timeout": True,
         "timeout_kind": timeout_kind,
         "timeout_seconds": timeout_seconds,
@@ -1924,28 +1952,6 @@ def timeout_output_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
-
-
-def proc_fd_path(fd: int) -> str:
-    return f"/proc/{os.getpid()}/fd/{fd}"
-
-
-def memfd_from_bytes(name: str, data: bytes) -> int:
-    fd = os.memfd_create(name, os.MFD_CLOEXEC)
-    try:
-        write_all(fd, data)
-        os.lseek(fd, 0, os.SEEK_SET)
-    except Exception:
-        os.close(fd)
-        raise
-    return fd
-
-
-def write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        written = os.write(fd, view)
-        view = view[written:]
 
 
 def recv_record(sock: socket.socket, max_bytes: int, label: str) -> bytes:
@@ -1978,33 +1984,7 @@ def response_payload(value: dict[str, object]) -> bytes:
     payload = encode_json_record(sanitized)
     if len(payload) <= MAX_RESPONSE_BYTES:
         return payload
-
-    fallback = response_too_large_result(sanitized, payload)
-    fallback_payload = encode_json_record(fallback)
-    if len(fallback_payload) <= MAX_RESPONSE_BYTES:
-        return fallback_payload
-
     return b'{"type":"result","ok":false,"error":"response too large"}'
-
-
-def response_too_large_result(value: dict[str, object], payload: bytes) -> dict[str, object]:
-    result: dict[str, object] = {
-        "type": "result",
-        "ok": False,
-        "error": "response exceeds maximum size after truncation",
-        "response_too_large": True,
-        "encoded_bytes": len(payload),
-        "max_response_bytes": MAX_RESPONSE_BYTES,
-        "sha256": hashlib.sha256(payload).hexdigest(),
-    }
-    original_ok = value.get("ok")
-    if isinstance(original_ok, bool):
-        result["original_ok"] = original_ok
-    for key in ["kind", "target", "serial"]:
-        selected = value.get(key)
-        if selected is None or isinstance(selected, (str, int, float, bool)):
-            result[key] = selected
-    return result
 
 
 def sanitize_response_value(value: object) -> object:
@@ -2013,7 +1993,7 @@ def sanitize_response_value(value: object) -> object:
     if isinstance(value, dict):
         return {str(key): sanitize_response_value(child) for key, child in value.items()}
     if isinstance(value, list):
-        return truncate_response_list(value)
+        return [sanitize_response_value(item) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return truncate_response_text(str(value))
@@ -2027,31 +2007,9 @@ def truncate_response_text(value: str) -> object:
     return {
         "truncated": True,
         "original_bytes": len(data),
-        "sha256": hashlib.sha256(data).hexdigest(),
         "head": data[:RESPONSE_STRING_HEAD_BYTES].decode("utf-8", errors="replace"),
         "tail": data[-RESPONSE_STRING_TAIL_BYTES:].decode("utf-8", errors="replace"),
     }
-
-
-def truncate_response_list(value: list[object]) -> list[object]:
-    max_items = RESPONSE_LIST_HEAD_ITEMS + RESPONSE_LIST_TAIL_ITEMS
-    if len(value) <= max_items:
-        return [sanitize_response_value(item) for item in value]
-
-    head = [sanitize_response_value(item) for item in value[:RESPONSE_LIST_HEAD_ITEMS]]
-    tail = [sanitize_response_value(item) for item in value[-RESPONSE_LIST_TAIL_ITEMS:]]
-    marker = {
-        "truncated": True,
-        "original_length": len(value),
-        "omitted_items": len(value) - max_items,
-        "sha256": json_value_sha256(value),
-    }
-    return [*head, marker, *tail]
-
-
-def json_value_sha256(value: object) -> str:
-    payload = encode_json_record(value)
-    return hashlib.sha256(payload).hexdigest()
 
 
 def encode_json_record(value: object) -> bytes:

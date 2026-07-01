@@ -82,7 +82,7 @@ in {
 
       ${common}
       locate_project
-      select_wasm_target_dir wasm-golden
+      select_wasm_target_dir wasm-release
       runner="$project_root/js/dist/wasm-driver/microbench.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
@@ -110,7 +110,7 @@ in {
 
       ${common}
       locate_project
-      select_wasm_target_dir wasm-golden
+      select_wasm_target_dir wasm-release
       runner="$project_root/js/dist/wasm-driver/golden.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
