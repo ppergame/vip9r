@@ -80,7 +80,10 @@ wasm-golden
 `wasm-golden` builds the release wasm module and runs d8 against prebuilt JS
 runner artifacts. It defaults to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the
 driver defaults the golden path to the `.md5` sidecar. The optional input path
-may be IVF or WebM. It exits non-zero on decode errors, missing/extra shown
+may be IVF or WebM. Normal stdout is one compact JSON object with `mode`,
+`ok`, workload metadata, frame counts, and the first few mismatches. Diagnostics
+and progress go to stderr so daemon/device runs can persist stdout as
+`result.json`. The runner exits non-zero on decode errors, missing/extra shown
 frames, or md5 mismatches; `wasm-golden --allow-mismatch` only permits wrong
 frame hashes for code-complete smoke runs. Grinder sandboxes do not carry these
 JS runner artifacts; use `vip9r-perf-submit validate [--allow-mismatch]`
@@ -88,7 +91,8 @@ instead. The current wasm driver parses all 82 coded frames in
 `bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
 md5 passes with 82 matched frames and no mismatches/missing/extra frames.
 Long local corpus runs can use `wasm-golden --progress-frames=N` to print
-periodic compared-frame progress without changing the final pass/fail criteria.
+periodic compared-frame progress to stderr without changing the final pass/fail
+criteria.
 
 WebM demux is intentionally a narrow harness subset: one `V_VP9` video track is
 selected, non-video tracks are ignored, `SimpleBlock` and `BlockGroup/Block`

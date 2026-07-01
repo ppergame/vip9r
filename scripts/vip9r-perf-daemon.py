@@ -851,7 +851,7 @@ def handle_device_validate_request(
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
         run_dir = create_device_run_dir(device, session, "validate")
         candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
-        result_path = str(PurePosixPath(run_dir) / "result.txt")
+        result_path = str(PurePosixPath(run_dir) / "result.json")
         push_file_to_device(device, local_candidate_path, candidate_path)
         candidate_result = run_device_validation(
             device,
@@ -938,7 +938,7 @@ def run_device_validation(
     if validation.get("allow_mismatch") is True:
         d8_args.append("--allow-mismatch")
     d8_args.append(media_path)
-    return run_device_text(device, d8_args, pin, result_path)
+    return run_device_json(device, d8_args, pin, "validation", result_path)
 
 
 def run_device_microbench(
@@ -984,30 +984,6 @@ def run_device_tests(
     return run_device_json(device, d8_args, pin, "test", result_path)
 
 
-def run_device_text(
-    device: DeviceContext,
-    d8_args: list[str],
-    pin: PinSelection,
-    result_path: str,
-) -> dict[str, object]:
-    try:
-        completed = adb_shell_completed(
-            device.serial,
-            device_d8_shell_command(device, d8_args, pin, result_path),
-            timeout=ADB_D8_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as error:
-        return timeout_result("adb shell", ADB_D8_TIMEOUT_SECONDS, error)
-    stdout, read_error = read_remote_text_file(device, result_path)
-    returncode, stderr = device_result_status(completed.returncode, completed.stderr, read_error)
-    result = text_result(returncode, stdout, stderr)
-    if returncode == DEVICE_TIMEOUT_EXIT_CODE:
-        result["timeout"] = True
-        result["timeout_kind"] = "device d8"
-        result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
-    return result
-
-
 def run_device_json(
     device: DeviceContext,
     d8_args: list[str],
@@ -1025,29 +1001,45 @@ def run_device_json(
         return timeout_result("adb shell", ADB_D8_TIMEOUT_SECONDS, error)
     stdout, read_error = read_remote_text_file(device, result_path)
     returncode, stderr = device_result_status(completed.returncode, completed.stderr, read_error)
-    if returncode != 0:
-        result = {
-            "ok": False,
-            "returncode": returncode,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
-        if returncode == DEVICE_TIMEOUT_EXIT_CODE:
-            result["timeout"] = True
-            result["timeout_kind"] = "device d8"
-            result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
-        return result
-
     try:
         report = json.loads(stdout)
     except json.JSONDecodeError as error:
-        return {
+        result = {
             "ok": False,
             "error": f"invalid {json_label} JSON: {error}",
             "stdout": stdout,
             "stderr": stderr,
         }
-    return {"ok": True, "report": report, "stderr": stderr}
+        if returncode != 0:
+            result["returncode"] = returncode
+        if returncode == DEVICE_TIMEOUT_EXIT_CODE:
+            result["timeout"] = True
+            result["timeout_kind"] = "device d8"
+            result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
+        return result
+    if not isinstance(report, dict):
+        result = {
+            "ok": False,
+            "error": f"invalid {json_label} JSON: expected object",
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        if returncode != 0:
+            result["returncode"] = returncode
+        return result
+
+    result = {
+        "ok": returncode == 0 and report.get("ok") is True,
+        "report": report,
+        "stderr": stderr,
+    }
+    if returncode != 0:
+        result["returncode"] = returncode
+    if returncode == DEVICE_TIMEOUT_EXIT_CODE:
+        result["timeout"] = True
+        result["timeout_kind"] = "device d8"
+        result["timeout_seconds"] = DEVICE_D8_TIMEOUT_SECONDS
+    return result
 
 
 def device_result_status(
@@ -1760,24 +1752,7 @@ def run_host_bench(
         )
     except subprocess.TimeoutExpired as error:
         return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
-    if completed.returncode != 0:
-        return {
-            "ok": False,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-
-    try:
-        report = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        return {
-            "ok": False,
-            "error": f"invalid benchmark JSON: {error}",
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-    return {"ok": True, "report": report, "stderr": completed.stderr}
+    return json_stdout_result(completed, "benchmark")
 
 
 def run_host_validation(
@@ -1806,7 +1781,7 @@ def run_host_validation(
         )
     except subprocess.TimeoutExpired as error:
         return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
-    return completed_text_result(completed)
+    return json_stdout_result(completed, "validation")
 
 
 def run_host_microbench(
@@ -1834,24 +1809,7 @@ def run_host_microbench(
         )
     except subprocess.TimeoutExpired as error:
         return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
-    if completed.returncode != 0:
-        return {
-            "ok": False,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-
-    try:
-        report = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
-        return {
-            "ok": False,
-            "error": f"invalid microbenchmark JSON: {error}",
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
-    return {"ok": True, "report": report, "stderr": completed.stderr}
+    return json_stdout_result(completed, "microbenchmark")
 
 
 def run_host_tests(
@@ -1883,27 +1841,6 @@ def run_host_tests(
     return json_stdout_result(completed, "test")
 
 
-def completed_text_result(
-    completed: subprocess.CompletedProcess[str],
-) -> dict[str, object]:
-    return text_result(completed.returncode, completed.stdout, completed.stderr)
-
-
-def text_result(
-    returncode: int,
-    stdout: str,
-    stderr: str,
-) -> dict[str, object]:
-    result: dict[str, object] = {
-        "ok": returncode == 0,
-        "stdout": stdout,
-        "stderr": stderr,
-    }
-    if returncode != 0:
-        result["returncode"] = returncode
-    return result
-
-
 def json_stdout_result(
     completed: subprocess.CompletedProcess[str],
     json_label: str,
@@ -1914,6 +1851,16 @@ def json_stdout_result(
         result = {
             "ok": False,
             "error": f"invalid {json_label} JSON: {error}",
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+        if completed.returncode != 0:
+            result["returncode"] = completed.returncode
+        return result
+    if not isinstance(report, dict):
+        result = {
+            "ok": False,
+            "error": f"invalid {json_label} JSON: expected object",
             "stdout": completed.stdout,
             "stderr": completed.stderr,
         }

@@ -1,5 +1,6 @@
 declare const readbuffer: (path: string) => ArrayBuffer;
 declare const print: (...values: unknown[]) => void;
+declare const printErr: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
 import { instanceMemory, makeVip9rImports } from "./wasm-env";
@@ -119,8 +120,16 @@ function parseArgs(args: string[]): MicrobenchArgs {
   };
 }
 
-function printUsage(): void {
-  print("usage: wasm-microbench --slot N");
+function printUsage(out: (...values: unknown[]) => void = print): void {
+  out("usage: wasm-microbench --slot N");
+}
+
+function printStderr(...values: unknown[]): void {
+  if (typeof printErr === "function") {
+    printErr(...values);
+    return;
+  }
+  print(...values);
 }
 
 function runTimedMicrobench(
@@ -236,10 +245,10 @@ try {
   main(d8.scriptArgs ?? d8.arguments ?? []);
 } catch (error) {
   if (error instanceof UsageError) {
-    printUsage();
-    print(error.message);
+    printUsage(printStderr);
+    print(JSON.stringify({ mode: "microbench", ok: false, error: error.message }));
     quit(2);
   }
-  print(errorMessage(error));
+  print(JSON.stringify({ mode: "microbench", ok: false, error: errorMessage(error) }));
   quit(1);
 }

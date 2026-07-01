@@ -165,6 +165,7 @@ export type BenchmarkTimedPasses = {
 
 export type BenchmarkReport = {
   mode: "bench";
+  ok: true;
   input: string;
   golden: string;
   container: "ivf" | "webm";
@@ -321,6 +322,7 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
 
   return {
     mode: "bench",
+    ok: true,
     input: args.inputPath,
     golden: args.goldenPath,
     container: input.container,
