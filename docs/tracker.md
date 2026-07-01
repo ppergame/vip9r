@@ -33,8 +33,8 @@ Deferrable external inputs for M3 performance work.
 
 ### M0 device path — gates M3
 
-- [ ] device oracle that serializes access to adb and hardware
-- [ ] host and ARM d8 paths for wasm inspection and timing, JIT tier control
+- [x] device oracle that serializes access to adb and hardware
+- [x] host and ARM d8 paths for wasm inspection and timing, JIT tier control
 - [ ] repeatable device timing protocol with CPU control and confidence checks
 - [x] systemize wasm runner JSON output; JSON stdout is the default for
       `wasm-golden` validation, `wasm-golden --bench`, and `wasm-microbench`;
@@ -128,7 +128,6 @@ Drive frame-md5 correctness green. Gated on M2R.
 
 Sustained 720p30 on the pinned big core. Gated on M2 + the M0 device path.
 
-- [x] user: deslop grinder prompt
 - [ ] optimize measured full-decode hotspots; confirm wins against full-decode
       wall time
 
