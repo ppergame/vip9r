@@ -105,7 +105,7 @@ moment the session is done.
   - Scope: roughly a context window's worth of jj revs making incremental
     progress on VP9 decoder implementation or optimization. Orchestrator makes
     the commits.
-  - Comes up with optimization strategies
+  - Comes up with implementation or optimization strategies
   - Manages codex implementation agents
     - Delegates bulk coding work
     - Reviews and merges changes
@@ -115,7 +115,10 @@ moment the session is done.
     so is an orchestrator judgement call. Stick to sequential execution unless
     the tasks are independent and won't create nontrivial merge conflicts
   - Adds entries to log.md as appropriate
-    - Put log changes in the implementation commit where it makes sense
+    - Combine log changes with the implementation commit where it makes sense
+  - Maintains temp/loop_state.md for any transient notes useful for the next
+    orchestrator session or in case of context compaction.
+    - Notes are most useful at phase boundaries, not as running commentary.
 
 The grinder is a batch job. It is ok for the orchestrator to poll it at the
 maximum supported interval.
@@ -126,8 +129,23 @@ consecutive failures.
 - grinder fails on turn one: malformed `tool_search` arguments with a garbage
   1255-character property name; API rejected the turn
   - verdict: retry
-- grinder stuck for 5 or more minutes with no output
+- grinder agent stuck for 5 or more minutes with no output
   - verdict: retry
+
+Orchestrator startup:
+
+- User issues a request, likely related to a tracker milestone and possibly
+  describing a device target
+- If a device target is involved, orchestrator
+  - Runs `./scripts/vip9r-perf-daemon.py probe`
+  - Locates the relevant device and its serial number
+  - Runs `./scripts/vip9r-perf-daemon.py prepare --serial <SERIAL>` to download
+    files onto the device
+- Once device preparation is complete or the task is host-only, orchestrator
+  runs
+  - `./scripts/vip9r-perf-daemon.py serve --serial <SERIAL> --pin <PIN>` if a
+    device is requested
+  - `./scripts/vip9r-perf-daemon.py serve` for host-only work
 
 ### Codex implementor
 
