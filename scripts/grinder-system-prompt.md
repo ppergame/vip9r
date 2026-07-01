@@ -47,7 +47,9 @@ Workspace crates:
   - `/specs/arm` - ARM optimization manuals and Neon intrinsics
   - `/specs/wasm` - Wasm core spec and Rust Wasm intrinsics
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
-- `vip9r-perf-submit` on PATH - script to build and submit the Wasm module. The only way to exercise the code.
+- `vip9r-perf-submit` on PATH - script to build and submit the Wasm module. The
+  only way to exercise the code. The orchestrator will communicate whether
+  device testing is necessary.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -64,31 +66,20 @@ Depending on the task, you can verify your work with
 
 - Engineering judgement. Self-review the change and decide whether it would
   satisfy the orchestrator and the user.
-- Wasm unit tests: `vip9r-perf-submit [--target host|device] tests
-  [TEST_SUBSTRING]`
-- Wasm validation: `vip9r-perf-submit [--target host|device] validate
-  [--media MEDIA] [--frames START:LAST]`, or
-  `vip9r-perf-submit [--target host|device] validate --allow-mismatch
-  [--media MEDIA] [--frames START:LAST]` for code-complete smoke runs that
-  permit wrong frame hashes
-- Wasm microbench slots: `vip9r-perf-submit [--target host|device] microbench
-  --slot N` for an ad-hoc
+- Wasm unit tests: `vip9r-perf-submit [--target device] tests [TEST_SUBSTRING]`
+- Wasm validation:
+  `vip9r-perf-submit [--target device] validate [--media MEDIA] [--frames START:LAST]`,
+  or
+  `vip9r-perf-submit [--target host|device] validate --allow-mismatch [--media MEDIA] [--frames START:LAST]`
+  to decode media and verify frame hashes.
+- Wasm microbench slots:
+  `vip9r-perf-submit [--target host|device] microbench --slot N` for an ad-hoc
   `vip9r_bench_run(slot, inner_iters)` export
 - `cargo clippy`
-- Full-decode timing: `vip9r-perf-submit [--target host|device] bench --media MEDIA`,
-  if the orchestrator asks for daemon-backed measurements
+- Full-decode validation and timing:
+  `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST]`,
 
-The strict wasm golden runner is the full-decode correctness gate.
-`--allow-mismatch` still fails on decode errors and missing/extra shown frames,
-but allows wrong frame md5 values. Benchmark submissions validate the selected
-output window with md5 first, then warm up and measure repeated decodes of the
-same window without md5 or output-plane copies. Orchestrator may provide a
-target media file to test with; validation defaults to the bear VP9 smoke vector
-when `--media` is omitted.
-
-Host submissions are the cheap reject path. `--target device` is the scarce
-ratchet path selected by the orchestrator. Do not discover devices or change
-device pins unless the task explicitly asks for core-comparison work.
+Orchestrator will specify correctness and optimization objectives.
 
 ## Monitoring updates
 
