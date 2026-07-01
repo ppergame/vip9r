@@ -75,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="wasm unit test substring",
     )
 
-    microbench = subparsers.add_parser("microbench", help="run a wasm microbenchmark slot")
+    microbench = subparsers.add_parser(
+        "microbench", help="run a wasm microbenchmark slot"
+    )
     microbench.add_argument(
         "--slot",
         required=True,
@@ -121,13 +123,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.pin is not None:
         request["pin"] = args.pin
 
+    socket_path = default_socket_path()
+    if socket_path is None:
+        print(f"submit: no perf daemon socket", file=sys.stderr)
+        return 2
+
     try:
         candidate = build_candidate(tests).read_bytes()
     except Exception as error:
         print(f"candidate: {error}", file=sys.stderr)
         return 2
 
-    response = submit_request(request, candidate)
+    try:
+        response = submit_request(request, candidate, socket_path)
+    except RuntimeError as error:
+        print(f"submit: {error}", file=sys.stderr)
+        return 2
     print(json.dumps(response, indent=2))
     return 0 if response.get("ok") is True else 1
 
@@ -205,11 +216,19 @@ def git_root() -> Path:
     return Path(completed.stdout.strip())
 
 
-def submit_request(request: dict[str, object], candidate: bytes) -> dict[str, object]:
+def submit_request(
+    request: dict[str, object], candidate: bytes, socket_path: Path
+) -> dict[str, object]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_CANDIDATE_BYTES)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_RESPONSE_BYTES)
-    sock.connect(str(default_socket_path()))
+    try:
+        sock.connect(str(socket_path))
+    except OSError as error:
+        sock.close()
+        raise RuntimeError(
+            f"connect {socket_path}: {error.strerror or error}"
+        ) from error
     with sock:
         send_json(sock, request)
         send_record(sock, candidate)
@@ -231,10 +250,12 @@ def submit_request(request: dict[str, object], candidate: bytes) -> dict[str, ob
             raise ValueError(f"unexpected response type: {message_type!r}")
 
 
-def default_socket_path() -> Path:
-    if GRINDER_SOCKET_PATH.exists():
+def default_socket_path() -> Path | None:
+    if GRINDER_SOCKET_PATH.is_socket():
         return GRINDER_SOCKET_PATH
-    return HOST_SOCKET_PATH
+    if HOST_SOCKET_PATH.is_socket():
+        return HOST_SOCKET_PATH
+    return None
 
 
 def send_json(sock: socket.socket, value: object) -> None:

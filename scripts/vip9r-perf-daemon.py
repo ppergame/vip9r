@@ -1572,7 +1572,6 @@ def cpu_groups(device: DeviceContext) -> list[dict[str, object]]:
             {
                 "name": name,
                 "cpus": cpu_indices,
-                "default_pin": f"cpu:{cpu_indices[0]}" if device.taskset is not None else None,
                 "capacity": capacity,
                 "max_freq": max_freq,
                 "midr": midr,
