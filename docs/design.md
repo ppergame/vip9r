@@ -186,6 +186,57 @@ wins only count after reconfirming full-decode wall time.
 Only log timings from harness-built wasm; ad-hoc builds are for exploration, not
 the record.
 
+### Devices and timing protocol
+
+Probed 2026-07 on the two connected targets:
+
+- **Pixel 9a (tegu, arm64):** 4×Cortex-A520 @1.95 GHz (cpu0-3), 3×A720
+  @2.6 GHz (cpu4-6), 1×X4 @3.105 GHz (cpu7). Rooted; su lives at
+  `/debug_ramdisk/su`. Policy: root reads for info-gathering are fine, root
+  mutation of device settings (governors, freq locks) is to be avoided.
+- **Google TV Streamer (kirkwood, armeabi-v7a only):** 4×Cortex-A55 @2.0 GHz,
+  one shared cpufreq policy. Not rootable. Supported dev target despite the
+  weaker confidence protocol below. On identical content the A55 runs ~1.75×
+  slower than the Pixel A520 (weaker core plus V8 arm32 codegen).
+
+Empirical behavior that shapes the protocol:
+
+- Stock governors ramp the pinned core to max within a sample or two and hold
+  it there under single-core d8 load on both devices. Run-to-run spread is
+  ≤1% with no CPU control at all; back-to-back baseline/candidate runs of
+  identical wasm agree within 0.02–0.5%. A/B deltas ≥~2% are credible from a
+  single daemon bench run.
+- The Pixel X4 heat-soaks: ~6% ms/frame degradation over 8 minutes of
+  continuous decode at 89–94 °C on the BIG sensor, while `scaling_cur_freq`
+  reports a constant 3105 MHz and `scaling_max_freq` never clamps. cpufreq
+  telemetry is therefore a false-negative throttle signal on the Pixel. The
+  honest signals are temperature and the timing drift itself (per-pass
+  timings). Drift is ~0.1–0.2% per 10 s, so adjacent A/B runs cancel it;
+  absolute margin numbers carry a ±6% thermal-state error unless started cool.
+  BIG recovers 94→45 °C within ~30 s of idle.
+- Temperature without root: the `dumpsys thermalservice` section
+  `Current temperatures from HAL` tracks the root-only sysfs sensor
+  (`/sys/class/thermal/thermal_zone0`, type `BIG`) within a few °C. The
+  `Cached temperatures` section and derived thermal status are event-driven
+  and can be stale by tens of °C; never use them. The streamer exposes no
+  thermal read to shell — per-CPU `scaling_cur_freq` (cluster-wide policy) is
+  its only telemetry, and it showed flat timings under 3.5 min of sustained
+  load.
+- The bench runner's per-pass deadline equals `targetMs` (5 s), and the
+  binding pass is the md5 validation pass (md5 overhead ≈ +15% on X4, +60% on
+  A55 vs a measurement pass). At 720p this caps decode windows at roughly
+  ≤16 output frames on the X4, ≤4 on the A520, ≤2 on the A55 at current
+  decoder speed. Decision: keep the 5 s limit — optimization is expected to
+  bring realistic windows into range, and bloating run times for extra
+  precision is not wanted. Revisit only if it blocks real work.
+
+Margins are measured against the 33.3 ms/frame 720p30 budget. Starting-line
+(2026-07, small windows, warm device): X4 ~147 ms/frame, A720 ~207, A520 ~845,
+A55 ~1489.
+
+The daemon binds one fixed socket (`temp/vip9r-perf.sock`) and one device per
+`serve`; switching devices is a daemon restart.
+
 ### V8 artifacts
 
 The devshell pins Google-published V8 canary bundles. Operational details for

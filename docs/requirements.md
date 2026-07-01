@@ -50,9 +50,9 @@ does not support VP9 hardware decode. The app could:
   - Companion socket server driven by CLI commands. Queues device access
     requests.
   - Devices
-    - local machine
-    - a connected Pixel 9a
-    - streaming stick TBD
+    - dev workstation
+    - Pixel 9a
+    - google tv streamer
   - Inputs
     - d8 binary (native, ARM)
     - JS driver

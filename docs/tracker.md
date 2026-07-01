@@ -36,6 +36,9 @@ Deferrable external inputs for M3 performance work.
 - [x] device oracle that serializes access to adb and hardware
 - [x] host and ARM d8 paths for wasm inspection and timing, JIT tier control
 - [ ] repeatable device timing protocol with CPU control and confidence checks
+- [ ] collect the ffvp9 performance baseline: static ffmpeg (arm64 + armv7) run
+      directly through adb, taskset-pinned, on the realworld 720p clips across
+      Pixel 9a core types and the streamer
 - [ ] return native (host / ARM) assembly for the wasm module from d8 back to
       the grinder to close the codegen feedback loop
 - [ ] surface perf-run profile traces (simpleperf / d8 wasm samples) back to the
