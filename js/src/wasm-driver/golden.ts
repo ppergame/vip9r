@@ -65,6 +65,7 @@ export type DriverArgs = {
   inputPath: string;
   goldenPath: string;
   progressFrames?: number;
+  frames?: DecodeWindow;
   bench?: BenchmarkOptions;
 };
 
@@ -199,8 +200,8 @@ export class DriverUsageError extends Error {
 export function parseDriverArgs(args: string[]): DriverArgs {
   let allowMismatch = false;
   let progressFrames: number | undefined;
+  let frames: DecodeWindow | undefined;
   let bench = false;
-  let sawBenchmarkOption = false;
   const benchmarkOptions = { ...DEFAULT_BENCHMARK_OPTIONS };
   const paths: string[] = [];
 
@@ -218,23 +219,13 @@ export function parseDriverArgs(args: string[]): DriverArgs {
       progressFrames = parsePositiveInteger(arg.slice("--progress-frames=".length), "--progress-frames");
       continue;
     }
-    if (arg === "--bench-frames") {
+    if (arg === "--frames") {
       const value = args[index + 1];
       if (value === undefined) {
-        throw new Error("--bench-frames requires START:LAST");
+        throw new Error("--frames requires START:LAST");
       }
       index += 1;
-      sawBenchmarkOption = true;
-      const frameRange = parseBenchmarkFrameRange(value);
-      benchmarkOptions.outputOffset = frameRange.outputOffset;
-      benchmarkOptions.outputFrames = frameRange.outputFrames;
-      continue;
-    }
-    if (arg.startsWith("--bench-frames=")) {
-      sawBenchmarkOption = true;
-      const frameRange = parseBenchmarkFrameRange(arg.slice("--bench-frames=".length));
-      benchmarkOptions.outputOffset = frameRange.outputOffset;
-      benchmarkOptions.outputFrames = frameRange.outputFrames;
+      frames = parseOutputFrameRange(value);
       continue;
     }
     if (arg.startsWith("-")) {
@@ -246,14 +237,18 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   if (paths.length < 1 || paths.length > 2) {
     throw new DriverUsageError("invalid path count");
   }
-  if (sawBenchmarkOption && !bench) {
-    throw new Error("benchmark options require --bench");
-  }
   if (bench && allowMismatch) {
     throw new Error("--allow-mismatch cannot be used with --bench");
   }
   if (bench && progressFrames !== undefined) {
     throw new Error("--progress-frames cannot be used with --bench");
+  }
+  if (!bench && frames !== undefined && progressFrames !== undefined) {
+    throw new Error("--progress-frames cannot be used with --frames");
+  }
+  if (bench && frames !== undefined) {
+    benchmarkOptions.outputOffset = frames.outputOffset;
+    benchmarkOptions.outputFrames = frames.outputFrames;
   }
 
   const [wasmPath, explicitInputPath] = paths;
@@ -265,6 +260,7 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     inputPath,
     goldenPath,
     progressFrames,
+    frames: bench ? undefined : frames,
     bench: bench ? benchmarkOptions : undefined,
   };
 }
@@ -273,6 +269,10 @@ export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonR
   const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
   const decoder = instantiateVp9Decoder(wasm, decoderDimensions, io.log);
+
+  if (args.frames !== undefined) {
+    return compareDecodedVp9WindowToGolden(args.inputPath, args.goldenPath, input, golden, decoder, args.frames);
+  }
 
   return compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder, {
     progressFrames: args.progressFrames,
@@ -516,7 +516,7 @@ export function planBenchmarkDecode(input: DemuxedVp9, window: DecodeWindow): Be
   }
 
   if (input.container !== "webm") {
-    throw new Error("nonzero --bench-frames start requires WebM keyframe metadata");
+    throw new Error("nonzero benchmark --frames start requires WebM keyframe metadata");
   }
 
   let visibleIndex = 0;
@@ -678,10 +678,10 @@ function normalizeDecodeWindow(window: DecodeWindow): DecodeWindow {
 }
 
 function validateGoldenWindow(golden: GoldenFrame[], window: DecodeWindow): void {
-  const end = checkedAdd(window.outputOffset, window.outputFrames, "benchmark output window");
+  const end = checkedAdd(window.outputOffset, window.outputFrames, "output window");
   if (end > golden.length) {
     throw new Error(
-      `benchmark output window ${window.outputOffset}..${end} exceeds golden frame count ${golden.length}`,
+      `output window ${window.outputOffset}..${end} exceeds golden frame count ${golden.length}`,
     );
   }
 }
@@ -882,19 +882,19 @@ function parseSafeInteger(value: string, name: string): number {
   return parsed;
 }
 
-function parseBenchmarkFrameRange(value: string): DecodeWindow {
+function parseOutputFrameRange(value: string): DecodeWindow {
   const match = /^(\d+):(\d+)$/.exec(value);
   if (match === null) {
-    throw new Error("--bench-frames must be START:LAST with non-negative integer start and last");
+    throw new Error("--frames must be START:LAST with non-negative integer start and last");
   }
-  const start = parseSafeInteger(match[1], "--bench-frames start");
-  const last = parseSafeInteger(match[2], "--bench-frames last");
+  const start = parseSafeInteger(match[1], "--frames start");
+  const last = parseSafeInteger(match[2], "--frames last");
   if (last < start) {
-    throw new Error("--bench-frames last must be greater than or equal to start");
+    throw new Error("--frames last must be greater than or equal to start");
   }
   return {
     outputOffset: start,
-    outputFrames: checkedAdd(last - start, 1, "benchmark output frame count"),
+    outputFrames: checkedAdd(last - start, 1, "output frame count"),
   };
 }
 

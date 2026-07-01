@@ -145,10 +145,10 @@ function makeGoldenJsonReport(
 
 function printUsage(out: (...values: unknown[]) => void = print): void {
   out(
-    "usage: wasm-golden [--allow-mismatch] [--progress-frames=N] [input.ivf|input.webm]",
+    "usage: wasm-golden [--allow-mismatch] [--frames START:LAST] [--progress-frames=N] [input.ivf|input.webm]",
   );
   out(
-    "       wasm-golden --bench [--bench-frames START:LAST] [input.ivf|input.webm]",
+    "       wasm-golden --bench [--frames START:LAST] [input.ivf|input.webm]",
   );
 }
 

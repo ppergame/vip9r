@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow wrong frame md5 values",
     )
+    validate.add_argument(
+        "--frames",
+        type=parse_frame_range,
+        help="output-frame selection as START:LAST",
+    )
 
     bench = subparsers.add_parser("bench", help="run full-decode timing")
     bench.add_argument(
@@ -102,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
         request["media"] = str(args.media)
         if args.allow_mismatch:
             request["allow_mismatch"] = True
+        if args.frames is not None:
+            request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
         tests = False
     elif args.command == "bench":
         request["kind"] = "bench"

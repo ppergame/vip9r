@@ -167,11 +167,21 @@ describe("wasm golden runner helpers", () => {
       goldenPath: "/bulk/vip9r/chromium/bear-vp9.ivf.md5",
       bench: undefined,
     });
+    expect(parseDriverArgs(["--frames", "2:6", "vip9r.wasm", "input.ivf"])).toMatchObject({
+      wasmPath: "vip9r.wasm",
+      inputPath: "input.ivf",
+      goldenPath: "input.ivf.md5",
+      frames: {
+        outputOffset: 2,
+        outputFrames: 5,
+      },
+      bench: undefined,
+    });
 
     expect(
       parseDriverArgs([
         "--bench",
-        "--bench-frames",
+        "--frames",
         "2:6",
         "vip9r.wasm",
         "input.webm",
@@ -190,10 +200,6 @@ describe("wasm golden runner helpers", () => {
     });
 
     expect(parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench).toEqual(DEFAULT_BENCHMARK_OPTIONS);
-    expect(parseDriverArgs(["--bench", "--bench-frames=2:6", "vip9r.wasm", "input.ivf"]).bench).toMatchObject({
-      outputOffset: 2,
-      outputFrames: 5,
-    });
     expect(parseDriverArgs(["--bench", "vip9r.wasm"])).toMatchObject({
       wasmPath: "vip9r.wasm",
       inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
@@ -203,21 +209,21 @@ describe("wasm golden runner helpers", () => {
   });
 
   test("rejects benchmark options that would make output non-benchmark or non-machine-readable", () => {
-    expect(() => parseDriverArgs(["--bench-frames", "0:1", "vip9r.wasm", "input.ivf"])).toThrow(
-      "benchmark options require --bench",
-    );
     expect(() => parseDriverArgs(["--bench", "--allow-mismatch", "vip9r.wasm", "input.ivf"])).toThrow(
       "--allow-mismatch cannot be used with --bench",
     );
     expect(() => parseDriverArgs(["--bench", "--progress-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
       "--progress-frames cannot be used with --bench",
     );
-    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2:1", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--bench-frames last must be greater than or equal to start",
+  });
+
+  test("rejects invalid validation frame selections", () => {
+    expect(() => parseDriverArgs(["--frames", "2:1", "vip9r.wasm", "input.ivf"])).toThrow(
+      "--frames last must be greater than or equal to start",
     );
-    expect(() => parseDriverArgs(["--bench", "--bench-frames", "2+3", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--bench-frames must be START:LAST with non-negative integer start and last",
-    );
+    expect(() =>
+      parseDriverArgs(["--frames", "0:1", "--progress-frames=1", "vip9r.wasm", "input.ivf"]),
+    ).toThrow("--progress-frames cannot be used with --frames");
   });
 
   test("chooses decoder dimensions from sidecar frame names when larger than container", () => {
@@ -539,7 +545,7 @@ describe("wasm golden runner helpers", () => {
         outputOffset: 1,
         outputFrames: 1,
       }),
-    ).toThrow("nonzero --bench-frames start requires WebM keyframe metadata");
+    ).toThrow("nonzero benchmark --frames start requires WebM keyframe metadata");
 
     expect(() =>
       planBenchmarkDecode(sampleDemuxedWebm([samplePacket(0, [0], { keyframe: false, visible: true })]), {

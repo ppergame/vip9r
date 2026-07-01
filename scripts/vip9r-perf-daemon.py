@@ -644,7 +644,7 @@ def frame_range_from_request(request: dict[str, object]) -> tuple[int, int] | No
     if frames is None:
         return None
     if not isinstance(frames, dict):
-        raise ValueError("bench request requires frames")
+        raise ValueError("frames must be an object")
     offset = frames.get("offset")
     last = frames.get("last")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
@@ -670,6 +670,10 @@ def validation_from_request(request: dict[str, object]) -> dict[str, object]:
         raise ValueError("allow_mismatch must be boolean")
     if allow_mismatch:
         validation["allow_mismatch"] = True
+
+    frames = frame_range_from_request(request)
+    if frames is not None:
+        validation["frames"] = frames
 
     return validation
 
@@ -913,7 +917,7 @@ def run_device_bench(
     ]
     if frame_range is not None:
         start, last = frame_range
-        d8_args.extend(["--bench-frames", f"{start}:{last}"])
+        d8_args.extend(["--frames", f"{start}:{last}"])
     d8_args.append(media_path)
     return run_device_json(device, d8_args, pin, "benchmark", result_path)
 
@@ -937,6 +941,10 @@ def run_device_validation(
     ]
     if validation.get("allow_mismatch") is True:
         d8_args.append("--allow-mismatch")
+    frames = validation.get("frames")
+    if frames is not None:
+        start, last = frames
+        d8_args.extend(["--frames", f"{start}:{last}"])
     d8_args.append(media_path)
     return run_device_json(device, d8_args, pin, "validation", result_path)
 
@@ -1740,7 +1748,7 @@ def run_host_bench(
     ]
     if frame_range is not None:
         start, last = frame_range
-        cmd.extend(["--bench-frames", f"{start}:{last}"])
+        cmd.extend(["--frames", f"{start}:{last}"])
     cmd.append(str(media_path))
     try:
         completed = subprocess.run(
@@ -1770,6 +1778,10 @@ def run_host_validation(
     ]
     if validation.get("allow_mismatch") is True:
         cmd.append("--allow-mismatch")
+    frames = validation.get("frames")
+    if frames is not None:
+        start, last = frames
+        cmd.extend(["--frames", f"{start}:{last}"])
     cmd.append(str(media_path))
     try:
         completed = subprocess.run(

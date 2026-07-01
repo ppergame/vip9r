@@ -42,13 +42,12 @@ Workspace crates:
 
 ### Inputs (read-only)
 
-- `/specs` - specs. Arm ISA XML lives under `/specs/arm-isa/a64` and
-  `/specs/arm-isa/aarch32-t32`.
+- `/specs` - specs, including the VP9 spec.
+  - `/specs/arm-isa/a64` and `/specs/arm-isa/aarch32-t32` - ARM ISA XMLs
+  - `/specs/arm` - ARM optimization manuals and Neon intrinsics
+  - `/specs/wasm` - Wasm core spec and Rust Wasm intrinsics
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
-- `vip9r-perf-submit` on PATH - blocking submission to the orchestrator's
-  performance daemon when a socket is provided. It always builds the candidate
-  wasm from the current checkout; `tests` builds the `wasm-tests` feature
-  module.
+- `vip9r-perf-submit` on PATH - script to build and submit the Wasm module. The only way to exercise the code.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -68,9 +67,10 @@ Depending on the task, you can verify your work with
 - Wasm unit tests: `vip9r-perf-submit [--target host|device] tests
   [TEST_SUBSTRING]`
 - Wasm validation: `vip9r-perf-submit [--target host|device] validate
-  [--media MEDIA]`, or `vip9r-perf-submit [--target host|device] validate
-  --allow-mismatch [--media MEDIA]` for code-complete smoke runs that permit
-  wrong frame hashes
+  [--media MEDIA] [--frames START:LAST]`, or
+  `vip9r-perf-submit [--target host|device] validate --allow-mismatch
+  [--media MEDIA] [--frames START:LAST]` for code-complete smoke runs that
+  permit wrong frame hashes
 - Wasm microbench slots: `vip9r-perf-submit [--target host|device] microbench
   --slot N` for an ad-hoc
   `vip9r_bench_run(slot, inner_iters)` export
