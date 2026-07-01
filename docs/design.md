@@ -71,23 +71,24 @@ against the `.md5` golden. The libvpx md5 protocol has sharp edges:
   vectors: md5 filename dimensions are not reliable enough for a global filter.
 
 The d8 wasm driver is the canonical golden path and exercises the manual
-boundary used by the shipping path. In grinder sandboxes, use the short command:
+boundary used by the shipping path. In the main checkout, use the short command:
 
 ```sh
 wasm-golden
 ```
 
 `wasm-golden` builds the release wasm module and runs d8 against prebuilt JS
-runner artifacts. It works from the main checkout and inside grinder, defaults
-to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the driver defaults the golden path
-to the `.md5` sidecar. The optional input path may be IVF or WebM. It exits
-non-zero on decode errors, missing/extra shown frames, or md5 mismatches;
-`wasm-golden --allow-mismatch` only permits wrong frame hashes for code-complete
-smoke runs. The current wasm driver parses all 82 coded frames in
+runner artifacts. It defaults to `/bulk/vip9r/chromium/bear-vp9.ivf`, and the
+driver defaults the golden path to the `.md5` sidecar. The optional input path
+may be IVF or WebM. It exits non-zero on decode errors, missing/extra shown
+frames, or md5 mismatches; `wasm-golden --allow-mismatch` only permits wrong
+frame hashes for code-complete smoke runs. Grinder sandboxes do not carry these
+JS runner artifacts; use `vip9r-perf-submit validate [--allow-mismatch]`
+instead. The current wasm driver parses all 82 coded frames in
 `bear-vp9.ivf`, emits 82 shown frames, applies the in-loop filter, and strict
 md5 passes with 82 matched frames and no mismatches/missing/extra frames.
-Long corpus vectors can use `wasm-golden --progress-frames=N` to print periodic
-compared-frame progress without changing the final pass/fail criteria.
+Long local corpus runs can use `wasm-golden --progress-frames=N` to print
+periodic compared-frame progress without changing the final pass/fail criteria.
 
 WebM demux is intentionally a narrow harness subset: one `V_VP9` video track is
 selected, non-video tracks are ignored, `SimpleBlock` and `BlockGroup/Block`
@@ -187,9 +188,6 @@ exploration, but their timings are not project evidence.
 The devshell pins Google-published V8 canary bundles. Operational details for
 bumping those pins, running Android `d8` under qemu user emulation, and
 extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
-
-The first coarse optimization loop is specified in
-[`docs/performance-ratchet.md`](performance-ratchet.md).
 
 ## Work shape
 

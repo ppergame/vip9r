@@ -56,8 +56,7 @@
       inherit pkgs rustToolchain v8;
     };
     grinder = import ./nix/grinder.nix {
-      inherit pkgs rustToolchain v8 codex armIsaXml;
-      inherit (wasmTools) wasmGolden wasmMicrobench wasmTests;
+      inherit pkgs rustToolchain codex armIsaXml;
     };
   in {
     packages.${system} = {

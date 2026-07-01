@@ -45,8 +45,10 @@ Workspace crates:
 - `/specs` - specs. Arm ISA XML lives under `/specs/arm-isa/a64` and
   `/specs/arm-isa/aarch32-t32`.
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
-- `wasm-tests`, `wasm-golden`, and `wasm-microbench` on PATH - scripts that
-  build and test the wasm module.
+- `vip9r-perf-submit` on PATH - blocking submission to the orchestrator's
+  performance daemon when a socket is provided. It always builds the candidate
+  wasm from the current checkout; `tests` builds the `wasm-tests` feature
+  module.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -63,20 +65,30 @@ Depending on the task, you can verify your work with
 
 - Engineering judgement. Self-review the change and decide whether it would
   satisfy the orchestrator and the user.
-- Wasm unit tests: `wasm-tests`, or `wasm-tests TEST_SUBSTRING` for targeted
-  runs
-- Wasm microbench slots: `wasm-microbench --slot N` for an ad-hoc
+- Wasm unit tests: `vip9r-perf-submit [--target host|device] tests
+  [TEST_SUBSTRING]`
+- Wasm validation: `vip9r-perf-submit [--target host|device] validate
+  [--media MEDIA]`, or `vip9r-perf-submit [--target host|device] validate
+  --allow-mismatch [--media MEDIA]` for code-complete smoke runs that permit
+  wrong frame hashes
+- Wasm microbench slots: `vip9r-perf-submit [--target host|device] microbench
+  --slot N` for an ad-hoc
   `vip9r_bench_run(slot, inner_iters)` export
 - `cargo clippy`
-- Wasm golden runner: `wasm-golden [--allow-mismatch] [IVF or WebM file]`
-- Host full-decode timing: `wasm-golden --bench [IVF or WebM file]`
+- Full-decode timing: `vip9r-perf-submit [--target host|device] bench --media MEDIA`,
+  if the orchestrator asks for daemon-backed measurements
 
 The strict wasm golden runner is the full-decode correctness gate.
 `--allow-mismatch` still fails on decode errors and missing/extra shown frames,
-but allows wrong frame md5 values. `--bench` validates the selected output window
-with md5 first, then warms up and measures repeated decodes of the same window
-without md5 or output-plane copies. Orchestrator may provide a target media file
-to test with, otherwise the runner uses a default.
+but allows wrong frame md5 values. Benchmark submissions validate the selected
+output window with md5 first, then warm up and measure repeated decodes of the
+same window without md5 or output-plane copies. Orchestrator may provide a
+target media file to test with; validation defaults to the bear VP9 smoke vector
+when `--media` is omitted.
+
+Host submissions are the cheap reject path. `--target device` is the scarce
+ratchet path selected by the orchestrator. Do not discover devices or change
+device pins unless the task explicitly asks for core-comparison work.
 
 ## Monitoring updates
 

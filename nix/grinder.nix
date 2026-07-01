@@ -1,12 +1,8 @@
 {
   pkgs,
   rustToolchain,
-  v8,
   codex,
   armIsaXml,
-  wasmGolden,
-  wasmMicrobench,
-  wasmTests,
 }: let
   inherit (pkgs) lib;
 
@@ -54,7 +50,6 @@
       gnumake
       git
       libvpx
-      nodejs
       pkg-config
       python3
       ripgrep
@@ -65,7 +60,7 @@
       # Debugging and host inspection.
       strace
     ])
-    ++ [codex wasmGolden wasmMicrobench wasmTests];
+    ++ [codex];
   sandboxEnv = pkgs.buildEnv {
     name = "vip9r-grinder-env";
     paths = sandboxPackages;
@@ -80,12 +75,9 @@
       ++ podmanEnv "HOME" "/run/home"
       ++ podmanEnv "SHELL" "/bin/bash"
       ++ podmanEnv "CARGO_HOME" "/cargo-home"
-      ++ podmanEnv "V8_LINUX64" "${v8.linux64}"
-      ++ podmanEnv "D8_LINUX64" "${v8.linux64}/d8"
       ++ podmanEnv "CODEX_HOME" "/codex-home"
       ++ podmanEnv "SSL_CERT_FILE" caBundle
       ++ podmanEnv "NIX_SSL_CERT_FILE" caBundle
-      ++ podmanEnv "NODE_EXTRA_CA_CERTS" caBundle
       ++ ["--tmpfs" "/tmp" "--volume" "/nix/store:/nix/store:ro"]);
 in
   pkgs.writeShellApplication {
@@ -154,14 +146,6 @@ in
       codex_events="$repo/scripts/codex-events.py"
       perf_submit="$repo/scripts/vip9r-perf-submit.py"
       perf_socket="$repo/temp/vip9r-perf.sock"
-      wasm_driver_dist="$repo/js/dist/wasm-driver"
-      for artifact in golden.js microbench.js tests.js; do
-        if [[ ! -f "$wasm_driver_dist/$artifact" ]]; then
-          echo "missing prebuilt wasm driver artifact: $wasm_driver_dist/$artifact" >&2
-          echo "run: cd js && pnpm build:wasm-driver" >&2
-          exit 2
-        fi
-      done
 
       temp_dir="$repo/temp"
       codex_home="$temp_dir/codex-home"
@@ -186,9 +170,6 @@ in
         [[ "$(basename "$entry")" == target ]] && continue
         cp -a "$entry" "$run/rust/"
       done
-      mkdir -p "$run/js/dist"
-      cp -a "$wasm_driver_dist" "$run/js/dist/"
-
       cp -a "$system_prompt" "$run/system.md"
       if [[ -n "$task_file" ]]; then
         cp -a "$task_file" "$run/task.md"
