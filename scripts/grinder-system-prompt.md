@@ -48,8 +48,8 @@ Workspace crates:
   - `/specs/wasm` - Wasm core spec and Rust Wasm intrinsics
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
 - `vip9r-perf-submit` on PATH - script to build and submit the Wasm module. The
-  only way to exercise the code. The orchestrator will communicate whether
-  device testing is necessary.
+  only way to run the code. The orchestrator will communicate whether device
+  testing is necessary.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from

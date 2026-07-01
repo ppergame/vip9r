@@ -201,9 +201,7 @@ extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
   `rust/`. Keep maintainer/orchestrator tooling outside that tree unless the
   implementor needs it for the task.
 - Grinder sandboxes make `rust/` the repo root, while the main checkout's VCS
-  root is the project root. When importing sandbox diffs manually, apply them
-  from the project root with `git apply --directory=rust` and verify `jj status`
-  or `git status` afterward. Do not trust a quiet patch command alone.
+  root is the project root. Import mechanics live in `docs/orchestrator.md`.
 - Keep task boundaries provisional. Split by whatever makes correctness,
   measurement, and review easiest at the time.
 - Prefer grinder tasks smaller than the first packet front-end handoff. That

@@ -38,9 +38,10 @@ does not support VP9 hardware decode. The app could:
     - Profile 0, 8-bit
     - "clean-ish" room from spec, test vectors, test content
     - libvpx is the correctness oracle
-      - frame md5sum, maybe partial frame contents
+      - frame md5sum
       - no peeking at source code
-      - vip9r is a "derived work" of libvpx
+        - this is an engineering, not a legal requirement
+        - vip9r is a "derived work" of libvpx
   - H.264 encoder
     - minih264
 - Performance baseline
@@ -56,10 +57,6 @@ does not support VP9 hardware decode. The app could:
     - d8 binary (native, ARM)
     - JS driver
     - Wasm module under test
-  - Shell wrappers
-    - Generate x86 or ARM asm for this wasm module
-    - Benchmark this many frames for this video on host or device
-    - Benchmark function slot X in this wasm module
 
 ## Testing strategy
 
@@ -116,27 +113,8 @@ moment the session is done.
     the tasks are independent and won't create nontrivial merge conflicts
   - Adds entries to log.md as appropriate
     - Combine log changes with the implementation commit where it makes sense
-  - Maintains temp/loop_state.md for any transient notes useful for the next
-    orchestrator session or in case of context compaction.
-    - Notes are most useful at phase boundaries, not as running commentary.
-
-The grinder is a batch job. It is ok for the orchestrator to poll it at the
-maximum supported interval. The grinder codex sometimes hangs or issues a
-malformed tool_search call on the first turn. Kill and retry up to 3 times.
-Orchestrator startup:
-
-- User issues a request, likely related to a tracker milestone and possibly
-  describing a device target
-- If a device target is involved, orchestrator
-  - Runs `./scripts/vip9r-perf-daemon.py probe`
-  - Locates the relevant device and its serial number
-  - Runs `./scripts/vip9r-perf-daemon.py prepare --serial <SERIAL>` to download
-    files onto the device
-- Once device preparation is complete or the task is host-only, orchestrator
-  runs
-  - `./scripts/vip9r-perf-daemon.py serve --serial <SERIAL> --pin <PIN>` if a
-    device is requested
-  - `./scripts/vip9r-perf-daemon.py serve` for host-only work
+  - Session mechanics — perf daemon startup, grinder invocation, review and
+    merge — live in `docs/orchestrator.md`.
 
 ### Codex implementor
 
@@ -158,10 +136,3 @@ the next run.
 `scripts/grinder-system-prompt.md` is the implementor prompt. The user maintains
 the bulk of the prompt. Orchestrator makes suggestions and maintains the
 orchestrator block.
-
-Orchestrator writes a task file then runs
-`nix run .#grinder -- run temp/task-<slug>.md`. The script puts together an
-implementor sandbox, including system prompt, task prompt and a copy of the Rust
-code. When the agent is done, the script will print a location like
-`temp/grinder.XXXXXX`. These directories and the task files are transient and
-the orchestrator deletes any stale ones. Preserve `temp/traces/` for auditing.
