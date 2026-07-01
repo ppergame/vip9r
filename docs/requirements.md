@@ -121,17 +121,8 @@ moment the session is done.
     - Notes are most useful at phase boundaries, not as running commentary.
 
 The grinder is a batch job. It is ok for the orchestrator to poll it at the
-maximum supported interval.
-
-Previous orchestrator infra failures. Retry unless there have been three
-consecutive failures.
-
-- grinder fails on turn one: malformed `tool_search` arguments with a garbage
-  1255-character property name; API rejected the turn
-  - verdict: retry
-- grinder agent stuck for 5 or more minutes with no output
-  - verdict: retry
-
+maximum supported interval. The grinder codex sometimes hangs or issues a
+malformed tool_search call on the first turn. Kill and retry up to 3 times.
 Orchestrator startup:
 
 - User issues a request, likely related to a tracker milestone and possibly

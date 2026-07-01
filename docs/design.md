@@ -183,9 +183,8 @@ baseline with enough repetition to report a credible delta. Targeted
 microbenchmarks are allowed when a full-decode result points at a hotspot; their
 wins only count after reconfirming full-decode wall time.
 
-Record performance results in `docs/log.md` only when the wasm was built by the
-normal harness from a named repo revision. Ad-hoc wasm files are fine for
-exploration, but their timings are not project evidence.
+Only log timings from harness-built wasm; ad-hoc builds are for exploration, not
+the record.
 
 ### V8 artifacts
 
