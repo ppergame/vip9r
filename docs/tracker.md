@@ -41,8 +41,9 @@ Deferrable external inputs for M3 performance work.
       Pixel 9a core types and the streamer
 - [x] return native (host / ARM) assembly for the wasm module from d8 back to
       the grinder to close the codegen feedback loop
-- [ ] surface perf-run profile traces (simpleperf / d8 wasm samples) back to the
-      orchestrator, so M3 hotspot attribution is measured rather than guessed
+- [x] surface perf-run profile traces (simpleperf / d8 wasm samples) back to the
+      orchestrator and grinder, so M3 hotspot attribution is measured rather
+      than guessed
 - [x] systemize wasm runner JSON output; JSON stdout is the default for
       `wasm-golden` validation, `wasm-golden --bench`, and `wasm-microbench`;
       `wasm-tests` keeps explicit `--json` because its human output is useful

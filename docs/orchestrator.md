@@ -20,6 +20,12 @@ requirements.md — suggest changes rather than editing.
 - `serve` blocks: run it in the background and keep it up for the session. This
   is the server allowing grinders to run wasm code.
 
+## Tooling
+
+- Hotspot attribution:
+  `vip9r-perf-submit --target device profile --media MEDIA`; artifacts in
+  temp/vip9r-profiles/, details in docs/d8.md."
+
 ## Grinder runs
 
 - Write a task file `temp/task-<slug>.md`.

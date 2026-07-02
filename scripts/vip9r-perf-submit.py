@@ -7,6 +7,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +88,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="microbenchmark slot",
     )
 
+    profile = subparsers.add_parser(
+        "profile", help="record a simpleperf profile of a device bench run"
+    )
+    profile.add_argument(
+        "--media",
+        required=True,
+        type=parse_media_path,
+        help="corpus-relative media path",
+    )
+    profile.add_argument(
+        "--frames",
+        type=parse_frame_range,
+        help="output-frame selection as START:LAST",
+    )
+    profile.add_argument(
+        "--freq",
+        type=parse_freq,
+        default=1000,
+        help="simpleperf sample frequency in Hz (default 1000)",
+    )
+
     asm = subparsers.add_parser(
         "asm", help="dump native asm of every declared wasm function"
     )
@@ -107,11 +129,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--pin requires --target device")
     if args.command == "asm" and args.target != "host":
         parser.error("asm runs on the daemon host; pick the ISA with --arch")
+    if args.command == "profile" and args.target != "device":
+        parser.error("profile requires --target device")
 
     request: dict[str, object] = {"target": args.target}
     if args.command == "asm":
         request["kind"] = "asm"
         request["arch"] = args.arch
+        tests = False
+    elif args.command == "profile":
+        request["kind"] = "profile"
+        request["media"] = str(args.media)
+        if args.frames is not None:
+            request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
+        request["freq"] = args.freq
         tests = False
     elif args.command == "microbench":
         request["kind"] = "microbench"
@@ -152,11 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"candidate: {error}", file=sys.stderr)
         return 2
 
-    file_dir = (
-        asm_output_dir(socket_path, candidate, args.arch)
-        if args.command == "asm"
-        else None
-    )
+    if args.command == "asm":
+        file_dir = asm_output_dir(socket_path, candidate, args.arch)
+    elif args.command == "profile":
+        file_dir = profile_output_dir(socket_path, candidate)
+    else:
+        file_dir = None
     try:
         response = submit_request(request, candidate, socket_path, file_dir)
     except RuntimeError as error:
@@ -173,6 +205,16 @@ def asm_output_dir(socket_path: Path, candidate: bytes, arch: str) -> Path:
     if socket_path == GRINDER_SOCKET_PATH:
         return Path("/tmp/vip9r-asm") / name
     return REPO_ROOT / "temp/vip9r-asm" / name
+
+
+def profile_output_dir(socket_path: Path, candidate: bytes) -> Path:
+    # Profile output is not deterministic per candidate; timestamp the
+    # directory so repeated runs do not overwrite each other.
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"{hashlib.sha256(candidate).hexdigest()[:8]}-{stamp}"
+    if socket_path == GRINDER_SOCKET_PATH:
+        return Path("/tmp/vip9r-profiles") / name
+    return REPO_ROOT / "temp/vip9r-profiles" / name
 
 
 def build_candidate(tests: bool) -> Path:
@@ -362,6 +404,13 @@ def parse_non_empty_string(value: str) -> str:
     if value == "":
         raise argparse.ArgumentTypeError("must be non-empty")
     return value
+
+
+def parse_freq(value: str) -> int:
+    parsed = parse_non_negative_int(value)
+    if not 1 <= parsed <= 100000:
+        raise argparse.ArgumentTypeError("must be in 1..100000")
+    return parsed
 
 
 def parse_u32(value: str) -> int:

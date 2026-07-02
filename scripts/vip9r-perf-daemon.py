@@ -38,6 +38,12 @@ ADB_D8_TIMEOUT_SECONDS = DEVICE_D8_TIMEOUT_SECONDS + 30
 DEVICE_TIMEOUT_EXIT_CODE = 124
 TARGETS = ("host", "device")
 ASM_D8_TIMEOUT_SECONDS = 120
+PROFILE_DEFAULT_FREQ = 1000
+PROFILE_MAX_FREQ = 100000
+PROFILE_REPORT_TIMEOUT_SECONDS = 60
+# V8's perf map must land where simpleperf report looks for JIT symbols;
+# /data/local/tmp is the validated location (see docs/d8.md).
+DEVICE_PERF_MAP_DIR = PurePosixPath("/data/local/tmp")
 JITDUMP_MAGIC = 0x4A695444
 JITDUMP_CODE_LOAD = 0
 WASM_TURBOFAN_NAME = re.compile(r"JS:(?P<mangled>.*)-(?P<index>\d+)-turbofan")
@@ -591,6 +597,40 @@ def handle_request(
         except ValueError as error:
             return {"ok": False, "kind": "asm", "target": "host", "error": str(error)}
         return handle_asm_request(arch, candidate_path, dir_fd)
+    if kind == "profile":
+        if target != "device":
+            return {"ok": False, "kind": "profile", "target": target, "error": "profile requires target device"}
+        if device is None or device_session is None:
+            return {
+                "ok": False,
+                "kind": "profile",
+                "target": "device",
+                "error": "target device requires a daemon started with --serial",
+            }
+        if dir_fd is None:
+            return {
+                "ok": False,
+                "kind": "profile",
+                "target": "device",
+                "error": "profile request carries no output directory fd",
+            }
+        try:
+            media = media_from_request(request)
+            frame_range = frame_range_from_request(request)
+            freq = profile_freq_from_request(request)
+            pin_name = pin_from_request(request, default_pin)
+        except ValueError as error:
+            return {"ok": False, "kind": "profile", "target": "device", "error": str(error)}
+        return handle_device_profile_request(
+            device,
+            device_session,
+            candidate_path,
+            media,
+            frame_range,
+            freq,
+            pin_name,
+            dir_fd,
+        )
     if kind != "bench":
         return {"ok": False, "error": f"unsupported request kind: {kind!r}"}
 
@@ -726,6 +766,13 @@ def microbench_from_request(request: dict[str, object]) -> dict[str, int]:
     if slot > U32_MAX:
         raise ValueError(f"slot must be less than or equal to {U32_MAX}")
     return {"slot": slot}
+
+
+def profile_freq_from_request(request: dict[str, object]) -> int:
+    freq = request.get("freq", PROFILE_DEFAULT_FREQ)
+    if not isinstance(freq, int) or isinstance(freq, bool) or not 1 <= freq <= PROFILE_MAX_FREQ:
+        raise ValueError(f"freq must be an integer in 1..{PROFILE_MAX_FREQ}")
+    return freq
 
 
 def validation_from_request(request: dict[str, object]) -> dict[str, object]:
@@ -952,10 +999,197 @@ def handle_device_validate_request(
     }
 
 
+def handle_device_profile_request(
+    device: DeviceContext,
+    session: DeviceSession,
+    local_candidate_path: Path,
+    media: PurePosixPath,
+    frame_range: tuple[int, int] | None,
+    freq: int,
+    pin_name: str,
+    dir_fd: int,
+) -> dict[str, object]:
+    try:
+        pin = resolve_and_verify_pin(device, pin_name)
+        missing_commands = missing_remote_commands(device, ["simpleperf"])
+        if missing_commands:
+            raise DeviceError("missing device commands: " + ", ".join(missing_commands))
+        media_path = str(device.root / "media" / media)
+        verify_remote_files(device, [media_path, f"{media_path}.md5"])
+        run_dir = create_device_run_dir(device, session, "profile")
+        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
+        result_path = str(PurePosixPath(run_dir) / "result.json")
+        perf_data_path = str(PurePosixPath(run_dir) / "perf.data")
+        push_file_to_device(device, local_candidate_path, candidate_path)
+        remove_device_perf_maps(device)
+        d8_args = [
+            "./d8",
+            "--no-liftoff",
+            "--perf-basic-prof",
+            f"--perf-basic-prof-path={DEVICE_PERF_MAP_DIR}",
+            "--module",
+            device_session_path(session, GOLDEN_RUNNER_PATH),
+            "--",
+            candidate_path,
+            "--bench",
+        ]
+        if frame_range is not None:
+            start, last = frame_range
+            d8_args.extend(["--frames", f"{start}:{last}"])
+        d8_args.append(media_path)
+        shell_command = device_profile_shell_command(
+            device, d8_args, pin, result_path, freq, perf_data_path
+        )
+        candidate_result = run_device_shell_json(
+            device, shell_command, pin, "benchmark", result_path
+        )
+        files: list[str] = []
+        samples: int | None = None
+        if candidate_result.get("ok") is True:
+            report_text = run_device_simpleperf_report(device, perf_data_path)
+            samples = profile_report_samples(report_text)
+            write_file_at(dir_fd, "report.txt", report_text.encode("utf-8"))
+            files.append("report.txt")
+            pull_device_file_at(
+                device, perf_data_path, dir_fd, "perf.data", local_candidate_path.parent
+            )
+            files.append("perf.data")
+            files.extend(
+                pull_device_perf_maps(device, dir_fd, local_candidate_path.parent)
+            )
+    except (DeviceError, ValueError) as error:
+        return {"ok": False, "kind": "profile", "target": "device", "serial": device.serial, "error": str(error)}
+
+    ok = candidate_result.get("ok") is True
+    return {
+        "ok": ok,
+        "kind": "profile",
+        "target": "device",
+        "serial": device.serial,
+        "device": {
+            "pin": pin_summary(pin),
+            "run_dir": run_dir,
+            "media": media_path,
+            "freq": freq,
+            "samples": samples,
+            "files": files,
+            # The report file is the deliverable; keep only enough of the
+            # bench result to judge whether the profiled run was healthy.
+            "candidate": profile_candidate_summary(candidate_result) if ok else candidate_result,
+        },
+    }
+
+
+def profile_candidate_summary(candidate_result: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {"ok": candidate_result.get("ok")}
+    report = candidate_result.get("report")
+    if isinstance(report, dict):
+        measurement = report.get("measurement")
+        if isinstance(measurement, dict):
+            summary["measurement"] = {
+                key: measurement.get(key)
+                for key in ("passes", "minPassMs", "msPerFrame", "fps")
+            }
+    stderr = candidate_result.get("stderr")
+    if stderr:
+        summary["stderr"] = stderr
+    telemetry = candidate_result.get("telemetry")
+    if telemetry:
+        summary["telemetry"] = telemetry
+    return summary
+
+
+def run_device_simpleperf_report(device: DeviceContext, perf_data_path: str) -> str:
+    command = " ".join(
+        shlex.quote(arg)
+        for arg in [
+            "simpleperf",
+            "report",
+            "-i",
+            perf_data_path,
+            "--sort",
+            "dso,symbol",
+            "-n",
+            "--percent-limit",
+            "0.1",
+        ]
+    )
+    try:
+        completed = adb_shell_completed(
+            device.serial, command, timeout=PROFILE_REPORT_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired as error:
+        raise DeviceError(
+            f"simpleperf report timed out after {PROFILE_REPORT_TIMEOUT_SECONDS}s"
+        ) from error
+    if completed.returncode != 0:
+        raise DeviceError(f"simpleperf report: {completed.stderr or completed.stdout}".strip())
+    return demangle_profile_report(completed.stdout)
+
+
+PROFILE_SYMBOL = re.compile(r"JS:(?P<mangled>\S+?)-(?P<index>\d+)-turbofan")
+
+
+def demangle_profile_report(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return f"wasm[{match.group('index')}] {demangle_rust(match.group('mangled'))}"
+
+    return PROFILE_SYMBOL.sub(replace, text)
+
+
+def profile_report_samples(text: str) -> int | None:
+    match = re.search(r"^Samples: (\d+)", text, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def list_device_perf_maps(device: DeviceContext) -> list[str]:
+    completed = adb_shell_completed(
+        device.serial, f"ls {DEVICE_PERF_MAP_DIR}/perf-*.map 2>/dev/null"
+    )
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def remove_device_perf_maps(device: DeviceContext) -> None:
+    adb_shell_completed(device.serial, f"rm -f {DEVICE_PERF_MAP_DIR}/perf-*.map")
+
+
+def pull_device_perf_maps(
+    device: DeviceContext, dir_fd: int, work_dir: Path
+) -> list[str]:
+    names: list[str] = []
+    for remote_path in list_device_perf_maps(device):
+        name = PurePosixPath(remote_path).name
+        pull_device_file_at(device, remote_path, dir_fd, name, work_dir)
+        names.append(name)
+    remove_device_perf_maps(device)
+    return names
+
+
+def pull_device_file_at(
+    device: DeviceContext,
+    remote_path: str,
+    dir_fd: int,
+    name: str,
+    work_dir: Path,
+) -> None:
+    local_path = work_dir / name
+    completed = subprocess.run(
+        ["adb", "-s", device.serial, "pull", remote_path, str(local_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise DeviceError(f"adb pull {remote_path}: {completed.stderr or completed.stdout}".strip())
+    write_file_at(dir_fd, name, local_path.read_bytes())
+
+
 def media_from_request(request: dict[str, object]) -> PurePosixPath:
     media = request.get("media")
     if not isinstance(media, str) or media == "":
-        raise ValueError("bench request requires media")
+        raise ValueError("request requires media")
     path = PurePosixPath(media)
     if path.is_absolute() or path == PurePosixPath(".") or ".." in path.parts:
         raise ValueError("media must be a corpus-relative path without '..'")
@@ -1064,9 +1298,20 @@ def run_device_json(
     json_label: str,
     result_path: str,
 ) -> dict[str, object]:
+    shell_command = device_d8_shell_command(device, d8_args, pin, result_path)
+    return run_device_shell_json(device, shell_command, pin, json_label, result_path)
+
+
+def run_device_shell_json(
+    device: DeviceContext,
+    shell_command: str,
+    pin: PinSelection,
+    json_label: str,
+    result_path: str,
+) -> dict[str, object]:
     telemetry: dict[str, object] = {}
     record_telemetry(telemetry, device, pin, "start")
-    result = execute_device_json(device, d8_args, pin, json_label, result_path)
+    result = execute_device_json(device, shell_command, json_label, result_path)
     record_telemetry(telemetry, device, pin, "end")
     if telemetry:
         result["telemetry"] = telemetry
@@ -1133,15 +1378,14 @@ def parse_hal_cpu_temp(text: str) -> float | None:
 
 def execute_device_json(
     device: DeviceContext,
-    d8_args: list[str],
-    pin: PinSelection,
+    shell_command: str,
     json_label: str,
     result_path: str,
 ) -> dict[str, object]:
     try:
         completed = adb_shell_completed(
             device.serial,
-            device_d8_shell_command(device, d8_args, pin, result_path),
+            shell_command,
             timeout=ADB_D8_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired as error:
@@ -1215,10 +1459,47 @@ def device_d8_shell_command(
     pin: PinSelection,
     stdout_path: str,
 ) -> str:
+    return device_timed_shell_command(device, pinned_d8_command(d8_args, pin, stdout_path))
+
+
+def device_profile_shell_command(
+    device: DeviceContext,
+    d8_args: list[str],
+    pin: PinSelection,
+    stdout_path: str,
+    freq: int,
+    perf_data_path: str,
+) -> str:
+    # simpleperf itself stays unpinned; the perf events follow the pinned d8
+    # child, so only the workload competes for the selected CPUs.
+    inner = "exec " + pinned_d8_command(d8_args, pin, stdout_path)
+    record = " ".join(
+        shlex.quote(arg)
+        for arg in [
+            "simpleperf",
+            "record",
+            "-f",
+            str(freq),
+            "-o",
+            perf_data_path,
+            "--",
+            "sh",
+            "-c",
+            inner,
+        ]
+    )
+    return device_timed_shell_command(device, record)
+
+
+def pinned_d8_command(d8_args: list[str], pin: PinSelection, stdout_path: str) -> str:
     command = " ".join(shlex.quote(arg) for arg in d8_args)
     command = f"{command} > {shlex.quote(stdout_path)}"
     if pin.mask is not None:
         command = f"taskset {shlex.quote(pin.mask)} {command}"
+    return command
+
+
+def device_timed_shell_command(device: DeviceContext, command: str) -> str:
     timed_command = f"timeout {DEVICE_D8_TIMEOUT_SECONDS} sh -c {shlex.quote('exec ' + command)}"
     return (
         f"cd {shlex.quote(str(device.root / 'bin'))} && {timed_command}; "

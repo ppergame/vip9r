@@ -80,6 +80,9 @@ Depending on the task, you can verify your work with
   `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST]`,
 - Assembly dump (one file per function):
   `vip9r-perf-submit asm --arch {arm32,arm64,host}`
+- Device hotspot profile (demangled simpleperf report + raw trace in
+  /tmp/vip9r-profiles/):
+  `vip9r-perf-submit --target device profile --media MEDIA [--frames START:LAST]`
 
 Orchestrator will specify correctness and optimization objectives.
 
