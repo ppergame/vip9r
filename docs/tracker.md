@@ -27,7 +27,7 @@ M0 — decode API and the first frame-md5 golden harness.
 Deferrable external inputs for M3 performance work.
 
 - [x] user: root the Pixel 9a
-- [x] user: 720p performance corpus with a held-out clip
+- [x] user: 720p performance corpus
 - [ ] user: collect the ffvp9 performance baseline: static ffmpeg (arm64 +
       armv7) run directly through adb, taskset-pinned, on the realworld 720p
       clips across Pixel 9a core types and the streamer. Deferred by the user

@@ -310,8 +310,7 @@ Each vector has a `.md5` golden.
 - **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset, IVF
   and WebM) plus `chromium/bear-vp9.ivf` as the default IVF smoke target.
 - **Performance:** `realworld/` 720p clips with distinct character (high-motion,
-  film grain, screen content, talking head). Keep at least one held out for
-  review.
+  film grain, screen content, talking head).
 
 ## Open design questions
 
