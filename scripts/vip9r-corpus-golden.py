@@ -16,6 +16,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CORPUS_ROOT = Path("/bulk/vip9r")
+
+# Skipped even under --all: 72k frames of 720p60, ~14% of full-corpus decode
+# cost by frames x pixels, nearly 2x the next-heaviest clip.
+ALL_EXCLUDE = {
+    "youtube/yUsYZ75JSw0/yUsYZ75JSw0-f302-720p60-vp9-rawprefix-0000-2000.webm",
+}
 RUNNER = REPO_ROOT / "js/dist/wasm-driver/golden.js"
 TARGET_DIR = REPO_ROOT / "rust/target/wasm-release"
 WASM = TARGET_DIR / "wasm32-unknown-unknown/release/vip9r.wasm"
@@ -342,6 +348,8 @@ def discover_media(run_all: bool) -> list[Path]:
             sidecar.with_suffix("")
             for sidecar in CORPUS_ROOT.rglob("*.md5")
             if sidecar.with_suffix("").is_file()
+            and str(sidecar.with_suffix("").relative_to(CORPUS_ROOT))
+            not in ALL_EXCLUDE
         ]
     else:
         media = [CORPUS_ROOT / rel for rel in COMPLIANCE]

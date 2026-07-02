@@ -77,6 +77,7 @@ forced a restart after every merge.
 - [ ] cool-start gate in the device-side run script: before a timed run,
       wait up to ~10 s or until the temperature's rate of decrease levels
       off, whichever comes first; record the wait in telemetry
+- [ ] trim full device summary in every perf-submit response
 
 ### M1 — Decode, code-complete (implement campaign)
 

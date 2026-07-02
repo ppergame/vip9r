@@ -32,8 +32,9 @@ requirements.md — suggest changes rather than editing.
 - Spawn `nix run .#grinder -- run temp/task-<slug>.md`. The command prints
   progress updates until the implementor finishes, then prints the final message
   and a sandbox location like `temp/grinder.XXXXXX`.
-  - You can poll the job at the maximum supported interval to monitor the
-    grinder. Running commentary is not required.
+  - Monitor / check up on a new job 2 minutes after starting it.
+  - Poll the job every 10 minutes (or the maximum supported by the tooling if
+    lower) to check its progress. No need for line-by-line running commentary.
 - Known failure: the grinder codex occasionally hangs or emits a malformed
   tool_search call on the first turn. Kill and retry, up to 3 times.
 - Traces are copied to `temp/traces/` automatically; preserve that directory for
