@@ -353,3 +353,20 @@ milestones, and measured optimization results.
   unchanged).
 - Measured on `jellyfish-720p30` frames 0:15, Pixel 9a X4: 143.6 → 77.3
   ms/frame (-46%). Compliance corpus green (307/307, host wall time 61 → 31 s).
+
+## 2026-07-02 — VP9 loop filter precompute and span processing
+
+- Reshaped the loop filter: per-frame strength LUTs (64 levels plus
+  segment/ref/mode lookup), a per-superblock MI decision cache, span
+  processing of up to 8 filter positions sharing one MI's decisions, and a
+  direct-index interior filter path with the clamped per-sample path kept as
+  the frame-edge fallback. The wide filter's per-output window sum became a
+  bit-identical sliding sum.
+- Filter arithmetic is unchanged; all mask/strength/edge special cases
+  (sharpness, ALT_L segments, odd-chroma guards) preserved and covered by
+  targeted goldens plus the compliance corpus (307/307, host wall 31 → 17 s).
+- Measured on `jellyfish-720p30` frames 0:15, Pixel 9a X4: 76.2 → 43.5
+  ms/frame (-43%); `loop_filter_frame` fell from 47% to ~7% of decode
+  cycles. First grinder attempt was lost to the socket-inode harness fault
+  fixed earlier this session; its unvalidated tree was salvaged, validated,
+  and refined by the relaunched session.
