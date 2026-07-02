@@ -552,8 +552,7 @@ def handle_host_job(job: Job) -> dict[str, object]:
         frame_range = frame_range_from_request(request)
     except ValueError as error:
         return {"ok": False, "kind": "bench", "target": "host", "error": str(error)}
-    assert job.baseline_path is not None
-    return handle_host_bench_request(job.baseline_path, job.candidate_path, MEDIA_ROOT / media, frame_range)
+    return handle_host_bench_request(job, MEDIA_ROOT / media, frame_range)
 
 
 def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
@@ -601,22 +600,93 @@ def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
         return {**base, "ok": False, "error": str(error)}
 
 
+# Counterbalanced bench order: baseline, candidate, candidate, baseline. Both
+# sides average the same queue position, so monotone thermal/position drift
+# cancels out of the corrected delta.
+BENCH_RUN_ORDER = ("b1", "c2", "c3", "b4")
+
+
+def bench_run_plan(baseline: object, candidate: object) -> tuple[tuple[str, object], ...]:
+    return (("b1", baseline), ("c2", candidate), ("c3", candidate), ("b4", baseline))
+
+
+def trim_bench_run(result: dict[str, object]) -> dict[str, object]:
+    # Response-side compression only; the run_dir result files keep the full
+    # arrays. Warmup pass times are JIT ramp and carry no signal. Measurement
+    # passMs collapses to quarter means: monotone soak reads as a rising
+    # staircase, a throttle event as a step, and minPassMs/maxPassMs already
+    # carry the extremes.
+    report = result.get("report")
+    if not isinstance(report, dict):
+        return result
+    report = dict(report)
+    warmup = report.get("warmup")
+    if isinstance(warmup, dict):
+        report["warmup"] = {key: value for key, value in warmup.items() if key != "passMs"}
+    measurement = report.get("measurement")
+    if isinstance(measurement, dict) and isinstance(measurement.get("passMs"), list):
+        report["measurement"] = {
+            ("passMsQuarterMeans" if key == "passMs" else key): (
+                quarter_means(value) if key == "passMs" else value
+            )
+            for key, value in measurement.items()
+        }
+    return {**result, "report": report}
+
+
+def quarter_means(values: list[object]) -> list[float] | None:
+    if not values or not all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) for value in values
+    ):
+        return None
+    bounds = [round(index * len(values) / 4) for index in range(5)]
+    chunks = [values[bounds[index] : bounds[index + 1]] for index in range(4)]
+    return [sum(chunk) / len(chunk) for chunk in chunks if chunk]
+
+
+def bench_summary(runs: dict[str, dict[str, object]]) -> dict[str, object] | None:
+    values: dict[str, float] = {}
+    for name in BENCH_RUN_ORDER:
+        result = runs.get(name)
+        report = result.get("report") if isinstance(result, dict) else None
+        measurement = report.get("measurement") if isinstance(report, dict) else None
+        ms = measurement.get("msPerFrame") if isinstance(measurement, dict) else None
+        if not isinstance(ms, (int, float)) or isinstance(ms, bool) or ms <= 0:
+            return None
+        values[name] = float(ms)
+    return {
+        "metric": "measurement.msPerFrame",
+        "ms_per_frame": values,
+        # candidate/baseline - 1: negative is faster.
+        "corrected_delta": (values["c2"] + values["c3"]) / (values["b1"] + values["b4"]) - 1,
+        # Two identical-wasm runs bracket the submission, so this is a
+        # built-in no-op control: deltas comparable to the spread are noise.
+        "baseline_spread": values["b4"] / values["b1"] - 1,
+    }
+
+
 def handle_host_bench_request(
-    baseline_path: Path,
-    candidate_path: Path,
+    job: Job,
     media_path: Path,
     frame_range: tuple[int, int] | None,
 ) -> dict[str, object]:
-    baseline_result = run_host_bench(baseline_path, media_path, frame_range)
-    candidate_result = run_host_bench(candidate_path, media_path, frame_range)
+    assert job.baseline_path is not None
+    runs: dict[str, dict[str, object]] = {}
+    for name, wasm_path in bench_run_plan(job.baseline_path, job.candidate_path):
+        result = run_host_bench(wasm_path, media_path, frame_range)
+        runs[name] = trim_bench_run(result)
+        if result.get("ok") is not True:
+            break
     return {
-        "ok": baseline_result.get("ok") is True and candidate_result.get("ok") is True,
+        "ok": len(runs) == len(BENCH_RUN_ORDER)
+        and all(run.get("ok") is True for run in runs.values()),
         "kind": "bench",
         "target": "host",
         "host": {
             "media": str(media_path),
-            "baseline": baseline_result,
-            "candidate": candidate_result,
+            "no_op_control": job.baseline_sha256 == job.candidate_sha256,
+            "bench": bench_summary(runs),
+            "runs": runs,
         },
     }
 
@@ -782,47 +852,40 @@ def handle_device_bench_request(
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
         run_dir = create_device_run_dir(device, session, "bench")
-        baseline_result_path = str(PurePosixPath(run_dir) / "baseline-result.json")
-        result_path = str(PurePosixPath(run_dir) / "result.json")
         candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
         assert job.baseline_path is not None and job.baseline_sha256 is not None
         baseline_wasm = push_wasm_blob(lane, job.baseline_path, job.baseline_sha256)
-        baseline_result = run_device_bench(
-            device,
-            device_session_path(session, GOLDEN_RUNNER_PATH),
-            baseline_wasm,
-            media_path,
-            frame_range,
-            pin,
-            baseline_result_path,
-        )
-        candidate_result = run_device_bench(
-            device,
-            device_session_path(session, GOLDEN_RUNNER_PATH),
-            candidate_wasm,
-            media_path,
-            frame_range,
-            pin,
-            result_path,
-        )
+        runs: dict[str, dict[str, object]] = {}
+        for name, wasm_path in bench_run_plan(baseline_wasm, candidate_wasm):
+            result = run_device_bench(
+                device,
+                device_session_path(session, GOLDEN_RUNNER_PATH),
+                wasm_path,
+                media_path,
+                frame_range,
+                pin,
+                str(PurePosixPath(run_dir) / f"{name}-result.json"),
+            )
+            runs[name] = trim_bench_run(result)
+            if result.get("ok") is not True:
+                break
     except (DeviceError, ValueError) as error:
         return {**base, "ok": False, "error": str(error)}
 
     return {
         **base,
-        "ok": baseline_result.get("ok") is True and candidate_result.get("ok") is True,
+        "ok": len(runs) == len(BENCH_RUN_ORDER)
+        and all(run.get("ok") is True for run in runs.values()),
         "device_run": {
             "pin": pin_summary(pin),
             "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
-            "result": result_path,
-            "baseline_result": baseline_result_path,
             "baseline_wasm": baseline_wasm,
             "candidate_wasm": candidate_wasm,
             "no_op_control": job.baseline_sha256 == job.candidate_sha256,
-            "baseline": baseline_result,
-            "candidate": candidate_result,
+            "bench": bench_summary(runs),
+            "runs": runs,
         },
     }
 

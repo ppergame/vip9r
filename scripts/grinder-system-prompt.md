@@ -79,6 +79,10 @@ Depending on the task, you can verify your work with
 - `cargo clippy --workspace` -- clippy. wasm32 is the default and only target
 - Full-decode validation and timing against a baseline:
   `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST] [--no-op-control]`,
+  - One submission runs baseline, candidate, candidate, baseline. Read
+    `bench.corrected_delta` (candidate/baseline − 1, negative = faster)
+    against `bench.baseline_spread`, the built-in noise gauge: a delta
+    comparable to the spread is not credible.
   - -no-op-control ignores the baseline wasm and runs the local build against
     itself, to check measurement consistency.
 - Assembly dump (one file per function):

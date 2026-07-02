@@ -57,13 +57,15 @@ Motivated by the 2026-07 scalar campaign: A/B position bias (~2% cool-start,
 ~13% heat-soaked) made sub-5% deltas unjudgeable, and daemon-held baselines
 forced a restart after every merge.
 
-- [ ] counterbalanced bench: one submission runs B, C, C, B so both sides
+- [x] counterbalanced bench: one submission runs B, C, C, B so both sides
       average the same position and monotone thermal drift cancels
-- [ ] position-corrected reporting: response carries the corrected delta
+- [x] position-corrected reporting: response carries the corrected delta
       `mean(C2,C3)/mean(B1,B4) - 1` as the headline number, the four raw
       per-run measurements, and the `B1` vs `B4` spread as a built-in no-op
       control / error-bar signal so callers can tell when a run was too
-      drifty to conclude anything
+      drifty to conclude anything. 2026-07-02: both host and device benches
+      run B1,C2,C3,B4 and report `bench.corrected_delta` /
+      `bench.baseline_spread` over `measurement.msPerFrame`
 - [x] baseline moves from daemon state to request payload: `serve` no longer
       builds a baseline, so merges stop forcing daemon restarts; device
       pushes cached by blob hash
@@ -76,9 +78,6 @@ forced a restart after every merge.
 - [x] grinder spawn script: `grinder run TASK --baseline WASM --device
       INDEX[:PIN]` passes sandbox-wide submit defaults via
       `VIP9R_PERF_BASELINE` / `VIP9R_PERF_DEVICE`
-- [ ] cool-start gate in the device-side run script: before a timed run,
-      wait up to ~10 s or until the temperature's rate of decrease levels
-      off, whichever comes first; record the wait in telemetry
 - [x] trim full device summary in every perf-submit response: responses
       carry index/serial/model; full topology stays in `probe`
 

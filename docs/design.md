@@ -219,13 +219,17 @@ Empirical behavior that shapes the protocol:
   ≤1% with no CPU control at all; back-to-back baseline/candidate runs of
   identical wasm agree within 0.02–0.5%. A/B deltas ≥~2% are credible from a
   single daemon bench run.
-- A/B bench runs execute baseline first, candidate second. Under sustained
-  multi-hour device load (grinder sessions hammering benches/validations
-  back-to-back) the second position read ~13% slow on the X4; a no-op
-  candidate reproduced it, so it is position bias, not a code delta. Under
-  normal cool-start conditions the position penalty is ~2%. When a grinder
-  reports a surprising regression after heavy device use, re-anchor with a
-  no-op control (candidate == baseline) before believing it.
+- A bench submission runs four counterbalanced runs — B1, C2, C3, B4
+  (baseline, candidate, candidate, baseline) — so both sides average the same
+  position and monotone thermal/position drift cancels. The headline number
+  is `bench.corrected_delta` = mean(C2,C3)/mean(B1,B4) − 1 over
+  `measurement.msPerFrame` (negative = candidate faster).
+  `bench.baseline_spread` = B4/B1 − 1 is a built-in no-op control: a delta
+  comparable to the spread is noise, not a result. Motivation: with the old
+  baseline-then-candidate order the second position read ~2% slow cool-start
+  and ~13% slow heat-soaked on the X4 (a no-op candidate reproduced it, so
+  it was position bias, not a code delta). `--no-op-control` remains the
+  explicit way to measure pure harness noise.
 - The Pixel X4 heat-soaks: ~6% ms/frame degradation over 8 minutes of
   continuous decode at 89–94 °C on the BIG sensor, while `scaling_cur_freq`
   reports a constant 3105 MHz and `scaling_max_freq` never clamps. cpufreq
@@ -247,9 +251,13 @@ Empirical behavior that shapes the protocol:
   `scaling_cur_freq` and the HAL temperature (`BIG`, else first CPU-type
   sensor), attached per run as `telemetry.{freq,temp}_{start,end}_*`;
   `temp_start_c` drives the cool-start rule for absolute margins. Bench
-  reports carry per-pass wall times (`passMs`, `minPassMs`, `maxPassMs`) in
-  warmup and measurement — pass drift is the throttle/contention signal that
-  works on both devices. Freq brackets sample outside the run and usually
+  responses carry `minPassMs`/`maxPassMs` plus measurement
+  `passMsQuarterMeans` (mean pass wall time per quarter of the run, in
+  order) — pass drift is the throttle/contention signal that works on both
+  devices: monotone soak reads as a rising staircase, a throttle event as a
+  step. Warmup pass arrays are JIT ramp and are dropped from responses; full
+  raw `passMs` arrays persist in the device run_dir result files. Freq
+  brackets sample outside the run and usually
   show idle governor state; they catch pin/policy mistakes, not throttling.
 - The bench runner's per-pass deadline equals `targetMs` (5 s), and the
   binding pass is the md5 validation pass (md5 overhead ≈ +15% on X4, +60% on
