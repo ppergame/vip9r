@@ -442,3 +442,22 @@ milestones, and measured optimization results.
   (`vip9r-perf-submit`, corpus runner, wasm-tools wrappers) now pin cwd to
   the workspace. Grinder sandboxes were unaffected (they build from
   `/run/rust`), which is why the grinder's numbers were right all along.
+
+## 2026-07-02 — loop filter simd128: measured negative
+
+- Vectorized the span loop filter three ways: full simd128 for both passes
+  (lane masks for hev/mask/flat/flat2, i8-saturating `filter4_clamp`,
+  bitselect blends, load+transpose tiles for vertical edges), a
+  pass-1-only variant, and a final narrowed pass-1 Tx4x4-narrow-only
+  variant with the simd probe gated out of larger-filter dispatch. All
+  bit-exact (85/85 wasm tests incl. a new segment sweep vs the scalar
+  reference across passes, lengths 1..8, sizes, and mask-diverse data).
+  Best case measured −0.6% (jellyfish) / −0.7% (big-buck-bunny) on the X4
+  against spreads of 1.1%/0.8% — inside noise; broader variants were
+  outright slower. Not merged.
+- Why it doesn't pay here: the scalar reshape already amortized decisions
+  over ≤8-position spans, so the simd upside is only the filter
+  arithmetic; pass-0 (vertical edge) needs a gather/transpose per span,
+  and wide filters need many blended variants, both of which cost more
+  than the lanes save under V8. Candidate for a relaxed-simd or
+  multi-thread era retry.
