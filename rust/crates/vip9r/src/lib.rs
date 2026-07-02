@@ -44,7 +44,13 @@ pub fn __vip9r_test_failure(args: core::fmt::Arguments<'_>) {
 }
 
 const REFERENCE_FRAME_SLOTS: usize = 8;
-const FRAME_POOL_SLOTS: usize = 1 + REFERENCE_FRAME_SLOTS;
+// A VP9 frame can keep all eight reference slots live as distinct pictures
+// while decoding a new current frame.  The current frame must be writable and
+// therefore cannot share any of those referenced buffers.  Nine physical frame
+// buffers are consequently both necessary (8 refs + 1 current) and sufficient:
+// refreshing current into any reference slot releases that slot's old buffer
+// before the next frame needs to choose a writable current buffer.
+const FRAME_POOL_BUFFERS: usize = 1 + REFERENCE_FRAME_SLOTS;
 const MODE_HISTORY_SLOTS: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,34 +135,34 @@ impl WorkspaceLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FramePoolLayout {
     frame: FrameLayout,
-    current: ByteRange,
-    references: [ByteRange; REFERENCE_FRAME_SLOTS],
+    buffers: [ByteRange; FRAME_POOL_BUFFERS],
 }
 
 impl FramePoolLayout {
     fn new(frame: FrameLayout) -> Result<Self, DecodeError> {
         let frame_bytes = frame.bytes();
-        let current = ByteRange::new(0, frame_bytes)?;
-        let mut references = [ByteRange::empty(); REFERENCE_FRAME_SLOTS];
-        let mut next_start = current.end()?;
-        for reference in &mut references {
-            *reference = ByteRange::new(next_start, frame_bytes)?;
-            next_start = reference.end()?;
+        let mut buffers = [ByteRange::empty(); FRAME_POOL_BUFFERS];
+        let mut next_start = 0;
+        for buffer in &mut buffers {
+            *buffer = ByteRange::new(next_start, frame_bytes)?;
+            next_start = buffer.end()?;
         }
-        Ok(Self {
-            frame,
-            current,
-            references,
-        })
+        Ok(Self { frame, buffers })
     }
 
     fn total_bytes(self) -> usize {
-        debug_assert_eq!(self.current.start, 0);
-        debug_assert_eq!(self.current.len, self.frame.bytes());
-        debug_assert_eq!(self.references[0].start, self.current.end().unwrap());
-        self.references[REFERENCE_FRAME_SLOTS - 1]
+        debug_assert_eq!(self.buffers[0].start, 0);
+        debug_assert_eq!(self.buffers[0].len, self.frame.bytes());
+        self.buffers[FRAME_POOL_BUFFERS - 1]
             .end()
             .expect("frame-pool layout was checked at construction")
+    }
+
+    fn buffer(self, slot: FramePoolSlot) -> Result<ByteRange, DecodeError> {
+        self.buffers
+            .get(slot.index())
+            .copied()
+            .ok_or(DecodeError::InvalidConfig)
     }
 }
 
@@ -253,7 +259,7 @@ impl FrameLayout {
         let frame = Self { y, u, v };
         frame
             .bytes()
-            .checked_mul(FRAME_POOL_SLOTS)
+            .checked_mul(FRAME_POOL_BUFFERS)
             .ok_or(DecodeError::InvalidConfig)?;
         Ok(frame)
     }
@@ -301,12 +307,13 @@ pub struct DecodeWorkspace<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReconstructionBufferRequest {
+    current_frame_slot: FramePoolSlot,
     frame_width: u32,
     frame_height: u32,
     reference_slots: Option<[InterReferenceSlot; 3]>,
     use_prev_frame_mvs: bool,
-    previous_slot: Option<ModeHistorySlot>,
-    current_slot: ModeHistorySlot,
+    previous_mode_history_slot: Option<ModeHistorySlot>,
+    current_mode_history_slot: ModeHistorySlot,
     mi_count: usize,
 }
 
@@ -329,15 +336,6 @@ impl<'a> DecodeWorkspace<'a> {
         Ok(())
     }
 
-    fn fill_current_default_i420(&mut self) -> Result<(), DecodeError> {
-        let frame_layout = self.layout.frame_pool.frame;
-        let frame = self.frame_slot_mut(FramePoolSlot::Current)?;
-        fill_frame_plane(frame, frame_layout.y, 128)?;
-        fill_frame_plane(frame, frame_layout.u, 128)?;
-        fill_frame_plane(frame, frame_layout.v, 128)?;
-        Ok(())
-    }
-
     fn reconstruction_buffers(
         &mut self,
         request: ReconstructionBufferRequest,
@@ -349,8 +347,6 @@ impl<'a> DecodeWorkspace<'a> {
         ),
         DecodeError,
     > {
-        self.fill_current_default_i420()?;
-
         let frame_pool_layout = self.layout.frame_pool;
         let frame_layout = frame_pool_layout.frame;
         let mode_history = self.layout.mode_history;
@@ -365,12 +361,17 @@ impl<'a> DecodeWorkspace<'a> {
         }
 
         let (frame_pool, history_and_after) = self.memory.split_at_mut(first_history.start);
-        let current = frame_pool_layout.current;
-        let current_end = current.end()?;
-        if current.start != 0 || current_end > frame_pool.len() {
+        let current_range = frame_pool_layout.buffer(request.current_frame_slot)?;
+        let current_end = current_range.end()?;
+        if current_end > frame_pool.len() {
             return Err(DecodeError::InvalidConfig);
         }
-        let (current_frame_bytes, reference_bytes) = frame_pool.split_at_mut(current_end);
+        let (before_current, current_and_after) = frame_pool.split_at_mut(current_range.start);
+        let (current_frame_bytes, after_current) =
+            current_and_after.split_at_mut(current_range.len);
+        fill_frame_plane(current_frame_bytes, frame_layout.y, 128)?;
+        fill_frame_plane(current_frame_bytes, frame_layout.u, 128)?;
+        fill_frame_plane(current_frame_bytes, frame_layout.v, 128)?;
         let current_frame = current_frame_view(
             current_frame_bytes,
             frame_layout,
@@ -379,8 +380,9 @@ impl<'a> DecodeWorkspace<'a> {
         )?;
         let reference_frames = match request.reference_slots {
             Some(reference_slots) => Some(reference_frame_views(
-                reference_bytes,
-                current_end,
+                before_current,
+                after_current,
+                current_range,
                 frame_pool_layout,
                 frame_layout,
                 reference_slots,
@@ -395,36 +397,28 @@ impl<'a> DecodeWorkspace<'a> {
             mode_history,
             history,
             request.use_prev_frame_mvs,
-            request.previous_slot,
-            request.current_slot,
+            request.previous_mode_history_slot,
+            request.current_mode_history_slot,
             request.mi_count,
         )?;
 
         Ok((current_frame, reference_frames, mode_buffers))
     }
 
-    fn refresh_references_from_current(
-        &mut self,
-        refresh_frame_flags: u8,
-    ) -> Result<(), DecodeError> {
-        for index in 0..REFERENCE_FRAME_SLOTS {
-            if refresh_frame_flags & (1u8 << index) != 0 {
-                self.copy_current_to_reference(index)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn current_i420_frame(&self, info: FrameInfo) -> Result<I420Frame<'_>, DecodeError> {
-        self.i420_frame(FramePoolSlot::Current, info)
+    fn current_i420_frame(
+        &self,
+        slot: FramePoolSlot,
+        info: FrameInfo,
+    ) -> Result<I420Frame<'_>, DecodeError> {
+        self.i420_frame(slot, info)
     }
 
     fn reference_i420_frame(
         &self,
-        index: usize,
+        slot: FramePoolSlot,
         info: FrameInfo,
     ) -> Result<I420Frame<'_>, DecodeError> {
-        self.i420_frame(FramePoolSlot::Reference(index), info)
+        self.i420_frame(slot, info)
     }
 
     fn i420_frame(
@@ -462,58 +456,11 @@ impl<'a> DecodeWorkspace<'a> {
     }
 
     fn frame_slot(&self, slot: FramePoolSlot) -> Result<&[u8], DecodeError> {
-        let range = self.frame_slot_range(slot)?;
+        let range = self.layout.frame_pool.buffer(slot)?;
         let end = range.end()?;
         self.memory
             .get(range.start..end)
             .ok_or(DecodeError::InvalidConfig)
-    }
-
-    fn frame_slot_mut(&mut self, slot: FramePoolSlot) -> Result<&mut [u8], DecodeError> {
-        let range = self.frame_slot_range(slot)?;
-        let end = range.end()?;
-        self.memory
-            .get_mut(range.start..end)
-            .ok_or(DecodeError::InvalidConfig)
-    }
-
-    fn frame_slot_range(&self, slot: FramePoolSlot) -> Result<ByteRange, DecodeError> {
-        match slot {
-            FramePoolSlot::Current => Ok(self.layout.frame_pool.current),
-            FramePoolSlot::Reference(index) => self
-                .layout
-                .frame_pool
-                .references
-                .get(index)
-                .copied()
-                .ok_or(DecodeError::InvalidBitstream),
-        }
-    }
-
-    fn copy_current_to_reference(&mut self, index: usize) -> Result<(), DecodeError> {
-        let current = self.layout.frame_pool.current;
-        let reference = self
-            .layout
-            .frame_pool
-            .references
-            .get(index)
-            .copied()
-            .ok_or(DecodeError::InvalidBitstream)?;
-        let current_end = current.end()?;
-        let reference_end = reference.end()?;
-        if current_end > reference.start || reference_end > self.memory.len() {
-            return Err(DecodeError::InvalidConfig);
-        }
-
-        let (before_reference, reference_and_after) = self.memory.split_at_mut(reference.start);
-        let current_frame = before_reference
-            .get(current.start..current_end)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let reference_frame = reference_and_after
-            .get_mut(..reference.len)
-            .ok_or(DecodeError::InvalidConfig)?;
-        reference_frame.copy_from_slice(current_frame);
-        Ok(())
     }
 
     fn mode_history_buffers_from_slice<'b>(
@@ -595,9 +542,89 @@ impl<'a> DecodeWorkspace<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FramePoolSlot {
-    Current,
-    Reference(usize),
+struct FramePoolSlot(usize);
+
+impl FramePoolSlot {
+    const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    const fn index(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FramePoolSlots {
+    current: FramePoolSlot,
+    references: [FramePoolSlot; REFERENCE_FRAME_SLOTS],
+}
+
+impl FramePoolSlots {
+    const fn new() -> Self {
+        Self {
+            current: FramePoolSlot::new(0),
+            references: [
+                FramePoolSlot::new(1),
+                FramePoolSlot::new(2),
+                FramePoolSlot::new(3),
+                FramePoolSlot::new(4),
+                FramePoolSlot::new(5),
+                FramePoolSlot::new(6),
+                FramePoolSlot::new(7),
+                FramePoolSlot::new(8),
+            ],
+        }
+    }
+
+    fn current_for_reconstruction(self) -> Result<FramePoolSlot, DecodeError> {
+        if !self.is_referenced(self.current) {
+            return Ok(self.current);
+        }
+
+        for index in 0..FRAME_POOL_BUFFERS {
+            let slot = FramePoolSlot::new(index);
+            if !self.is_referenced(slot) {
+                return Ok(slot);
+            }
+        }
+
+        Err(DecodeError::InvalidConfig)
+    }
+
+    fn set_current_for_reconstruction(
+        &mut self,
+        current: FramePoolSlot,
+    ) -> Result<(), DecodeError> {
+        if current.index() >= FRAME_POOL_BUFFERS || self.is_referenced(current) {
+            return Err(DecodeError::InvalidConfig);
+        }
+        self.current = current;
+        Ok(())
+    }
+
+    fn refresh_references_from_current(
+        &mut self,
+        refresh_frame_flags: u8,
+    ) -> Result<(), DecodeError> {
+        for (index, reference) in self.references.iter_mut().enumerate() {
+            if refresh_frame_flags & (1u8 << index) != 0 {
+                *reference = self.current;
+            }
+        }
+        Ok(())
+    }
+
+    fn reference(self, index: usize) -> Result<FramePoolSlot, DecodeError> {
+        self.references
+            .get(index)
+            .copied()
+            .ok_or(DecodeError::InvalidBitstream)
+    }
+
+    fn is_referenced(self, slot: FramePoolSlot) -> bool {
+        self.references.contains(&slot)
+    }
 }
 
 fn fill_frame_plane(frame: &mut [u8], layout: PlaneLayout, value: u8) -> Result<(), DecodeError> {
@@ -656,29 +683,18 @@ fn current_frame_view(
 }
 
 fn reference_frame_views<'a>(
-    reference_bytes: &'a [u8],
-    reference_base: usize,
+    before_current: &'a [u8],
+    after_current: &'a [u8],
+    current_range: ByteRange,
     frame_pool_layout: FramePoolLayout,
     frame_layout: FrameLayout,
     reference_slots: [InterReferenceSlot; 3],
 ) -> Result<ReferenceFrames<'a>, DecodeError> {
     let mut frames = [None; 4];
     for (logical_index, reference_slot) in reference_slots.into_iter().enumerate() {
-        let range = frame_pool_layout
-            .references
-            .get(reference_slot.slot_index)
-            .copied()
-            .ok_or(DecodeError::InvalidBitstream)?;
-        let start = range
-            .start
-            .checked_sub(reference_base)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let end = start
-            .checked_add(range.len)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let frame = reference_bytes
-            .get(start..end)
-            .ok_or(DecodeError::InvalidConfig)?;
+        let range = frame_pool_layout.buffer(reference_slot.frame_pool_slot)?;
+        let frame =
+            frame_pool_reference_slice(before_current, after_current, current_range, range)?;
         frames[logical_index + 1] = Some(reference_frame_view(
             frame,
             frame_layout,
@@ -688,6 +704,37 @@ fn reference_frame_views<'a>(
     }
 
     Ok(ReferenceFrames::new(frames))
+}
+
+fn frame_pool_reference_slice<'a>(
+    before_current: &'a [u8],
+    after_current: &'a [u8],
+    current_range: ByteRange,
+    reference_range: ByteRange,
+) -> Result<&'a [u8], DecodeError> {
+    let reference_end = reference_range.end()?;
+    let current_end = current_range.end()?;
+
+    if reference_end <= current_range.start {
+        return before_current
+            .get(reference_range.start..reference_end)
+            .ok_or(DecodeError::InvalidConfig);
+    }
+
+    if reference_range.start >= current_end {
+        let start = reference_range
+            .start
+            .checked_sub(current_end)
+            .ok_or(DecodeError::InvalidConfig)?;
+        let end = start
+            .checked_add(reference_range.len)
+            .ok_or(DecodeError::InvalidConfig)?;
+        return after_current
+            .get(start..end)
+            .ok_or(DecodeError::InvalidConfig);
+    }
+
+    Err(DecodeError::InvalidConfig)
 }
 
 fn reference_frame_view(
@@ -849,6 +896,7 @@ pub struct Decoder {
     header_state: HeaderParserState,
     probability_state: ProbabilityState,
     syntax_counts: SyntaxCounts,
+    frame_pool_slots: FramePoolSlots,
     reference_frames: [Option<ReferenceSlotInfo>; REFERENCE_FRAME_SLOTS],
     next_output_frame_index: u64,
     last_frame_type: header::FrameType,
@@ -887,7 +935,7 @@ impl ReferenceSlotInfo {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InterReferenceSlot {
-    slot_index: usize,
+    frame_pool_slot: FramePoolSlot,
     info: ReferenceSlotInfo,
 }
 
@@ -896,6 +944,7 @@ struct PreviousFrameForMvs {
     width: u32,
     height: u32,
     show_frame: bool,
+    frame_pool_slot: FramePoolSlot,
     mode_history_slot: ModeHistorySlot,
 }
 
@@ -906,6 +955,7 @@ impl Decoder {
             header_state: HeaderParserState::new(),
             probability_state: ProbabilityState::new(),
             syntax_counts: SyntaxCounts::default(),
+            frame_pool_slots: FramePoolSlots::new(),
             reference_frames: [None; REFERENCE_FRAME_SLOTS],
             next_output_frame_index: 0,
             last_frame_type: header::FrameType::Key,
@@ -983,21 +1033,23 @@ impl Decoder {
         // segmentation maps persist across hidden frames too.  Keep the
         // previous mode grid available for segment-id prediction independently
         // from MV reuse.
-        let previous_slot = self.previous_mode_history_slot(&header);
-        let current_slot = self
+        let previous_mode_history_slot = self.previous_mode_history_slot(&header);
+        let current_mode_history_slot = self
             .previous_frame_for_mvs
             .map(|previous| previous.mode_history_slot.other())
             .unwrap_or(ModeHistorySlot::Slot0);
+        let current_frame_slot = self.frame_pool_slots.current_for_reconstruction()?;
         let reference_slots = self.inter_reference_slots(&header)?;
         {
             let (mut current_frame, reference_frames, mode_buffers) = workspace
                 .reconstruction_buffers(ReconstructionBufferRequest {
+                    current_frame_slot,
                     frame_width: header.frame_width,
                     frame_height: header.frame_height,
                     reference_slots,
                     use_prev_frame_mvs: previous_slot_for_mvs.is_some(),
-                    previous_slot,
-                    current_slot,
+                    previous_mode_history_slot,
+                    current_mode_history_slot,
                     mi_count,
                 })?;
 
@@ -1037,7 +1089,10 @@ impl Decoder {
         self.refresh_probability_state(&header, &compressed_header)?;
 
         let current_reference = ReferenceSlotInfo::from_header(&header);
-        workspace.refresh_references_from_current(header.refresh_frame_flags)?;
+        self.frame_pool_slots
+            .set_current_for_reconstruction(current_frame_slot)?;
+        self.frame_pool_slots
+            .refresh_references_from_current(header.refresh_frame_flags)?;
         self.refresh_reference_info(header.refresh_frame_flags, current_reference);
         self.header_state = parsed_header_state;
         self.header_state.update_references(&header);
@@ -1046,7 +1101,8 @@ impl Decoder {
             width: header.frame_width,
             height: header.frame_height,
             show_frame: header.show_frame,
-            mode_history_slot: current_slot,
+            frame_pool_slot: current_frame_slot,
+            mode_history_slot: current_mode_history_slot,
         });
 
         if header.show_frame {
@@ -1069,7 +1125,7 @@ impl Decoder {
         reference: ReferenceSlotInfo,
     ) -> Result<DecodeOutcome<'w>, DecodeError> {
         let (info, next_output_frame_index) = self.next_output_frame_info(reference)?;
-        let frame = workspace.current_i420_frame(info)?;
+        let frame = workspace.current_i420_frame(self.frame_pool_slots.current, info)?;
         self.next_output_frame_index = next_output_frame_index;
         Ok(DecodeOutcome::Output(frame))
     }
@@ -1081,7 +1137,8 @@ impl Decoder {
         reference: ReferenceSlotInfo,
     ) -> Result<DecodeOutcome<'w>, DecodeError> {
         let (info, next_output_frame_index) = self.next_output_frame_info(reference)?;
-        let frame = workspace.reference_i420_frame(index, info)?;
+        let frame =
+            workspace.reference_i420_frame(self.frame_pool_slots.reference(index)?, info)?;
         self.next_output_frame_index = next_output_frame_index;
         Ok(DecodeOutcome::Output(frame))
     }
@@ -1121,6 +1178,7 @@ impl Decoder {
             return None;
         }
         let previous = self.previous_frame_for_mvs?;
+        debug_assert!(previous.frame_pool_slot.index() < FRAME_POOL_BUFFERS);
         (previous.width == header.frame_width
             && previous.height == header.frame_height
             && previous.show_frame)
@@ -1148,7 +1206,7 @@ impl Decoder {
         }
 
         let mut slots = [InterReferenceSlot {
-            slot_index: 0,
+            frame_pool_slot: FramePoolSlot::new(0),
             info: ReferenceSlotInfo {
                 visible_width: 0,
                 visible_height: 0,
@@ -1164,7 +1222,10 @@ impl Decoder {
                 .get(slot_index)
                 .and_then(|reference| *reference)
                 .ok_or(DecodeError::InvalidBitstream)?;
-            *slot = InterReferenceSlot { slot_index, info };
+            *slot = InterReferenceSlot {
+                frame_pool_slot: self.frame_pool_slots.reference(slot_index)?,
+                info,
+            };
         }
 
         Ok(Some(slots))
@@ -1315,11 +1376,11 @@ mod tests {
             layout.total_bytes(),
             frame_pool_bytes + 2 * mode_history_slot_bytes
         );
-        assert_eq!(layout.frame_pool.current.start, 0);
-        assert_eq!(layout.frame_pool.current.len, 16 * 16 * 3 / 2);
-        assert_eq!(layout.frame_pool.references[0].start, 16 * 16 * 3 / 2);
+        assert_eq!(layout.frame_pool.buffers[0].start, 0);
+        assert_eq!(layout.frame_pool.buffers[0].len, 16 * 16 * 3 / 2);
+        assert_eq!(layout.frame_pool.buffers[1].start, 16 * 16 * 3 / 2);
         assert_eq!(
-            layout.frame_pool.references[7].end().unwrap(),
+            layout.frame_pool.buffers[8].end().unwrap(),
             frame_pool_bytes
         );
         assert_eq!(layout.mode_history.slots[0].start, frame_pool_bytes);
@@ -1355,10 +1416,37 @@ mod tests {
         assert_eq!(layout.frame_pool.frame.y.shape, PlaneShape::new(24, 16, 24));
         assert_eq!(layout.frame_pool.frame.u.shape, PlaneShape::new(12, 8, 12));
         assert_eq!(layout.frame_pool.frame.v.shape, PlaneShape::new(12, 8, 12));
-        assert_eq!(layout.frame_pool.current.len, frame_bytes);
+        assert_eq!(layout.frame_pool.buffers[0].len, frame_bytes);
         assert_eq!(
             layout.total_bytes(),
             frame_bytes * 9 + 2 * mode_history_slot_bytes
+        );
+    }
+
+    #[test]
+    fn frame_pool_slots_refresh_by_aliasing_and_choose_free_current() {
+        let mut slots = super::FramePoolSlots::new();
+
+        slots.refresh_references_from_current(1 << 3).unwrap();
+        assert_eq!(slots.references[3], super::FramePoolSlot::new(0));
+        assert_eq!(
+            slots.current_for_reconstruction().unwrap(),
+            super::FramePoolSlot::new(4)
+        );
+
+        slots
+            .set_current_for_reconstruction(super::FramePoolSlot::new(4))
+            .unwrap();
+        slots.refresh_references_from_current(0xff).unwrap();
+        assert!(
+            slots
+                .references
+                .iter()
+                .all(|&slot| slot == super::FramePoolSlot::new(4))
+        );
+        assert_eq!(
+            slots.current_for_reconstruction().unwrap(),
+            super::FramePoolSlot::new(0)
         );
     }
 

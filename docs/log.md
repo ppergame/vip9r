@@ -479,3 +479,22 @@ milestones, and measured optimization results.
   → 17.5 ms/frame, spread 1.1%); A55 0:5 −9.6% (233 → 211, spread 0.2%).
   Grinder cross-check big-buck-bunny −5.1%. simd-vs-scalar wasm test
   sweep across sizes/types/sparsity patterns; compliance corpus 307/307.
+
+## 2026-07-02 — reference slot remap
+
+- Reference refresh is now a slot-table write instead of a full-frame
+  copy: the frame pool is 9 equal physical buffers plus a decoder-owned
+  map of {current, ref 0..7} → buffer. 9 buffers are necessary (8 live
+  refs + writable current) and sufficient (refreshing current into a ref
+  frees that ref's old buffer). Refs may alias one buffer; current is
+  never referenced by construction, and the ref table only advances after
+  a successful decode. This also drops the old "current precedes all
+  references" layout constraint.
+- Measured on the A55 (the memory-bound target): −0.40% jellyfish /
+  −0.33% big-buck-bunny with no-op anchors of similar magnitude — at the
+  noise line, as the tracker's ~1-2% X4 headroom estimate predicted. A
+  ~1.4 MB memcpy per refreshed slot is simply small against a 211 ms A55
+  frame. Merged anyway: consistent positive direction on both clips, and
+  the indirection is the structure the threads milestone needs (no copy
+  serialization), with alias/free-selection unit tests and the
+  resize/svc/skip vectors green. Compliance corpus 307/307.
