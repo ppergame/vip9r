@@ -30,7 +30,7 @@ requirements.md — suggest changes rather than editing.
 
 - Write a task file `temp/task-<slug>.md`.
 - Spawn
-  `nix run .#grinder -- run temp/task-<slug>.md [--baseline WASM] [--device INDEX:PIN]`.
+  `nix run .#grinder -- run temp/task-<slug>.md --baseline WASM [--device INDEX:PIN]`.
   The command prints progress updates until the implementor finishes, then
   prints the final message and a sandbox location like `temp/grinder.XXXXXX`.
   - Monitor / check up on a new job 2 minutes after starting it.

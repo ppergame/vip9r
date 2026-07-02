@@ -270,8 +270,8 @@ stays serialized. Submissions address a device by index (`--device N`, or
 `VIP9R_PERF_DEVICE` inside grinder sandboxes) and state the CPU pin per
 request; timed kinds (bench, microbench, profile) require an explicit pin,
 validate/tests default to `any`. Bench submissions carry their own baseline
-wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE` (set inside grinder
-sandboxes by `grinder run --baseline`) — or say `--no-op-control` to A/B the
+wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE` (always set inside grinder
+sandboxes; `grinder run` requires `--baseline`) — or say `--no-op-control` to A/B the
 candidate against itself for a harness-noise reading. There are no quiet
 fallbacks: a device request without an index or a bench without a stated
 baseline is an error. The daemon holds no baseline state, so merges do not

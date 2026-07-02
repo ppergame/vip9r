@@ -77,19 +77,21 @@ Depending on the task, you can verify your work with
   `vip9r-perf-submit [--target device] microbench --slot N` for an ad-hoc
   `vip9r_bench_run(slot, inner_iters)` export
 - `cargo clippy --workspace` -- clippy. wasm32 is the default and only target
-- Full-decode validation and timing:
-  `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST]`,
+- Full-decode validation and timing against a baseline:
+  `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST] [--no-op-control]`,
+  - -no-op-control ignores the baseline wasm and runs the local build against
+    itself, to check measurement consistency.
 - Assembly dump (one file per function):
   `vip9r-perf-submit asm --arch {arm32,arm64,host}`
 - Device hotspot profile (demangled simpleperf report + raw trace in
   /tmp/vip9r-profiles/):
   `vip9r-perf-submit --target device profile --media MEDIA [--frames START:LAST]`
 
-Orchestrator will specify correctness and optimization objectives, whether
-device testing is requested. It will also env defaults for baseline wasm file
-and device selection. In any case, consider using host (`--target host`, the
-default) to preflight correctness / quickly filter multiple potential
-approaches.
+Orchestrator will specify correctness and optimization objectives, and whether
+device testing is requested. The orchestrator sets env defaults for baseline
+wasm and device selection, if device testing is required. In any case, consider
+using host (`--target host`, the default) to preflight correctness / quickly
+filter multiple potential approaches.
 
 ## Monitoring updates
 

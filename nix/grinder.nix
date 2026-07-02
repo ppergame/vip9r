@@ -94,7 +94,7 @@ in
       usage() {
         printf '%s\n' \
           'usage:' \
-          '  grinder run TASK_FILE [--baseline WASM] [--device INDEX:PIN]' \
+          '  grinder run TASK_FILE --baseline WASM [--device INDEX:PIN]' \
           '  grinder shell [COMMAND...]' \
           '  grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]' >&2
       }
@@ -146,6 +146,13 @@ in
                 ;;
             esac
           done
+          # The modal task benches; a run without a stated baseline is an
+          # orchestrator mistake best caught at spawn, not mid-session.
+          if [[ -z "$baseline_file" ]]; then
+            echo "grinder: run requires --baseline WASM" >&2
+            usage
+            exit 2
+          fi
           ;;
         shell)
           command=("''${@}")
