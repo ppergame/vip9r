@@ -19,6 +19,9 @@ mod tables;
 use residual::{DequantizedCoefficients, FrameDequant, TransformCoefficients};
 use tables::*;
 
+#[cfg(target_arch = "wasm32")]
+use core::arch::wasm32::*;
+
 // Above contexts are column-indexed, not frame-MI indexed. This fixed storage
 // covers the local VP9 large-scaling frontier: the largest expected frame is
 // 20400px wide (2550 MI columns), rounded up to 2560 entries for 64x64
@@ -2719,6 +2722,72 @@ fn inter_predict_subpel_unscaled_block(
     write_vertical_filtered_block(plane, request, y_filter, &buffer)
 }
 
+#[allow(dead_code)]
+#[inline(never)]
+fn inter_predict_subpel_unscaled_block_scalar(
+    reference: ReferencePlane<'_>,
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+    x_filter: &[i16; INTERP_TAPS],
+    y_filter: &[i16; INTERP_TAPS],
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    let source_left = request
+        .src_x
+        .checked_sub(3)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_top = request
+        .src_y
+        .checked_sub(3)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_width = context
+        .width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_height = context
+        .height
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let mut buffer = [0u8; MAX_INTERP_BUFFER];
+
+    if reference_rect_inside(
+        reference,
+        source_left,
+        source_top,
+        source_width,
+        source_height,
+    )? {
+        let left = usize::try_from(source_left).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let top = usize::try_from(source_top).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_reference_rect_scalar(
+            reference,
+            (left, top),
+            (context.width, source_height),
+            request.x_phase,
+            x_filter,
+            &mut buffer,
+        )?;
+    } else {
+        gather_clamped_reference_rect(
+            reference,
+            source_left,
+            source_top,
+            source_width,
+            source_height,
+            &mut buffer,
+        )?;
+        horizontal_filter_buffer_in_place_scalar(
+            context.width,
+            source_height,
+            request.x_phase,
+            x_filter,
+            &mut buffer,
+        )?;
+    }
+
+    write_vertical_filtered_block_scalar(plane, request, y_filter, &buffer)
+}
+
 fn reference_rect_inside(
     reference: ReferencePlane<'_>,
     left: i32,
@@ -2831,6 +2900,48 @@ fn horizontal_filter_reference_rect(
     Ok(())
 }
 
+#[allow(dead_code)]
+fn horizontal_filter_reference_rect_scalar(
+    reference: ReferencePlane<'_>,
+    origin: (usize, usize),
+    size: (usize, usize),
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &mut [u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let (left, top) = origin;
+    let (width, height) = size;
+    let source_width = width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    for row in 0..height {
+        let src_start = top
+            .checked_add(row)
+            .and_then(|y| y.checked_mul(reference.stride))
+            .and_then(|base| base.checked_add(left))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let src_end = src_start
+            .checked_add(source_width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let src = reference
+            .data
+            .get(src_start..src_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_end = dst_start
+            .checked_add(width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst = buffer
+            .get_mut(dst_start..dst_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_row_to_buffer_scalar(src, width, x_phase, filter, dst);
+    }
+
+    Ok(())
+}
+
 fn horizontal_filter_buffer_in_place(
     width: usize,
     height: usize,
@@ -2857,6 +2968,33 @@ fn horizontal_filter_buffer_in_place(
     Ok(())
 }
 
+#[allow(dead_code)]
+fn horizontal_filter_buffer_in_place_scalar(
+    width: usize,
+    height: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &mut [u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let source_width = width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    for row in 0..height {
+        let row_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let row_end = row_start
+            .checked_add(source_width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let source_row = buffer
+            .get_mut(row_start..row_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_row_in_place_scalar(source_row, width, x_phase, filter);
+    }
+
+    Ok(())
+}
+
 #[inline(always)]
 fn horizontal_filter_row_to_buffer(
     src: &[u8],
@@ -2870,6 +3008,41 @@ fn horizontal_filter_row_to_buffer(
         return;
     }
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let scalar_start = horizontal_filter_row_to_buffer_simd(src, width, filter, dst);
+        horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, scalar_start, width);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, 0, width);
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn horizontal_filter_row_to_buffer_scalar(
+    src: &[u8],
+    width: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    dst: &mut [u8],
+) {
+    if x_phase == 0 {
+        dst.copy_from_slice(&src[3..3 + width]);
+        return;
+    }
+
+    horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, 0, width);
+}
+
+#[inline(always)]
+fn horizontal_filter_row_to_buffer_scalar_nonzero(
+    src: &[u8],
+    filter: &[i16; INTERP_TAPS],
+    dst: &mut [u8],
+    start: usize,
+    end: usize,
+) {
     let c0 = i32::from(filter[0]);
     let c1 = i32::from(filter[1]);
     let c2 = i32::from(filter[2]);
@@ -2879,7 +3052,7 @@ fn horizontal_filter_row_to_buffer(
     let c6 = i32::from(filter[6]);
     let c7 = i32::from(filter[7]);
 
-    for col in 0..width {
+    for col in start..end {
         let sum = c0 * i32::from(src[col])
             + c1 * i32::from(src[col + 1])
             + c2 * i32::from(src[col + 2])
@@ -2904,6 +3077,39 @@ fn horizontal_filter_row_in_place(
         return;
     }
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let scalar_start = horizontal_filter_row_in_place_simd(row, width, filter);
+        horizontal_filter_row_in_place_scalar_nonzero(row, filter, scalar_start, width);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    horizontal_filter_row_in_place_scalar_nonzero(row, filter, 0, width);
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn horizontal_filter_row_in_place_scalar(
+    row: &mut [u8],
+    width: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+) {
+    if x_phase == 0 {
+        row.copy_within(3..3 + width, 0);
+        return;
+    }
+
+    horizontal_filter_row_in_place_scalar_nonzero(row, filter, 0, width);
+}
+
+#[inline(always)]
+fn horizontal_filter_row_in_place_scalar_nonzero(
+    row: &mut [u8],
+    filter: &[i16; INTERP_TAPS],
+    start: usize,
+    end: usize,
+) {
     let c0 = i32::from(filter[0]);
     let c1 = i32::from(filter[1]);
     let c2 = i32::from(filter[2]);
@@ -2913,7 +3119,7 @@ fn horizontal_filter_row_in_place(
     let c6 = i32::from(filter[6]);
     let c7 = i32::from(filter[7]);
 
-    for col in 0..width {
+    for col in start..end {
         let sum = c0 * i32::from(row[col])
             + c1 * i32::from(row[col + 1])
             + c2 * i32::from(row[col + 2])
@@ -2927,6 +3133,22 @@ fn horizontal_filter_row_in_place(
 }
 
 fn write_vertical_filtered_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &[u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        write_vertical_filtered_block_simd(plane, request, filter, buffer)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    write_vertical_filtered_block_scalar(plane, request, filter, buffer)
+}
+
+#[allow(dead_code)]
+fn write_vertical_filtered_block_scalar(
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
     filter: &[i16; INTERP_TAPS],
@@ -2976,39 +3198,459 @@ fn write_vertical_filtered_block(
             .checked_mul(MAX_INTERP_SOURCE_DIM)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
 
-        match request.write {
-            InterPredictionWrite::Store => {
-                for (col, dst_sample) in dst.iter_mut().enumerate() {
-                    let base = row_start + col;
-                    let sum = c0 * i32::from(buffer[base])
-                        + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
-                        + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
-                        + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
-                        + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
-                        + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
-                        + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
-                        + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
-                    *dst_sample = clip1(round2_i32(sum, 7));
-                }
-            }
-            InterPredictionWrite::Average => {
-                for (col, dst_sample) in dst.iter_mut().enumerate() {
-                    let base = row_start + col;
-                    let sum = c0 * i32::from(buffer[base])
-                        + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
-                        + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
-                        + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
-                        + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
-                        + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
-                        + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
-                        + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
-                    *dst_sample = avg2(*dst_sample, clip1(round2_i32(sum, 7)));
-                }
-            }
-        }
+        vertical_filter_row_scalar(
+            buffer,
+            row_start,
+            (c0, c1, c2, c3, c4, c5, c6, c7),
+            dst,
+            request.write,
+            0,
+        );
     }
 
     Ok(())
+}
+
+#[inline(always)]
+fn vertical_filter_row_scalar(
+    buffer: &[u8; MAX_INTERP_BUFFER],
+    row_start: usize,
+    filter: (i32, i32, i32, i32, i32, i32, i32, i32),
+    dst: &mut [u8],
+    write: InterPredictionWrite,
+    start_col: usize,
+) {
+    let (c0, c1, c2, c3, c4, c5, c6, c7) = filter;
+    match write {
+        InterPredictionWrite::Store => {
+            for (col, dst_sample) in dst.iter_mut().enumerate().skip(start_col) {
+                let base = row_start + col;
+                let sum = c0 * i32::from(buffer[base])
+                    + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
+                    + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
+                    + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
+                    + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
+                    + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
+                    + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
+                    + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
+                *dst_sample = clip1(round2_i32(sum, 7));
+            }
+        }
+        InterPredictionWrite::Average => {
+            for (col, dst_sample) in dst.iter_mut().enumerate().skip(start_col) {
+                let base = row_start + col;
+                let sum = c0 * i32::from(buffer[base])
+                    + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
+                    + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
+                    + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
+                    + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
+                    + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
+                    + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
+                    + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
+                *dst_sample = avg2(*dst_sample, clip1(round2_i32(sum, 7)));
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct WasmInterpCoefficients {
+    c0: v128,
+    c1: v128,
+    c2: v128,
+    c3: v128,
+    c4: v128,
+    c5: v128,
+    c6: v128,
+    c7: v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmInterpCoefficients {
+    #[inline(always)]
+    fn new(filter: &[i16; INTERP_TAPS]) -> Self {
+        Self {
+            c0: i32x4_splat(i32::from(filter[0])),
+            c1: i32x4_splat(i32::from(filter[1])),
+            c2: i32x4_splat(i32::from(filter[2])),
+            c3: i32x4_splat(i32::from(filter[3])),
+            c4: i32x4_splat(i32::from(filter[4])),
+            c5: i32x4_splat(i32::from(filter[5])),
+            c6: i32x4_splat(i32::from(filter[6])),
+            c7: i32x4_splat(i32::from(filter[7])),
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn horizontal_filter_row_to_buffer_simd(
+    src: &[u8],
+    width: usize,
+    filter: &[i16; INTERP_TAPS],
+    dst: &mut [u8],
+) -> usize {
+    debug_assert!(src.len() >= width + INTERP_TAPS - 1);
+    debug_assert!(dst.len() >= width);
+
+    let coeffs = WasmInterpCoefficients::new(filter);
+    let mut col = 0;
+    while col + 8 <= width {
+        let prediction = horizontal_filter_8(src.as_ptr().wrapping_add(col), coeffs);
+        unsafe {
+            v128_store64_lane::<0>(prediction, dst.as_mut_ptr().wrapping_add(col).cast::<u64>());
+        }
+        col += 8;
+    }
+    if col + 4 <= width {
+        let prediction = horizontal_filter_4(src.as_ptr().wrapping_add(col), coeffs);
+        unsafe {
+            v128_store32_lane::<0>(prediction, dst.as_mut_ptr().wrapping_add(col).cast::<u32>());
+        }
+        col += 4;
+    }
+    col
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn horizontal_filter_row_in_place_simd(
+    row: &mut [u8],
+    width: usize,
+    filter: &[i16; INTERP_TAPS],
+) -> usize {
+    debug_assert!(row.len() >= width + INTERP_TAPS - 1);
+
+    let coeffs = WasmInterpCoefficients::new(filter);
+    let src = row.as_ptr();
+    let dst = row.as_mut_ptr();
+    let mut col = 0;
+    while col + 8 <= width {
+        let prediction = horizontal_filter_8(src.wrapping_add(col), coeffs);
+        unsafe {
+            v128_store64_lane::<0>(prediction, dst.wrapping_add(col).cast::<u64>());
+        }
+        col += 8;
+    }
+    if col + 4 <= width {
+        let prediction = horizontal_filter_4(src.wrapping_add(col), coeffs);
+        unsafe {
+            v128_store32_lane::<0>(prediction, dst.wrapping_add(col).cast::<u32>());
+        }
+        col += 4;
+    }
+    col
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn write_vertical_filtered_block_simd(
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &[u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    if request.y_phase == 0 {
+        for row in 0..context.height {
+            let prediction_start = row
+                .checked_add(3)
+                .and_then(|y| y.checked_mul(MAX_INTERP_SOURCE_DIM))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let prediction_end = prediction_start
+                .checked_add(context.width)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let prediction = buffer
+                .get(prediction_start..prediction_end)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let dst_y = context
+                .start_y
+                .checked_add(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            write_inter_prediction_row_simd(
+                plane,
+                context.start_x,
+                dst_y,
+                prediction,
+                request.write,
+            )?;
+        }
+        return Ok(());
+    }
+
+    let coeffs = WasmInterpCoefficients::new(filter);
+    let scalar_filter = (
+        i32::from(filter[0]),
+        i32::from(filter[1]),
+        i32::from(filter[2]),
+        i32::from(filter[3]),
+        i32::from(filter[4]),
+        i32::from(filter[5]),
+        i32::from(filter[6]),
+        i32::from(filter[7]),
+    );
+
+    for row in 0..context.height {
+        let dst_y = context
+            .start_y
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let Some(dst) = inter_prediction_row_mut(plane, context.start_x, dst_y, context.width)?
+        else {
+            continue;
+        };
+        let row_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+        let scalar_start = vertical_filter_row_simd(
+            buffer.as_ptr().wrapping_add(row_start),
+            coeffs,
+            dst,
+            request.write,
+        );
+        vertical_filter_row_scalar(
+            buffer,
+            row_start,
+            scalar_filter,
+            dst,
+            request.write,
+            scalar_start,
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn vertical_filter_row_simd(
+    src: *const u8,
+    coeffs: WasmInterpCoefficients,
+    dst: &mut [u8],
+    write: InterPredictionWrite,
+) -> usize {
+    let mut col = 0;
+    while col + 8 <= dst.len() {
+        let prediction = vertical_filter_8(src.wrapping_add(col), coeffs);
+        let dst_ptr = dst.as_mut_ptr().wrapping_add(col);
+        match write {
+            InterPredictionWrite::Store => unsafe {
+                v128_store64_lane::<0>(prediction, dst_ptr.cast::<u64>());
+            },
+            InterPredictionWrite::Average => average_prediction_8(dst_ptr, prediction),
+        }
+        col += 8;
+    }
+    if col + 4 <= dst.len() {
+        let prediction = vertical_filter_4(src.wrapping_add(col), coeffs);
+        let dst_ptr = dst.as_mut_ptr().wrapping_add(col);
+        match write {
+            InterPredictionWrite::Store => unsafe {
+                v128_store32_lane::<0>(prediction, dst_ptr.cast::<u32>());
+            },
+            InterPredictionWrite::Average => average_prediction_4(dst_ptr, prediction),
+        }
+        col += 4;
+    }
+    col
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn write_inter_prediction_row_simd(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: usize,
+    y: usize,
+    prediction: &[u8],
+    write: InterPredictionWrite,
+) -> Result<(), TileSyntaxError> {
+    let Some(dst) = inter_prediction_row_mut(plane, x, y, prediction.len())? else {
+        return Ok(());
+    };
+
+    match write {
+        InterPredictionWrite::Store => dst.copy_from_slice(&prediction[..dst.len()]),
+        InterPredictionWrite::Average => average_prediction_row_simd(dst, prediction),
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn average_prediction_row_simd(dst: &mut [u8], prediction: &[u8]) {
+    debug_assert!(prediction.len() >= dst.len());
+
+    let mut col = 0;
+    while col + 16 <= dst.len() {
+        let dst_ptr = dst.as_mut_ptr().wrapping_add(col);
+        let pred_ptr = prediction.as_ptr().wrapping_add(col);
+        unsafe {
+            let dst_values = v128_load(dst_ptr.cast::<v128>());
+            let pred_values = v128_load(pred_ptr.cast::<v128>());
+            v128_store(dst_ptr.cast::<v128>(), u8x16_avgr(dst_values, pred_values));
+        }
+        col += 16;
+    }
+    while col + 8 <= dst.len() {
+        let prediction =
+            unsafe { v128_load64_zero(prediction.as_ptr().wrapping_add(col).cast::<u64>()) };
+        average_prediction_8(dst.as_mut_ptr().wrapping_add(col), prediction);
+        col += 8;
+    }
+    if col + 4 <= dst.len() {
+        let prediction =
+            unsafe { v128_load32_zero(prediction.as_ptr().wrapping_add(col).cast::<u32>()) };
+        average_prediction_4(dst.as_mut_ptr().wrapping_add(col), prediction);
+        col += 4;
+    }
+    for (dst, &prediction) in dst[col..].iter_mut().zip(prediction[col..].iter()) {
+        *dst = avg2(*dst, prediction);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn average_prediction_8(dst: *mut u8, prediction: v128) {
+    unsafe {
+        let dst_values = v128_load64_zero(dst.cast::<u64>());
+        let average = u8x16_avgr(dst_values, prediction);
+        v128_store64_lane::<0>(average, dst.cast::<u64>());
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn average_prediction_4(dst: *mut u8, prediction: v128) {
+    unsafe {
+        let dst_values = v128_load32_zero(dst.cast::<u32>());
+        let average = u8x16_avgr(dst_values, prediction);
+        v128_store32_lane::<0>(average, dst.cast::<u32>());
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn horizontal_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
+    let mut lo = i32x4_splat(0);
+    let mut hi = i32x4_splat(0);
+
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 0), coeffs.c0);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 1), coeffs.c1);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 2), coeffs.c2);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 3), coeffs.c3);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 4), coeffs.c4);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 5), coeffs.c5);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 6), coeffs.c6);
+    accumulate_u8x8(&mut lo, &mut hi, load_u8x8(src, 7), coeffs.c7);
+
+    round_shift_pack_u8(lo, hi)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn horizontal_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
+    let mut sum = i32x4_splat(0);
+
+    accumulate_u8x4(&mut sum, load_u8x4(src, 0), coeffs.c0);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 1), coeffs.c1);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 2), coeffs.c2);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 3), coeffs.c3);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 4), coeffs.c4);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 5), coeffs.c5);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 6), coeffs.c6);
+    accumulate_u8x4(&mut sum, load_u8x4(src, 7), coeffs.c7);
+
+    round_shift_pack_u8(sum, i32x4_splat(0))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn vertical_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
+    let mut lo = i32x4_splat(0);
+    let mut hi = i32x4_splat(0);
+
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 0), coeffs.c0);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 1), coeffs.c1);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 2), coeffs.c2);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 3), coeffs.c3);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 4), coeffs.c4);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 5), coeffs.c5);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 6), coeffs.c6);
+    accumulate_u8x8(&mut lo, &mut hi, load_vertical_u8x8(src, 7), coeffs.c7);
+
+    round_shift_pack_u8(lo, hi)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn vertical_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
+    let mut sum = i32x4_splat(0);
+
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 0), coeffs.c0);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 1), coeffs.c1);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 2), coeffs.c2);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 3), coeffs.c3);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 4), coeffs.c4);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 5), coeffs.c5);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 6), coeffs.c6);
+    accumulate_u8x4(&mut sum, load_vertical_u8x4(src, 7), coeffs.c7);
+
+    round_shift_pack_u8(sum, i32x4_splat(0))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_u8x8(src: *const u8, offset: usize) -> v128 {
+    unsafe { v128_load64_zero(src.wrapping_add(offset).cast::<u64>()) }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_u8x4(src: *const u8, offset: usize) -> v128 {
+    unsafe { v128_load32_zero(src.wrapping_add(offset).cast::<u32>()) }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_vertical_u8x8(src: *const u8, tap: usize) -> v128 {
+    load_u8x8(src, tap * MAX_INTERP_SOURCE_DIM)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_vertical_u8x4(src: *const u8, tap: usize) -> v128 {
+    load_u8x4(src, tap * MAX_INTERP_SOURCE_DIM)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn accumulate_u8x8(lo: &mut v128, hi: &mut v128, samples: v128, coeff: v128) {
+    let samples = i16x8_extend_low_u8x16(samples);
+    let sample_lo = i32x4_extend_low_i16x8(samples);
+    let sample_hi = i32x4_extend_high_i16x8(samples);
+    *lo = i32x4_add(*lo, i32x4_mul(sample_lo, coeff));
+    *hi = i32x4_add(*hi, i32x4_mul(sample_hi, coeff));
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn accumulate_u8x4(sum: &mut v128, samples: v128, coeff: v128) {
+    let samples = i16x8_extend_low_u8x16(samples);
+    let samples = i32x4_extend_low_i16x8(samples);
+    *sum = i32x4_add(*sum, i32x4_mul(samples, coeff));
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_shift_pack_u8(lo: v128, hi: v128) -> v128 {
+    let rounding = i32x4_splat(1 << 6);
+    let lo = i32x4_shr(i32x4_add(lo, rounding), 7);
+    let hi = i32x4_shr(i32x4_add(hi, rounding), 7);
+    let packed_i16 = i16x8_narrow_i32x4(lo, hi);
+    u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
 }
 
 fn write_inter_prediction_row(
@@ -6960,19 +7602,134 @@ mod tests {
     use super::residual::{FrameDequant, TransformCoefficients};
     use super::{
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
-        GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, IntraMode, IntraPredictionEdges,
-        IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH,
-        ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
-        REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, STORED_MODE_INFO_BYTES,
-        SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
-        TileParseBuffers, TileParser, TxSize, TxType, ZEROMV, add_residual_block,
-        inter_predict_sample, intra_predict_block, parse_intra_tiles, read_coef, select_inter_mv,
+        GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, InterPredictionWrite, IntraMode,
+        IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS,
+        MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
+        NeighborModeInfo, REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane,
+        STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
+        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
+        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
+        ZEROMV, add_residual_block, inter_predict_sample, inter_predict_subpel_unscaled_block,
+        inter_predict_subpel_unscaled_block_scalar, intra_predict_block, parse_intra_tiles,
+        read_coef, select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
     use crate::header::{FrameType, LoopFilterParams, UncompressedFrameHeader};
     use crate::probability::{FrameContext, SyntaxCounts};
     use crate::tile::parse_tile_layout;
+
+    #[test]
+    fn simd_subpel_convolution_matches_scalar_reference() -> Result<(), TileSyntaxError> {
+        const REFERENCE_STRIDE: usize = 96;
+        const REFERENCE_HEIGHT: usize = 96;
+        const PLANE_STRIDE: usize = 80;
+        const PLANE_HEIGHT: usize = 80;
+        const WIDTHS: [usize; 5] = [4, 8, 16, 32, 64];
+        const HEIGHTS: [usize; 3] = [4, 8, 16];
+        const FILTER_BANKS: [usize; 3] = [0, 1, 2];
+        const SOURCE_ORIGINS: [(i32, i32); 2] = [(11, 9), (1, 2)];
+
+        let mut seed = 0x1234_5678u32;
+        let mut reference_data = [0u8; REFERENCE_STRIDE * REFERENCE_HEIGHT];
+        let mut initial_plane = [0u8; PLANE_STRIDE * PLANE_HEIGHT];
+        fill_pseudorandom(&mut reference_data, &mut seed);
+        fill_pseudorandom(&mut initial_plane, &mut seed);
+
+        let reference = ReferencePlane {
+            data: &reference_data,
+            width: REFERENCE_STRIDE,
+            height: REFERENCE_HEIGHT,
+            stride: REFERENCE_STRIDE,
+        };
+        let block = test_block(false);
+
+        for filter_index in FILTER_BANKS {
+            for x_phase in 0..SUBPEL_SHIFTS as usize {
+                for y_phase in 0..SUBPEL_SHIFTS as usize {
+                    let x_filter = &SUBPEL_FILTERS[filter_index][x_phase];
+                    let y_filter = &SUBPEL_FILTERS[filter_index][y_phase];
+                    for (origin_index, (src_x, src_y)) in SOURCE_ORIGINS.into_iter().enumerate() {
+                        for width in WIDTHS {
+                            for height in HEIGHTS {
+                                for write in
+                                    [InterPredictionWrite::Store, InterPredictionWrite::Average]
+                                {
+                                    let context = InterPredictionContext {
+                                        plane: 0,
+                                        mi_row: 0,
+                                        mi_col: 0,
+                                        start_x: 5,
+                                        start_y: 7,
+                                        width,
+                                        height,
+                                        block_idx: 0,
+                                        mi_size: BlockSize::Block8x8,
+                                        block,
+                                    };
+                                    let request = UnscaledInterPrediction {
+                                        src_x,
+                                        src_y,
+                                        x_phase,
+                                        y_phase,
+                                        context,
+                                        write,
+                                    };
+                                    let mut scalar_data = initial_plane;
+                                    let mut simd_data = initial_plane;
+                                    let mut scalar_plane = CurrentPlaneMut {
+                                        data: &mut scalar_data,
+                                        width: PLANE_STRIDE,
+                                        height: PLANE_HEIGHT,
+                                        stride: PLANE_STRIDE,
+                                    };
+                                    let mut simd_plane = CurrentPlaneMut {
+                                        data: &mut simd_data,
+                                        width: PLANE_STRIDE,
+                                        height: PLANE_HEIGHT,
+                                        stride: PLANE_STRIDE,
+                                    };
+
+                                    inter_predict_subpel_unscaled_block_scalar(
+                                        reference,
+                                        &mut scalar_plane,
+                                        request,
+                                        x_filter,
+                                        y_filter,
+                                    )?;
+                                    inter_predict_subpel_unscaled_block(
+                                        reference,
+                                        &mut simd_plane,
+                                        request,
+                                        x_filter,
+                                        y_filter,
+                                    )?;
+
+                                    if scalar_data != simd_data {
+                                        let mismatch = scalar_data
+                                            .iter()
+                                            .zip(simd_data.iter())
+                                            .position(|(scalar, simd)| scalar != simd)
+                                            .expect("mismatch exists");
+                                        panic!(
+                                            "SIMD subpel mismatch: filter={filter_index} \
+                                             x_phase={x_phase} y_phase={y_phase} width={width} \
+                                             height={height} write={write:?} \
+                                             origin={origin_index} index={mismatch} \
+                                             scalar={} simd={}",
+                                            scalar_data[mismatch], simd_data[mismatch]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 
     #[test]
     fn dc_prediction_covers_neighbor_availability_cases() {
@@ -7931,6 +8688,13 @@ mod tests {
             "prediction was {:?}",
             &pred[..request.size * request.size]
         );
+    }
+
+    fn fill_pseudorandom(data: &mut [u8], seed: &mut u32) {
+        for byte in data {
+            *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (*seed >> 24) as u8;
+        }
     }
 
     fn test_header(segmentation_enabled: bool) -> UncompressedFrameHeader {

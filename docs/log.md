@@ -417,3 +417,28 @@ milestones, and measured optimization results.
   that measured worse: fully unrolled token tree, precomputed
   neighbor-context tables, direct coefficient writes, small-token coef
   fast path. Compliance corpus green (307/307).
+
+## 2026-07-02 — simd128 subpel convolution + harness cargo-config fix
+
+- First kernel of the simd128 campaign: the 8-tap subpel convolution
+  (h-pass to-buffer and in-place, v-pass Store/Average, phase-0 Average
+  rows) now runs on `core::arch::wasm32` lanes — per-tap u8→i32 widening
+  multiply-accumulate, `(sum+64)>>7` on i32 lanes, saturating narrow
+  reproducing `clip1`/`avg2` bit-exactly. Scalar kernels retained as the
+  test reference and odd-width tails. An exhaustive wasm unit sweep (3
+  filter banks × 16×16 phase pairs × widths 4-64 × Store/Average × interior
+  and edge-clamped gathers) checks simd-vs-scalar equality on device and
+  host; compliance corpus green (307/307).
+- Measured with position-corrected A/B vs the pre-simd baseline,
+  `jellyfish-720p30`: Pixel 9a X4 frames 0:15 −16.7% (23.8 → 20.1
+  ms/frame, spread 2.8%); A55 streamer frames 0:5 −14.5% (272 → 233
+  ms/frame, spread 0.2%). Grinder cross-check on `big-buck-bunny-720p25`
+  −19.0%.
+- Merge validation initially measured the "same" build 2.8x *slower* —
+  root cause: cargo resolves `.cargo/config.toml` from the invoking cwd,
+  not `--manifest-path`, so harness builds launched outside `rust/`
+  silently dropped `target-feature=+simd128` and compiled every simd
+  intrinsic as an outlined call. All harness cargo invocations
+  (`vip9r-perf-submit`, corpus runner, wasm-tools wrappers) now pin cwd to
+  the workspace. Grinder sandboxes were unaffected (they build from
+  `/run/rust`), which is why the grinder's numbers were right all along.

@@ -214,12 +214,19 @@ kernel per grinder task, sequential (everything touches `tile_syntax/mod.rs`);
 reorder on refreshed profiles. Starting X4 profile (jellyfish 0:15, 23.1
 ms/frame): inter subpel 33%, decode_block 30%, loop filter 15%, IDCT 7%.
 
-- [ ] pass 0: post-reshape attribution on X4 *and* A55 (A55 profile predates
-      all five scalar merges and decides whether loop filter outranks
-      convolution there); confirm the token-loop `--all` corpus run from
-      session end finished green
-- [ ] inter subpel convolution simd — two-pass separable structure is
-      already lane-shaped (i16 intermediates); expected largest single delta
+- [x] pass 0: post-reshape attribution on X4 *and* A55. 2026-07-02: X4
+      jellyfish 0:15 at 23.2 ms/frame — subpel 33% / decode_block 31% /
+      loop_filter 15% / IDCT 6%; A55 0:5 at 275 ms/frame — subpel 24% /
+      decode_block 24% / loop_filter 9% / IDCT 6% (+ ~19% d8/libc). Loop
+      filter no longer outranks convolution on the A55; tracker order
+      holds on both devices. `--all` corpus rerun green (337/337; 338
+      sidecars minus one excluded yt raw-prefix clip)
+- [x] inter subpel convolution simd — per-tap widening MAC on i32 lanes,
+      saturating narrow; scalar kept as test reference/tails. X4 −16.7%
+      (23.8 → 20.1 ms/frame), A55 −14.5% (272 → 233). Exposed and fixed a
+      harness hole: cargo builds outside `rust/` dropped
+      `.cargo/config.toml` target features; harness cargo invocations now
+      pin cwd to the workspace
 - [ ] loop filter simd — spans/LUT reshape already batches up to 8
       positions; vertical-edge transpose is the review risk
 - [ ] IDCT simd — scalar butterflies use i64 products for exactness; a simd
