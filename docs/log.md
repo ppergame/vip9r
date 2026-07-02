@@ -340,3 +340,16 @@ milestones, and measured optimization results.
   loops, as expected. The flag is now part of the baseline
   (`rust/.cargo/config.toml`) so later hand-written kernel deltas are not
   confounded with the flag; compliance corpus green with the flag (307/307).
+
+## 2026-07-02 — VP9 inter prediction two-pass convolution
+
+- Reshaped unscaled inter prediction from per-sample nested 8-tap filtering
+  (64 MACs/pixel with per-sample clamped access and checked math) into a
+  block-level two-pass separable convolution: constant per-block filter
+  phase, horizontal pass into a local intermediate buffer, straight-line
+  vertical pass, integer-MV block copy, and edge clamping hoisted to a
+  per-block clamped gather. Scaled references keep the spec-literal
+  per-sample path. Output is bit-exact (u8 intermediate math composition
+  unchanged).
+- Measured on `jellyfish-720p30` frames 0:15, Pixel 9a X4: 143.6 → 77.3
+  ms/frame (-46%). Compliance corpus green (307/307, host wall time 61 → 31 s).

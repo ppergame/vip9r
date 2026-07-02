@@ -59,6 +59,10 @@ const INTER_MODE_CONTEXTS_U8: u8 = 7;
 const MV_BORDER: i32 = 128;
 const BORDERINPIXELS: i32 = 160;
 const INTERP_EXTEND: i32 = 4;
+const INTERP_TAPS: usize = 8;
+const MAX_INTER_PRED_SIZE: usize = 64;
+const MAX_INTERP_SOURCE_DIM: usize = MAX_INTER_PRED_SIZE + INTERP_TAPS - 1;
+const MAX_INTERP_BUFFER: usize = MAX_INTERP_SOURCE_DIM * MAX_INTERP_SOURCE_DIM;
 const SUBPEL_BITS: u8 = 4;
 const SUBPEL_SHIFTS: i32 = 1 << SUBPEL_BITS;
 const SUBPEL_MASK: i32 = SUBPEL_SHIFTS - 1;
@@ -2206,6 +2210,31 @@ impl TileParser<'_, '_, '_> {
         }
 
         let plane = current_frame.plane_mut(context.plane)?;
+        let unscaled = scaled[..ref_count]
+            .iter()
+            .all(|motion| motion.step_x == SUBPEL_SHIFTS && motion.step_y == SUBPEL_SHIFTS);
+        if unscaled {
+            inter_predict_unscaled_block(
+                refs[0].ok_or(TileSyntaxError::InvalidBitstream)?,
+                scaled[0],
+                interp_filter,
+                plane,
+                context,
+                InterPredictionWrite::Store,
+            )?;
+            if is_compound {
+                inter_predict_unscaled_block(
+                    refs[1].ok_or(TileSyntaxError::InvalidBitstream)?,
+                    scaled[1],
+                    interp_filter,
+                    plane,
+                    context,
+                    InterPredictionWrite::Average,
+                )?;
+            }
+            return Ok(());
+        }
+
         for row in 0..context.height {
             let y = context
                 .start_y
@@ -2559,6 +2588,549 @@ fn round_mv_comp_q4(value: i32) -> i32 {
     } else {
         (value + 2) / 4
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterPredictionWrite {
+    Store,
+    Average,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnscaledInterPrediction {
+    src_x: i32,
+    src_y: i32,
+    x_phase: usize,
+    y_phase: usize,
+    context: InterPredictionContext,
+    write: InterPredictionWrite,
+}
+
+#[inline(never)]
+fn inter_predict_unscaled_block(
+    reference: ReferencePlane<'_>,
+    scaled: ScaledMotion,
+    interp_filter: usize,
+    plane: &mut CurrentPlaneMut<'_>,
+    context: InterPredictionContext,
+    write: InterPredictionWrite,
+) -> Result<(), TileSyntaxError> {
+    if context.width == 0
+        || context.height == 0
+        || context.width > MAX_INTER_PRED_SIZE
+        || context.height > MAX_INTER_PRED_SIZE
+    {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let request = UnscaledInterPrediction {
+        src_x: scaled.start_x >> SUBPEL_BITS,
+        src_y: scaled.start_y >> SUBPEL_BITS,
+        x_phase: usize::try_from(scaled.start_x & SUBPEL_MASK)
+            .map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        y_phase: usize::try_from(scaled.start_y & SUBPEL_MASK)
+            .map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        context,
+        write,
+    };
+
+    if request.x_phase == 0 && request.y_phase == 0 {
+        return inter_predict_integer_unscaled_block(reference, plane, request);
+    }
+
+    let x_filter = SUBPEL_FILTERS
+        .get(interp_filter)
+        .and_then(|filters| filters.get(request.x_phase))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let y_filter = SUBPEL_FILTERS
+        .get(interp_filter)
+        .and_then(|filters| filters.get(request.y_phase))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+    inter_predict_subpel_unscaled_block(reference, plane, request, x_filter, y_filter)
+}
+
+#[inline(never)]
+fn inter_predict_integer_unscaled_block(
+    reference: ReferencePlane<'_>,
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    if reference_rect_inside(
+        reference,
+        request.src_x,
+        request.src_y,
+        context.width,
+        context.height,
+    )? {
+        let src_x =
+            usize::try_from(request.src_x).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let src_y =
+            usize::try_from(request.src_y).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        for row in 0..context.height {
+            let src_start = src_y
+                .checked_add(row)
+                .and_then(|y| y.checked_mul(reference.stride))
+                .and_then(|base| base.checked_add(src_x))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let src_end = src_start
+                .checked_add(context.width)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let prediction = reference
+                .data
+                .get(src_start..src_end)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let dst_y = context
+                .start_y
+                .checked_add(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            write_inter_prediction_row(plane, context.start_x, dst_y, prediction, request.write)?;
+        }
+        return Ok(());
+    }
+
+    inter_predict_integer_edge_block(reference, plane, request)
+}
+
+#[inline(never)]
+fn inter_predict_integer_edge_block(
+    reference: ReferencePlane<'_>,
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    let mut buffer = [0u8; MAX_INTERP_BUFFER];
+    gather_clamped_reference_rect(
+        reference,
+        request.src_x,
+        request.src_y,
+        context.width,
+        context.height,
+        &mut buffer,
+    )?;
+
+    for row in 0..context.height {
+        let offset = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let prediction = buffer
+            .get(offset..offset + context.width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_y = context
+            .start_y
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        write_inter_prediction_row(plane, context.start_x, dst_y, prediction, request.write)?;
+    }
+
+    Ok(())
+}
+
+#[inline(never)]
+fn inter_predict_subpel_unscaled_block(
+    reference: ReferencePlane<'_>,
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+    x_filter: &[i16; INTERP_TAPS],
+    y_filter: &[i16; INTERP_TAPS],
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    let source_left = request
+        .src_x
+        .checked_sub(3)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_top = request
+        .src_y
+        .checked_sub(3)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_width = context
+        .width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let source_height = context
+        .height
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let mut buffer = [0u8; MAX_INTERP_BUFFER];
+
+    if reference_rect_inside(
+        reference,
+        source_left,
+        source_top,
+        source_width,
+        source_height,
+    )? {
+        let left = usize::try_from(source_left).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let top = usize::try_from(source_top).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_reference_rect(
+            reference,
+            (left, top),
+            (context.width, source_height),
+            request.x_phase,
+            x_filter,
+            &mut buffer,
+        )?;
+    } else {
+        gather_clamped_reference_rect(
+            reference,
+            source_left,
+            source_top,
+            source_width,
+            source_height,
+            &mut buffer,
+        )?;
+        horizontal_filter_buffer_in_place(
+            context.width,
+            source_height,
+            request.x_phase,
+            x_filter,
+            &mut buffer,
+        )?;
+    }
+
+    write_vertical_filtered_block(plane, request, y_filter, &buffer)
+}
+
+fn reference_rect_inside(
+    reference: ReferencePlane<'_>,
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+) -> Result<bool, TileSyntaxError> {
+    let right = i64::from(left)
+        .checked_add(i64::try_from(width).map_err(|_| TileSyntaxError::InvalidBitstream)?)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let bottom = i64::from(top)
+        .checked_add(i64::try_from(height).map_err(|_| TileSyntaxError::InvalidBitstream)?)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let reference_width =
+        i64::try_from(reference.width).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let reference_height =
+        i64::try_from(reference.height).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+
+    Ok(left >= 0 && top >= 0 && right <= reference_width && bottom <= reference_height)
+}
+
+fn gather_clamped_reference_rect(
+    reference: ReferencePlane<'_>,
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
+    buffer: &mut [u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let last_x =
+        i32::try_from(reference.width - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let last_y =
+        i32::try_from(reference.height - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+
+    for row in 0..height {
+        let src_y = usize::try_from(clip3(
+            0,
+            last_y,
+            top.checked_add(i32::try_from(row).map_err(|_| TileSyntaxError::InvalidBitstream)?)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        ))
+        .map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let src_row = src_y
+            .checked_mul(reference.stride)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_row = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for col in 0..width {
+            let src_x = usize::try_from(clip3(
+                0,
+                last_x,
+                left.checked_add(
+                    i32::try_from(col).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+                )
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            ))
+            .map_err(|_| TileSyntaxError::InvalidBitstream)?;
+            let sample_index = src_row
+                .checked_add(src_x)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            buffer[dst_row + col] = *reference
+                .data
+                .get(sample_index)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn horizontal_filter_reference_rect(
+    reference: ReferencePlane<'_>,
+    origin: (usize, usize),
+    size: (usize, usize),
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &mut [u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let (left, top) = origin;
+    let (width, height) = size;
+    let source_width = width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    for row in 0..height {
+        let src_start = top
+            .checked_add(row)
+            .and_then(|y| y.checked_mul(reference.stride))
+            .and_then(|base| base.checked_add(left))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let src_end = src_start
+            .checked_add(source_width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let src = reference
+            .data
+            .get(src_start..src_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_end = dst_start
+            .checked_add(width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst = buffer
+            .get_mut(dst_start..dst_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_row_to_buffer(src, width, x_phase, filter, dst);
+    }
+
+    Ok(())
+}
+
+fn horizontal_filter_buffer_in_place(
+    width: usize,
+    height: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &mut [u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let source_width = width
+        .checked_add(INTERP_TAPS - 1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    for row in 0..height {
+        let row_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let row_end = row_start
+            .checked_add(source_width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let source_row = buffer
+            .get_mut(row_start..row_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        horizontal_filter_row_in_place(source_row, width, x_phase, filter);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+fn horizontal_filter_row_to_buffer(
+    src: &[u8],
+    width: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+    dst: &mut [u8],
+) {
+    if x_phase == 0 {
+        dst.copy_from_slice(&src[3..3 + width]);
+        return;
+    }
+
+    let c0 = i32::from(filter[0]);
+    let c1 = i32::from(filter[1]);
+    let c2 = i32::from(filter[2]);
+    let c3 = i32::from(filter[3]);
+    let c4 = i32::from(filter[4]);
+    let c5 = i32::from(filter[5]);
+    let c6 = i32::from(filter[6]);
+    let c7 = i32::from(filter[7]);
+
+    for col in 0..width {
+        let sum = c0 * i32::from(src[col])
+            + c1 * i32::from(src[col + 1])
+            + c2 * i32::from(src[col + 2])
+            + c3 * i32::from(src[col + 3])
+            + c4 * i32::from(src[col + 4])
+            + c5 * i32::from(src[col + 5])
+            + c6 * i32::from(src[col + 6])
+            + c7 * i32::from(src[col + 7]);
+        dst[col] = clip1(round2_i32(sum, 7));
+    }
+}
+
+#[inline(always)]
+fn horizontal_filter_row_in_place(
+    row: &mut [u8],
+    width: usize,
+    x_phase: usize,
+    filter: &[i16; INTERP_TAPS],
+) {
+    if x_phase == 0 {
+        row.copy_within(3..3 + width, 0);
+        return;
+    }
+
+    let c0 = i32::from(filter[0]);
+    let c1 = i32::from(filter[1]);
+    let c2 = i32::from(filter[2]);
+    let c3 = i32::from(filter[3]);
+    let c4 = i32::from(filter[4]);
+    let c5 = i32::from(filter[5]);
+    let c6 = i32::from(filter[6]);
+    let c7 = i32::from(filter[7]);
+
+    for col in 0..width {
+        let sum = c0 * i32::from(row[col])
+            + c1 * i32::from(row[col + 1])
+            + c2 * i32::from(row[col + 2])
+            + c3 * i32::from(row[col + 3])
+            + c4 * i32::from(row[col + 4])
+            + c5 * i32::from(row[col + 5])
+            + c6 * i32::from(row[col + 6])
+            + c7 * i32::from(row[col + 7]);
+        row[col] = clip1(round2_i32(sum, 7));
+    }
+}
+
+fn write_vertical_filtered_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    request: UnscaledInterPrediction,
+    filter: &[i16; INTERP_TAPS],
+    buffer: &[u8; MAX_INTERP_BUFFER],
+) -> Result<(), TileSyntaxError> {
+    let context = request.context;
+    if request.y_phase == 0 {
+        for row in 0..context.height {
+            let prediction_start = row
+                .checked_add(3)
+                .and_then(|y| y.checked_mul(MAX_INTERP_SOURCE_DIM))
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let prediction_end = prediction_start
+                .checked_add(context.width)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let prediction = buffer
+                .get(prediction_start..prediction_end)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            let dst_y = context
+                .start_y
+                .checked_add(row)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            write_inter_prediction_row(plane, context.start_x, dst_y, prediction, request.write)?;
+        }
+        return Ok(());
+    }
+
+    let c0 = i32::from(filter[0]);
+    let c1 = i32::from(filter[1]);
+    let c2 = i32::from(filter[2]);
+    let c3 = i32::from(filter[3]);
+    let c4 = i32::from(filter[4]);
+    let c5 = i32::from(filter[5]);
+    let c6 = i32::from(filter[6]);
+    let c7 = i32::from(filter[7]);
+
+    for row in 0..context.height {
+        let dst_y = context
+            .start_y
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let Some(dst) = inter_prediction_row_mut(plane, context.start_x, dst_y, context.width)?
+        else {
+            continue;
+        };
+        let row_start = row
+            .checked_mul(MAX_INTERP_SOURCE_DIM)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+        match request.write {
+            InterPredictionWrite::Store => {
+                for (col, dst_sample) in dst.iter_mut().enumerate() {
+                    let base = row_start + col;
+                    let sum = c0 * i32::from(buffer[base])
+                        + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
+                        + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
+                        + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
+                        + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
+                        + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
+                        + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
+                        + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
+                    *dst_sample = clip1(round2_i32(sum, 7));
+                }
+            }
+            InterPredictionWrite::Average => {
+                for (col, dst_sample) in dst.iter_mut().enumerate() {
+                    let base = row_start + col;
+                    let sum = c0 * i32::from(buffer[base])
+                        + c1 * i32::from(buffer[base + MAX_INTERP_SOURCE_DIM])
+                        + c2 * i32::from(buffer[base + 2 * MAX_INTERP_SOURCE_DIM])
+                        + c3 * i32::from(buffer[base + 3 * MAX_INTERP_SOURCE_DIM])
+                        + c4 * i32::from(buffer[base + 4 * MAX_INTERP_SOURCE_DIM])
+                        + c5 * i32::from(buffer[base + 5 * MAX_INTERP_SOURCE_DIM])
+                        + c6 * i32::from(buffer[base + 6 * MAX_INTERP_SOURCE_DIM])
+                        + c7 * i32::from(buffer[base + 7 * MAX_INTERP_SOURCE_DIM]);
+                    *dst_sample = avg2(*dst_sample, clip1(round2_i32(sum, 7)));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_inter_prediction_row(
+    plane: &mut CurrentPlaneMut<'_>,
+    x: usize,
+    y: usize,
+    prediction: &[u8],
+    write: InterPredictionWrite,
+) -> Result<(), TileSyntaxError> {
+    let Some(dst) = inter_prediction_row_mut(plane, x, y, prediction.len())? else {
+        return Ok(());
+    };
+
+    match write {
+        InterPredictionWrite::Store => dst.copy_from_slice(&prediction[..dst.len()]),
+        InterPredictionWrite::Average => {
+            for (dst, &prediction) in dst.iter_mut().zip(prediction.iter()) {
+                *dst = avg2(*dst, prediction);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn inter_prediction_row_mut<'a>(
+    plane: &'a mut CurrentPlaneMut<'_>,
+    x: usize,
+    y: usize,
+    width: usize,
+) -> Result<Option<&'a mut [u8]>, TileSyntaxError> {
+    if width == 0 || y >= plane.height || x >= plane.width {
+        return Ok(None);
+    }
+
+    let width = core::cmp::min(width, plane.width - x);
+    let start = y
+        .checked_mul(plane.stride)
+        .and_then(|base| base.checked_add(x))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let end = start
+        .checked_add(width)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+    plane
+        .data
+        .get_mut(start..end)
+        .map(Some)
+        .ok_or(TileSyntaxError::InvalidBitstream)
 }
 
 fn inter_predict_sample(
