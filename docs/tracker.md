@@ -205,16 +205,34 @@ between passes and reorder on what you see. One measured pass per grinder task;
       credibility line; kept as hot-loop simplification. Wide-window bool
       decoder, unrolled tree, neighbor tables, direct coef writes all
       measured worse and were rejected
-- [ ] simd128 kernels in post-reshape profile order — X4 profile after the
-      scalar campaign (jellyfish 0:15, 23.1 ms/frame): inter subpel 33%,
-      decode_block 30%, loop filter 15%, IDCT 7%. Convolution first; with
-      `wasm-tests` unit coverage per kernel and the golden corpus as oracle
-- [ ] memory/layout: reference slot remap instead of full-frame
-      `copy_from_slice` on refresh (~1.4 MB per slot per frame at 720p),
-      stride/alignment normalization, counts-accumulation cost check.
-      2026-07: X4 headroom estimate is ~1-2%, below the A/B credibility
-      line; measure on the A55 (libc/memory share is ~9% there) or bundle
-      with the simd session
+simd128 kernel campaign (scoped 2026-07-02). Framing: portable simd128, not
+single-target tuning — A/B on the X4 for iteration speed, log an A55
+confirmation bench per merged pass. simd cannot close the A55 budget gap
+(~9x over, and decode_block's ~30% is serial entropy); the campaign goal is
+the portable win plus A55 data for the later threads decision (M6). One
+kernel per grinder task, sequential (everything touches `tile_syntax/mod.rs`);
+reorder on refreshed profiles. Starting X4 profile (jellyfish 0:15, 23.1
+ms/frame): inter subpel 33%, decode_block 30%, loop filter 15%, IDCT 7%.
+
+- [ ] pass 0: post-reshape attribution on X4 *and* A55 (A55 profile predates
+      all five scalar merges and decides whether loop filter outranks
+      convolution there); confirm the token-loop `--all` corpus run from
+      session end finished green
+- [ ] inter subpel convolution simd — two-pass separable structure is
+      already lane-shaped (i16 intermediates); expected largest single delta
+- [ ] loop filter simd — spans/LUT reshape already batches up to 8
+      positions; vertical-edge transpose is the review risk
+- [ ] IDCT simd — scalar butterflies use i64 products for exactness; a simd
+      version must prove bit-exact 32-bit-lane behavior for conformant
+      streams (`wasm-tests` sweep vs the scalar reference, plus the corpus)
+- [ ] conditional tail, by post-IDCT profile: compound average, intra
+      prediction, and the memory/layout items — reference slot remap instead
+      of full-frame `copy_from_slice` on refresh (~1.4 MB per slot per frame
+      at 720p), stride/alignment normalization, counts-accumulation cost
+      check. X4 headroom ~1-2% (below the A/B credibility line); measure on
+      the A55, where libc/memory share is ~9%
+- [ ] end-of-campaign: both-device margin table in log.md; the A55 residue
+      feeds the threads / ffvp9-baseline scope decision
 
 ### M4 — Encode
 
