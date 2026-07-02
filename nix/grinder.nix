@@ -94,7 +94,7 @@ in
       usage() {
         printf '%s\n' \
           'usage:' \
-          '  grinder run TASK_FILE' \
+          '  grinder run TASK_FILE [--baseline WASM] [--device INDEX[:PIN]]' \
           '  grinder shell [COMMAND...]' \
           '  grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]' >&2
       }
@@ -119,6 +119,8 @@ in
       fi
 
       task_file=""
+      baseline_file=""
+      device_default=""
       command=()
       case "$mode" in
         run)
@@ -128,10 +130,22 @@ in
             exit 2
           fi
           shift
-          if [[ $# -gt 0 ]]; then
-            usage
-            exit 2
-          fi
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --baseline)
+                baseline_file="''${2:-}"
+                shift 2 || { usage; exit 2; }
+                ;;
+              --device)
+                device_default="''${2:-}"
+                shift 2 || { usage; exit 2; }
+                ;;
+              *)
+                usage
+                exit 2
+                ;;
+            esac
+          done
           ;;
         shell)
           command=("''${@}")
@@ -139,6 +153,10 @@ in
       esac
       if [[ -n "$task_file" && ! -f "$task_file" ]]; then
         echo "task file not found: $task_file" >&2
+        exit 2
+      fi
+      if [[ -n "$baseline_file" && ! -f "$baseline_file" ]]; then
+        echo "baseline file not found: $baseline_file" >&2
         exit 2
       fi
 
@@ -202,6 +220,15 @@ in
       )
       mkdir -p "$perf_socket_dir"
       podman_args+=(--volume "$perf_socket_dir:/run/vip9r-perf:rw")
+      # Default perf-submit routing for the sandbox: bench baseline and
+      # device index:pin ride in as env, overridable per submission.
+      if [[ -n "$baseline_file" ]]; then
+        cp -a "$baseline_file" "$run/rootfs/baseline.wasm"
+        podman_args+=(--env VIP9R_PERF_BASELINE=/baseline.wasm)
+      fi
+      if [[ -n "$device_default" ]]; then
+        podman_args+=(--env VIP9R_PERF_DEVICE="$device_default")
+      fi
       # Name the container after the sandbox so it can be stopped by name;
       # TaskStop/SIGTERM on this wrapper must not orphan a running codex.
       container_name="$(basename "$run")"

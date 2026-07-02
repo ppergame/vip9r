@@ -64,20 +64,22 @@ forced a restart after every merge.
       per-run measurements, and the `B1` vs `B4` spread as a built-in no-op
       control / error-bar signal so callers can tell when a run was too
       drifty to conclude anything
-- [ ] baseline moves from daemon state to request payload: `serve` no longer
-      builds a baseline, so merges stop forcing daemon restarts; cache device
-      pushes by blob hash
-- [ ] `serve` takes a list of devices (serial plus per-device pin), one
-      queue per device
-- [ ] `vip9r-perf-submit` takes an optional baseline wasm path and a device
+- [x] baseline moves from daemon state to request payload: `serve` no longer
+      builds a baseline, so merges stop forcing daemon restarts; device
+      pushes cached by blob hash
+- [x] `serve` takes a list of devices (`--serial` repeated), one queue and
+      worker per device; pin moved entirely to request config (timed kinds
+      require an explicit pin, validate/tests default `any`)
+- [x] `vip9r-perf-submit` takes an optional baseline wasm path and a device
       index; default baseline is the current build (no-op control by default)
-- [ ] grinder spawn script takes a default baseline file (or builds one from
-      `orchestrator-base` at sandbox creation) and a default device
-      index:pin, passed into the sandbox for all submissions
+- [x] grinder spawn script: `grinder run TASK --baseline WASM --device
+      INDEX[:PIN]` passes sandbox-wide submit defaults via
+      `VIP9R_PERF_BASELINE` / `VIP9R_PERF_DEVICE`
 - [ ] cool-start gate in the device-side run script: before a timed run,
       wait up to ~10 s or until the temperature's rate of decrease levels
       off, whichever comes first; record the wait in telemetry
-- [ ] trim full device summary in every perf-submit response
+- [x] trim full device summary in every perf-submit response: responses
+      carry index/serial/model; full topology stays in `probe`
 
 ### M1 — Decode, code-complete (implement campaign)
 
