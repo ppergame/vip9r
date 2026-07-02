@@ -104,6 +104,7 @@ pub(super) struct DequantizedCoefficients {
     pub(super) block: TransformBlock,
     pub(super) coefficients: [i32; MAX_TX_COEFFS],
     pub(super) eob: usize,
+    nonzero_row_mask: u32,
 }
 
 impl DequantizedCoefficients {
@@ -112,6 +113,7 @@ impl DequantizedCoefficients {
             block,
             coefficients: [0; MAX_TX_COEFFS],
             eob,
+            nonzero_row_mask: 0,
         }
     }
 
@@ -126,9 +128,33 @@ impl DequantizedCoefficients {
 
         let n = 2 + self.block.tx_size.index();
         let width = transform_width(self.block.tx_size);
-        let mut t = [0i32; MAX_TX_WIDTH];
 
-        for row in 0..width {
+        if self.eob == 0 {
+            return Ok(());
+        }
+
+        if !lossless && self.block.tx_type == TxType::DctDct && self.eob == 1 {
+            return self.inverse_dct_dct_dc_only(n, width);
+        }
+
+        self.inverse_transform_2d(lossless, n, width, self.nonzero_row_mask)
+    }
+
+    fn inverse_transform_2d(
+        &mut self,
+        lossless: bool,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        let mut t = [0i32; MAX_TX_WIDTH];
+        let active_rows = width.min(u32::BITS as usize - nonzero_row_mask.leading_zeros() as usize);
+
+        for row in 0..active_rows {
+            if nonzero_row_mask & (1u32 << row) == 0 {
+                continue;
+            }
+
             for (col, slot) in t.iter_mut().take(width).enumerate() {
                 *slot = self.coefficients[row * width + col];
             }
@@ -145,9 +171,9 @@ impl DequantizedCoefficients {
             for (col, value) in t.iter().take(width).copied().enumerate() {
                 self.coefficients[row * width + col] = value;
             }
-            t[..width].fill(0);
         }
 
+        let final_shift = core::cmp::min(6, n + 2);
         for col in 0..width {
             for (row, slot) in t.iter_mut().take(width).enumerate() {
                 *slot = self.coefficients[row * width + col];
@@ -162,7 +188,6 @@ impl DequantizedCoefficients {
                 inverse_adst(&mut t, n)?;
             }
 
-            let final_shift = core::cmp::min(6, n + 2);
             for (row, value) in t.iter().take(width).copied().enumerate() {
                 self.coefficients[row * width + col] = if lossless {
                     value
@@ -170,9 +195,18 @@ impl DequantizedCoefficients {
                     narrow_i32(round2_i64(i64::from(value), final_shift))?
                 };
             }
-            t[..width].fill(0);
         }
 
+        Ok(())
+    }
+
+    fn inverse_dct_dct_dc_only(&mut self, n: usize, width: usize) -> Result<(), TileSyntaxError> {
+        let pass1 = inverse_dct_dc_value(self.coefficients[0]);
+        let pass2 = inverse_dct_dc_value(pass1);
+        let final_shift = core::cmp::min(6, n + 2);
+        let value = narrow_i32(round2_i64(i64::from(pass2), final_shift))?;
+
+        self.coefficients[..width * width].fill(value);
         Ok(())
     }
 }
@@ -293,14 +327,34 @@ impl FrameDequant {
         segment_id: u8,
     ) -> DequantizedCoefficients {
         let mut output = DequantizedCoefficients::new(input.block, input.eob);
+        if input.eob == 0 {
+            return output;
+        }
+
         let count = coefficient_count(input.block.tx_size);
+        let width = transform_width(input.block.tx_size);
         let dq_denom = dq_denom(input.block.tx_size);
         let dc_quant = self.get_dc_quant_for_segment(input.block.plane, segment_id);
         let ac_quant = self.get_ac_quant_for_segment(input.block.plane, segment_id);
 
+        if input.eob == 1 {
+            let coefficient = input.coefficients[0];
+            if coefficient != 0 {
+                output.coefficients[0] = (i32::from(coefficient) * dc_quant) / dq_denom;
+                output.nonzero_row_mask = 1;
+            }
+            return output;
+        }
+
         for pos in 0..count {
+            let coefficient = input.coefficients[pos];
+            if coefficient == 0 {
+                continue;
+            }
+
             let quant = if pos == 0 { dc_quant } else { ac_quant };
-            output.coefficients[pos] = (i32::from(input.coefficients[pos]) * quant) / dq_denom;
+            output.coefficients[pos] = (i32::from(coefficient) * quant) / dq_denom;
+            output.nonzero_row_mask |= 1u32 << (pos / width);
         }
 
         output
@@ -372,19 +426,27 @@ fn narrow_i32(value: i64) -> Result<i32, TileSyntaxError> {
     i32::try_from(value).map_err(|_| TileSyntaxError::InvalidBitstream)
 }
 
-fn b(
-    t: &mut [i32; MAX_TX_WIDTH],
-    a: usize,
-    b_index: usize,
-    angle: i32,
-    flip: bool,
-) -> Result<(), TileSyntaxError> {
+// VP9 requires intermediate transform values to be representable as i32 for a
+// conformant bitstream. The hot butterfly path trusts that guarantee: malformed
+// streams that overflow here wrap through this cast and may produce wrong
+// pixels instead of a decode error, but safe Rust still avoids UB.
+#[inline(always)]
+fn narrow_i32_butterfly(value: i64) -> i32 {
+    value as i32
+}
+
+fn inverse_dct_dc_value(value: i32) -> i32 {
+    narrow_i32_butterfly(round2_i64(i64::from(value) * i64::from(cos64(16)), 14))
+}
+
+#[inline(always)]
+fn b(t: &mut [i32; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, flip: bool) {
     let ta = i64::from(t[a]);
     let tb = i64::from(t[b_index]);
     let cos = i64::from(cos64(angle));
     let sin = i64::from(sin64(angle));
-    let x = narrow_i32(round2_i64(ta * cos - tb * sin, 14))?;
-    let y = narrow_i32(round2_i64(ta * sin + tb * cos, 14))?;
+    let x = narrow_i32_butterfly(round2_i64(ta * cos - tb * sin, 14));
+    let y = narrow_i32_butterfly(round2_i64(ta * sin + tb * cos, 14));
 
     if flip {
         t[a] = y;
@@ -393,22 +455,15 @@ fn b(
         t[a] = x;
         t[b_index] = y;
     }
-
-    Ok(())
 }
 
-fn h(
-    t: &mut [i32; MAX_TX_WIDTH],
-    a: usize,
-    b_index: usize,
-    flip: bool,
-) -> Result<(), TileSyntaxError> {
+#[inline(always)]
+fn h(t: &mut [i32; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     let (x_index, y_index) = if flip { (b_index, a) } else { (a, b_index) };
     let x = i64::from(t[x_index]);
     let y = i64::from(t[y_index]);
-    t[x_index] = narrow_i32(x + y)?;
-    t[y_index] = narrow_i32(x - y)?;
-    Ok(())
+    t[x_index] = narrow_i32_butterfly(x + y);
+    t[y_index] = narrow_i32_butterfly(x - y);
 }
 
 fn sb(
@@ -465,20 +520,20 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
     let n2 = 1usize << (n - 2);
 
     if n == 2 {
-        b(t, 0, 1, 16, true)?;
+        b(t, 0, 1, 16, true);
     } else {
         inverse_dct(t, n - 1)?;
     }
 
     for i in 0..n2 {
-        b(t, n1 + i, n0 - 1 - i, 32 - brev(5, n1 + i) as i32, false)?;
+        b(t, n1 + i, n0 - 1 - i, 32 - brev(5, n1 + i) as i32, false);
     }
 
     if n >= 3 {
         let n3 = 1usize << (n - 3);
         for i in 0..n3 {
             for j in 0..=1 {
-                h(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0)?;
+                h(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
             }
         }
     }
@@ -493,12 +548,12 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
                     n1 + n - 4 + n2 * j + 4 * i,
                     28 - 16 * i as i32 + 56 * j as i32,
                     true,
-                )?;
+                );
             }
         }
         for i in 0..=1 {
             for j in 0..=3 {
-                h(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0)?;
+                h(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0);
             }
         }
     }
@@ -512,12 +567,12 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
                     n1 + n - 3 + i + n2 * j,
                     24 + 48 * j as i32,
                     true,
-                )?;
+                );
             }
         }
         for i in 0..=(2 * n - 7) {
             for j in 0..=1 {
-                h(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0)?;
+                h(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0);
             }
         }
     }
@@ -525,12 +580,12 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
     if n >= 3 {
         let n3 = 1usize << (n - 3);
         for i in 0..n3 {
-            b(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true)?;
+            b(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
         }
     }
 
     for i in 0..n1 {
-        h(t, i, n0 - 1 - i, false)?;
+        h(t, i, n0 - 1 - i, false);
     }
 
     Ok(())
@@ -622,10 +677,10 @@ fn inverse_adst8(t: &mut [i32; MAX_TX_WIDTH]) -> Result<(), TileSyntaxError> {
         sh(t, &s, 4 + i, 6 + i)?;
     }
     for i in 0..=1 {
-        h(t, i, 2 + i, false)?;
+        h(t, i, 2 + i, false);
     }
     for i in 0..=1 {
-        b(t, 2 + 4 * i, 3 + 4 * i, 16, true)?;
+        b(t, 2 + 4 * i, 3 + 4 * i, 16, true);
     }
     inverse_adst_output_permutation(t, 3);
     for i in 0..=3 {
@@ -652,7 +707,7 @@ fn inverse_adst16(t: &mut [i32; MAX_TX_WIDTH]) -> Result<(), TileSyntaxError> {
         sh(t, &s, 8 + i, 12 + i)?;
     }
     for i in 0..=3 {
-        h(t, i, 4 + i, false)?;
+        h(t, i, 4 + i, false);
     }
     for i in 0..=1 {
         for j in 0..=1 {
@@ -673,7 +728,7 @@ fn inverse_adst16(t: &mut [i32; MAX_TX_WIDTH]) -> Result<(), TileSyntaxError> {
     }
     for i in 0..=1 {
         for j in 0..=1 {
-            h(t, 8 * j + i, 2 + 8 * j + i, false)?;
+            h(t, 8 * j + i, 2 + 8 * j + i, false);
         }
     }
     for i in 0..=1 {
@@ -684,7 +739,7 @@ fn inverse_adst16(t: &mut [i32; MAX_TX_WIDTH]) -> Result<(), TileSyntaxError> {
                 3 + 4 * j + 8 * i,
                 48 + 64 * (i ^ j) as i32,
                 false,
-            )?;
+            );
         }
     }
     inverse_adst_output_permutation(t, 4);
@@ -783,10 +838,19 @@ mod tests {
     use super::*;
 
     fn block(tx_size: TxSize, tx_type: TxType, values: &[(usize, i32)]) -> DequantizedCoefficients {
+        let eob = match values {
+            [] => 0,
+            [(0, _)] => 1,
+            _ => coefficient_count(tx_size),
+        };
         let mut block =
-            DequantizedCoefficients::new(TransformBlock::new(0, (0, 0), tx_size, tx_type), 0);
+            DequantizedCoefficients::new(TransformBlock::new(0, (0, 0), tx_size, tx_type), eob);
+        let width = transform_width(tx_size);
         for &(index, value) in values {
             block.coefficients[index] = value;
+            if value != 0 {
+                block.nonzero_row_mask |= 1u32 << (index / width);
+            }
         }
         block
     }
@@ -840,6 +904,51 @@ mod tests {
                 "unexpected DCT_DCT DC vector for {tx_size:?}: {:?}",
                 &b.coefficients[..coefficient_count(tx_size)]
             );
+        }
+    }
+
+    #[test]
+    fn dct_dct_dc_only_path_matches_general_transform() {
+        let dc_values = [
+            i16::MIN as i32,
+            -16384,
+            -8192,
+            -4096,
+            -255,
+            -1,
+            0,
+            1,
+            255,
+            4096,
+            8192,
+            16384,
+            i16::MAX as i32,
+        ];
+
+        for tx_size in [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ] {
+            let n = 2 + tx_size.index();
+            let width = transform_width(tx_size);
+            let count = coefficient_count(tx_size);
+            for dc in dc_values {
+                let mut general = block(tx_size, TxType::DctDct, &[(0, dc)]);
+                general
+                    .inverse_transform_2d(false, n, width, u32::MAX)
+                    .unwrap();
+
+                let mut fast = block(tx_size, TxType::DctDct, &[(0, dc)]);
+                fast.inverse_transform(false).unwrap();
+
+                assert_eq!(
+                    &fast.coefficients[..count],
+                    &general.coefficients[..count],
+                    "DC-only mismatch for {tx_size:?} dc={dc}"
+                );
+            }
         }
     }
 

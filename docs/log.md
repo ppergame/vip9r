@@ -370,3 +370,18 @@ milestones, and measured optimization results.
   cycles. First grinder attempt was lost to the socket-inode harness fault
   fixed earlier this session; its unvalidated tree was salvaged, validated,
   and refined by the relaunched session.
+
+## 2026-07-02 — VP9 IDCT eob fast paths
+
+- Added dequantization-time nonzero-row tracking and first-pass zero-row
+  skipping (a 1-D transform of a zero row is exactly zero), plus a DC-only
+  DCT_DCT fast path pinned to the general 2-D pipeline by a unit test across
+  clamp-range DC values.
+- Removed per-op checked narrowing from the hot `b()`/`h()` butterflies: the
+  spec makes 32-bit intermediate representability a conformance requirement,
+  so conformant output is unchanged; malformed streams that overflow now
+  produce wrong pixels instead of a decode error (documented in code).
+  Products stay i64 for exactness.
+- Measured on `jellyfish-720p30` frames 0:15, Pixel 9a X4: 42.6 → 24.2
+  ms/frame (-43%). Compliance corpus green (307/307). The X4 is now under
+  the 33.3 ms/frame 720p30 budget on this clip.
