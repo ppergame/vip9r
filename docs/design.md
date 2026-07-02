@@ -98,6 +98,15 @@ Long local corpus runs can use `wasm-golden --progress-frames=N` to print
 periodic compared-frame progress to stderr without changing the final pass/fail
 criteria.
 
+`scripts/vip9r-corpus-golden.py` runs strict golden validation across the whole
+md5-backed `/bulk/vip9r` corpus on host d8, one process per core. The default
+compliance set excludes a hardcoded list of heavy movie/VOD clips and finishes
+in about a minute on the workstation; it gates every merged optimization pass.
+`--all` includes the heavy clips (hours of CPU, dominated by the
+multi-thousand-frame movie clips) and runs in the background at pass
+boundaries. When a deferred `--all` run fails, bisect by replaying only the
+failing vectors across the candidate commits, not the corpus.
+
 WebM demux is intentionally a narrow harness subset: one `V_VP9` video track is
 selected, non-video tracks are ignored, `SimpleBlock` and `BlockGroup/Block`
 payloads become VP9 packets, and laced VP9 blocks are rejected.
