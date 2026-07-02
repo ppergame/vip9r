@@ -437,13 +437,16 @@ COOP/COEP headers, CDN media) is out of scope until it exists.
       URL textbox (direct fetch plays the CORS lottery; vite dev-server proxy
       route as the local escape hatch); config via URL params (`mode`, `media`,
       `wc`, `lanes`, `autostart`) with a copy-link button — F5 is the rerun
-- [ ] worker decode pipeline: vip9r in a dedicated worker (postMessage +
-      transferable planes, no SAB/COOP/COEP needed), `VideoFrame` I420
-      construction and canvas present on main; two clocks — worker-side decode
-      ms/frame vs main-side presented fps and drop count — so slow blits on
-      TV-class compositors can't pollute decoder numbers
-- [ ] playback mode: real-time pacing off WebM timestamps, bounded frame
-      queue, drop counter
+- [x] worker decode pipeline: vip9r in a dedicated worker (postMessage, no
+      SAB/COOP/COEP needed); worker demuxes via `parseVp9Input`, constructs
+      I420 `VideoFrame`s directly over wasm memory, and transfers them to
+      main for canvas present; two clocks — worker-side decode ms/frame vs
+      main-side presented fps and drop count — so slow blits on TV-class
+      compositors can't pollute decoder numbers
+- [x] playback mode: real-time pacing off IVF/WebM timestamps, credit-bounded
+      frame queue (8 in flight), drop counter. 2026-07-02: jellyfish 720p30
+      on the workstation: 300/300 presented @30 fps, 0 dropped, decode avg
+      25.1 ms/frame
 - [ ] race mode: side-by-side flat-out decode, vip9r vs WebCodecs
       `VideoDecoder`; `wc` param maps to `hardwareAcceleration` (default
       prefer-software; it is a preference — display the accepted config,
