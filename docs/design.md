@@ -15,6 +15,10 @@ guide the next session without pretending the decoder architecture is settled.
 - minih264 is used for the showcase path. It is not the current design center.
 - SIMD, relaxed SIMD, workers, allocator shape, and internal boundaries are
   choices to earn with evidence, not decisions to pre-bake into the docs.
+  - 2026-07: wasm simd128 is in scope for M3. It is baseline in shipped Chrome
+    and V8 lowers it to NEON on both device targets (arm64 and the streamer's
+    arm32), so it is portable, not CPU-specific tuning. Relaxed SIMD and
+    workers remain M6 stretch.
 
 ## Correctness
 

@@ -28,6 +28,12 @@ Deferrable external inputs for M3 performance work.
 
 - [x] user: root the Pixel 9a
 - [x] user: 720p performance corpus with a held-out clip
+- [ ] user: collect the ffvp9 performance baseline: static ffmpeg (arm64 +
+      armv7) run directly through adb, taskset-pinned, on the realworld 720p
+      clips across Pixel 9a core types and the streamer. Deferred by the user
+      2026-07. Strategically it bounds the A55 target: if ffvp9 can't do
+      single-threaded 720p30 there, that's a threads/M6 scope decision, not an
+      optimization gap
 
 ## Later
 
@@ -36,9 +42,6 @@ Deferrable external inputs for M3 performance work.
 - [x] device oracle that serializes access to adb and hardware
 - [x] host and ARM d8 paths for wasm inspection and timing, JIT tier control
 - [x] repeatable device timing protocol with CPU control and confidence checks
-- [ ] collect the ffvp9 performance baseline: static ffmpeg (arm64 + armv7) run
-      directly through adb, taskset-pinned, on the realworld 720p clips across
-      Pixel 9a core types and the streamer
 - [x] return native (host / ARM) assembly for the wasm module from d8 back to
       the grinder to close the codegen feedback loop
 - [x] surface perf-run profile traces (simpleperf / d8 wasm samples) back to the
@@ -137,8 +140,39 @@ Drive frame-md5 correctness green. Gated on M2R.
 
 Sustained 720p30 on the pinned big core. Gated on M2 + the M0 device path.
 
-- [ ] optimize measured full-decode hotspots; confirm wins against full-decode
-      wall time
+Starting evidence (2026-07): per-core baselines are in `docs/design.md`
+(X4 ~147 ms/frame vs the 33.3 ms budget). The only profile so far — bear on
+the X4 — splits `predict_inter` 58% / `loop_filter_frame` 19% /
+`decode_block` 9% / IDCT ~7%; entropy and memmove shares should grow on 720p
+content. The pass order below follows that evidence plus two stacking
+arguments: algorithmic reshaping must precede SIMD (per-pixel spec-literal
+loops can't be vectorized), and the multipliers compound. It is a suggested
+order, not a commitment — re-profile between passes and reorder on what you
+see. One measured pass per grinder task; full-corpus `wasm-golden` is the
+correctness gate; log measured device deltas.
+
+- [ ] refresh hotspot attribution on 720p realworld clips (Pixel + streamer);
+      measure a bare `+simd128` flag flip (autovectorization only) so the flag
+      is part of the baseline before any hand-written kernels
+- [ ] inter prediction: block-level two-pass separable convolution. The
+      current `inter_predict_sample` path is 64 MACs/pixel with per-sample
+      clamped access and checked math; two-pass is 16 MACs/pixel with
+      straight-line inner loops. Unscaled (`step == 16`) fast path with
+      per-block filter phase, integer-MV block copy, edge clamping hoisted out
+      of inner loops — likely via reference-plane border extension, which
+      touches `WorkspaceLayout` and deserves its own reviewable step
+- [ ] loop filter: per-superblock filter-mask precomputation and
+      edge-directional processing over contiguous memory, scalar first
+- [ ] bool decoder: wide window with byte-granularity refill (`read_bool`
+      currently renormalizes bit-by-bit); move validation to block/tile setup
+      so token loops lose checked math and per-call `Result` plumbing
+- [ ] IDCT: eob-based fast paths (DC-only, low-eob) before any butterfly work
+- [ ] simd128 kernels in post-reshape profile order — convolution, loop
+      filter, IDCT, compound average, intra predictors as warranted — with
+      `wasm-tests` unit coverage per kernel and the golden corpus as oracle
+- [ ] memory/layout: reference slot remap instead of full-frame
+      `copy_from_slice` on refresh (~1.4 MB per slot per frame at 720p),
+      stride/alignment normalization, counts-accumulation cost check
 
 ### M4 — Encode
 

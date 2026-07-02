@@ -305,3 +305,18 @@ milestones, and measured optimization results.
   `vp90-2-tos_1920x800_tile_1x4_fpm_2335kbps.webm` at 17,620 matched frames and
   `realworld/wikimedia/spring-original-2048x858p24-1_41mbps.webm` at 11,138
   matched frames.
+
+## 2026-07-02 — M3 pre-optimization timing baselines
+
+- Recorded full-decode wasm timings on `bear-vp9.ivf` (320x240) across all
+  three perf targets before any optimization work. Same 16-output-frame window
+  (`--frames 0:15`), release wasm, md5-validated, cool start, flat per-pass
+  timings on all targets:
+  - host workstation: 6.9 ms/frame
+  - Pixel 9a Cortex-X4 (pinned cpu7, 3.105 GHz): 11.2 ms/frame
+  - TV Streamer Cortex-A55 (pinned, 2.0 GHz): 129.7 ms/frame
+- The window is small because the A55 cannot finish the full 82-frame bear
+  validation pass inside the bench runner's 5 s per-pass deadline (26 frames
+  in 5.1 s). Host and X4 full-clip runs measure 7.3 and 12.0 ms/frame.
+- 720p per-core starting-line numbers against the 33.3 ms/frame 720p30 budget
+  are in `docs/design.md`: X4 ~147, A720 ~207, A520 ~845, A55 ~1489 ms/frame.
