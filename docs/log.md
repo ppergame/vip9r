@@ -561,3 +561,30 @@ Full matrix with per-run telemetry:
   bound there.
 - Host (x86-64, `-threads 1`): 0.7–2.1 ms/frame, collected under
   concurrent build load; rough numbers only.
+
+## 2026-07-02 — A55 campaign: measurement-window profiling + residual path restructure
+
+A55-first optimization campaign opened (streamer is the decision device;
+X4 confirmation secondary; changes stay portable-V8-principled).
+
+- Harness first: device profile reports are now windowed to the bench
+  driver's measurement passes (daemon filters samples by time against
+  `measurement.elapsedMs`). The md5-validation/warmup/startup head was
+  ~40% of samples and had inflated the JS/d8/libc rows; the suspected
+  "hot d8 memory.copy builtin" from the exploration notes dissolved
+  under scrutiny (it was `Builtin:DoubleToI` from validation md5,
+  double-counted by an offline histogram). Real V8-runtime cost during
+  decode is 1–2%. Clean A55 measurement-only shares — jellyfish:
+  decode_block 38 / subpel 18 / loop_filter 15 / libc 11; BBB:
+  decode_block 50 / libc 20 / loop_filter 7 / subpel 6.
+- Residual path restructure (decode_block's data churn): parser-owned
+  persistent coefficient/dequant/token-cache buffers with
+  scan-prefix-scoped clears, dequantization bounded by eob in scan
+  order, eob==0 blocks skip dequant/IDCT/reconstruct entirely, no more
+  KB-sized by-value struct returns; plus shift/mask in
+  `coefficient_token_context` (real udivs on arm32). A stale-workspace
+  regression test pins the clear discipline.
+- Measured on the A55: **−16.1% big-buck-bunny** (residual-heavy clip),
+  **−14.2% jellyfish** (spreads 0.5/0.3%). Host validations across
+  quantizer extremes/aq2/tiny-frame vectors and 88/88 wasm tests green;
+  compliance corpus 307/307.

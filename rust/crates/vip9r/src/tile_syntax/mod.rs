@@ -528,6 +528,7 @@ fn parse_tile(
         prev_frame_modes: mode_buffers.prev_frame_modes,
         current_frame_modes: mode_buffers.current_frame_modes,
         reference_frames,
+        residual: ResidualBuffers::new(),
     };
 
     let mut row = tile_row_start;
@@ -579,6 +580,53 @@ struct TileParser<'a, 'b, 'r> {
     prev_frame_modes: Option<ModeInfoView<'b>>,
     current_frame_modes: Option<ModeInfoViewMut<'b>>,
     reference_frames: Option<ReferenceFrames<'r>>,
+    residual: ResidualBuffers,
+}
+
+struct ResidualBuffers {
+    coefficients: TransformCoefficients,
+    dequantized: DequantizedCoefficients,
+    token_cache: [u8; MAX_TX_COEFFS],
+    quantized_dirty: Option<QuantizedDirty>,
+}
+
+impl ResidualBuffers {
+    const fn new() -> Self {
+        Self {
+            coefficients: TransformCoefficients::empty(),
+            dequantized: DequantizedCoefficients::empty(),
+            token_cache: [0; MAX_TX_COEFFS],
+            quantized_dirty: None,
+        }
+    }
+
+    fn clear_quantized_dirty(&mut self) {
+        if let Some(dirty) = self.quantized_dirty.take() {
+            let scan = scan_table(dirty.tx_size, dirty.tx_type);
+            self.coefficients.clear_scan_prefix(scan, dirty.eob);
+        }
+    }
+
+    fn mark_quantized_dirty(&mut self, tx_size: TxSize, tx_type: TxType, eob: usize) {
+        self.quantized_dirty = (eob > 0).then_some(QuantizedDirty {
+            tx_size,
+            tx_type,
+            eob,
+        });
+    }
+
+    fn clear_token_cache_prefix(&mut self, scan: &[u16], eob: usize) {
+        for &pos in scan.iter().take(eob) {
+            self.token_cache[usize::from(pos)] = 0;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct QuantizedDirty {
+    tx_size: TxSize,
+    tx_type: TxType,
+    eob: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2093,7 +2141,7 @@ impl TileParser<'_, '_, '_> {
                         }
 
                         if !block.skip {
-                            let coefficients = self.tokens(
+                            self.tokens(
                                 plane,
                                 (start_x, start_y),
                                 tx_size,
@@ -2101,11 +2149,32 @@ impl TileParser<'_, '_, '_> {
                                 mi_size,
                                 block,
                             )?;
-                            nonzero = coefficients.nonzero_context();
-                            let mut dequantized =
-                                self.dequant.dequantize(&coefficients, block.segment_id);
-                            dequantized.inverse_transform(self.lossless)?;
-                            reconstruct(current_frame, &dequantized)?;
+                            nonzero = self.residual.coefficients.nonzero_context();
+                            if nonzero {
+                                let scan = scan_table(
+                                    self.residual.coefficients.block.tx_size,
+                                    self.residual.coefficients.block.tx_type,
+                                );
+                                let dequant = self.dequant;
+                                let segment_id = block.segment_id;
+                                {
+                                    let ResidualBuffers {
+                                        coefficients,
+                                        dequantized,
+                                        ..
+                                    } = &mut self.residual;
+                                    dequant.dequantize_into(
+                                        coefficients,
+                                        segment_id,
+                                        scan,
+                                        dequantized,
+                                    )?;
+                                }
+                                self.residual.clear_quantized_dirty();
+                                self.residual.dequantized.inverse_transform(self.lossless)?;
+                                reconstruct(current_frame, &self.residual.dequantized)?;
+                                self.residual.dequantized.clear_transform_extent();
+                            }
                         }
                     }
 
@@ -2366,11 +2435,9 @@ impl TileParser<'_, '_, '_> {
         block_idx: usize,
         mi_size: BlockSize,
         block: DecodedBlockInfo,
-    ) -> Result<TransformCoefficients, TileSyntaxError> {
+    ) -> Result<(), TileSyntaxError> {
         let seg_eob = 16usize << (tx_size.index() << 1);
         let tx_type = self.get_tx_type(plane, tx_size, block_idx, mi_size, block)?;
-        let mut coefficients = TransformCoefficients::new(plane, start, tx_size, tx_type)?;
-        let mut token_cache = [0u8; MAX_TX_COEFFS];
         let mut check_eob = true;
         let mut c = 0usize;
         let scan = scan_table(tx_size, tx_type);
@@ -2390,14 +2457,21 @@ impl TileParser<'_, '_, '_> {
         let counts_more_coefs = &mut counts.counts_more_coefs[tx_index][plane_type][ref_type];
         let counts_token = &mut counts.counts_token[tx_index][plane_type][ref_type];
         let decoder = &mut self.decoder;
+        let residual = &mut self.residual;
+        residual.clear_quantized_dirty();
+        residual
+            .coefficients
+            .reset(plane, start, tx_size, tx_type)?;
+        let coefficients = &mut residual.coefficients;
+        let token_cache = &mut residual.token_cache;
 
         while c < seg_eob {
-            let pos = usize::from(scan[c]);
+            let pos = usize::from(*scan.get(c).ok_or(TileSyntaxError::InvalidBitstream)?);
             let band = usize::from(coef_bands[c]);
             let ctx = if c == 0 {
                 dc_ctx
             } else {
-                coefficient_token_context(pos, tx_size, tx_type, &token_cache)?
+                coefficient_token_context(pos, tx_size, tx_type, token_cache)?
             };
             let probability_row = &coef_probs[band][ctx];
 
@@ -2422,7 +2496,9 @@ impl TileParser<'_, '_, '_> {
         }
 
         coefficients.set_eob(c)?;
-        Ok(coefficients)
+        residual.mark_quantized_dirty(tx_size, tx_type, c);
+        residual.clear_token_cache_prefix(scan, c);
+        Ok(())
     }
 
     fn get_tx_type(
@@ -6848,35 +6924,24 @@ fn coefficient_token_context(
     tx_type: TxType,
     token_cache: &[u8; MAX_TX_COEFFS],
 ) -> Result<usize, TileSyntaxError> {
-    let n = 4usize << tx_size.index();
-    let i = pos / n;
-    let j = pos % n;
+    let n_shift = 2 + tx_size.index();
+    let n = 1usize << n_shift;
+    let i = pos >> n_shift;
+    let j = pos & (n - 1);
     let (nb0, nb1) = if i > 0 && j > 0 {
-        let a = (i - 1)
-            .checked_mul(n)
-            .and_then(|value| value.checked_add(j))
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let a2 = i
-            .checked_mul(n)
-            .and_then(|value| value.checked_add(j - 1))
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let a = ((i - 1) << n_shift) + j;
+        let a2 = (i << n_shift) + j - 1;
         match tx_type {
             TxType::DctAdst => (a, a),
             TxType::AdstDct => (a2, a2),
             TxType::DctDct | TxType::AdstAdst => (a, a2),
         }
     } else if i > 0 {
-        let a = (i - 1)
-            .checked_mul(n)
-            .and_then(|value| value.checked_add(j))
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let a = ((i - 1) << n_shift) + j;
         (a, a)
     } else {
         let jm1 = j.checked_sub(1).ok_or(TileSyntaxError::InvalidBitstream)?;
-        let a = i
-            .checked_mul(n)
-            .and_then(|value| value.checked_add(jm1))
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let a = (i << n_shift) + jm1;
         (a, a)
     };
 
@@ -7599,19 +7664,19 @@ const KF_UV_MODE_PROBS: [[u8; INTRA_MODE_PROBS]; INTRA_MODES] = [
 
 #[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
-    use super::residual::{FrameDequant, TransformCoefficients};
+    use super::residual::{DequantizedCoefficients, FrameDequant, TransformCoefficients};
     use super::{
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
         GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, InterPredictionWrite, IntraMode,
         IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS,
         MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
         NeighborModeInfo, REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane,
-        STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
+        ResidualBuffers, STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
         SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
         TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
         ZEROMV, add_residual_block, inter_predict_sample, inter_predict_subpel_unscaled_block,
         inter_predict_subpel_unscaled_block_scalar, intra_predict_block, parse_intra_tiles,
-        read_coef, select_inter_mv,
+        read_coef, scan_table, select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -8016,6 +8081,7 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: Some(ReferenceFrames::new(references)),
+                residual: ResidualBuffers::new(),
             };
             let mut block = test_block(false);
             block.is_inter = true;
@@ -8113,6 +8179,7 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: None,
+                residual: ResidualBuffers::new(),
             };
 
             assert!(
@@ -8167,9 +8234,10 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            residual: ResidualBuffers::new(),
         };
 
-        let coefficients = parser
+        parser
             .tokens(
                 0,
                 (0, 0),
@@ -8179,6 +8247,7 @@ mod tests {
                 test_block(false),
             )
             .unwrap();
+        let coefficients = &parser.residual.coefficients;
 
         assert!(!coefficients.nonzero_context());
         assert_eq!(coefficients.eob, 0);
@@ -8221,9 +8290,10 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: None,
+                residual: ResidualBuffers::new(),
             };
 
-            let coefficients = parser
+            parser
                 .tokens(
                     0,
                     (4, 8),
@@ -8233,6 +8303,7 @@ mod tests {
                     test_block(false),
                 )
                 .unwrap();
+            let coefficients = &parser.residual.coefficients;
 
             assert!(coefficients.nonzero_context());
             assert_eq!(coefficients.eob, 2);
@@ -8245,6 +8316,74 @@ mod tests {
             assert_eq!(coefficients.coefficients[4], expected);
             assert_eq!(parser.decoder.finish(), Ok(()));
         }
+    }
+
+    #[test]
+    fn token_workspace_clears_previous_scan_prefix_before_reuse() {
+        let sign_probabilities = sign_bit_test_probabilities();
+        let zero_probabilities = FrameContext::DEFAULT;
+        let mut contexts = TileModeContexts::new(1).unwrap();
+        let mut counts = SyntaxCounts::default();
+        let mut parser = TileParser {
+            decoder: BoolDecoder::new(&[0x01, 0x80]).unwrap(),
+            probabilities: &sign_probabilities,
+            counts: &mut counts,
+            contexts: &mut contexts,
+            tx_mode: TxMode::Only4x4,
+            frame_is_intra: true,
+            frame_width: 8,
+            frame_height: 8,
+            reference_mode: ReferenceMode::Single,
+            compound_reference: None,
+            interpolation_filter: None,
+            allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
+            ref_frame_sign_bias: [false; 4],
+            lossless: true,
+            dequant: FrameDequant::new(0, 0, 0, 0),
+            segmentation: crate::header::SegmentationParams::disabled(),
+            segment_map_reset: false,
+            mi_rows: 1,
+            mi_cols: 1,
+            tile_col_start: 0,
+            tile_col_end: 1,
+            left_row_base: 0,
+            prev_frame_modes: None,
+            current_frame_modes: None,
+            reference_frames: None,
+            residual: ResidualBuffers::new(),
+        };
+
+        parser
+            .tokens(
+                0,
+                (4, 8),
+                TxSize::Tx4x4,
+                0,
+                BlockSize::Block8x8,
+                test_block(false),
+            )
+            .unwrap();
+        assert_eq!(parser.residual.coefficients.coefficients[4], 1);
+        assert_eq!(parser.residual.token_cache[..16], [0; 16]);
+
+        parser.decoder = BoolDecoder::new(&[0x00, 0x00]).unwrap();
+        parser.probabilities = &zero_probabilities;
+        parser
+            .tokens(
+                0,
+                (4, 8),
+                TxSize::Tx4x4,
+                0,
+                BlockSize::Block8x8,
+                test_block(false),
+            )
+            .unwrap();
+
+        assert_eq!(parser.residual.coefficients.eob, 0);
+        assert_eq!(parser.residual.coefficients.coefficients[4], 0);
+        assert!(parser.residual.quantized_dirty.is_none());
+        assert_eq!(parser.decoder.finish(), Ok(()));
     }
 
     #[test]
@@ -8268,27 +8407,45 @@ mod tests {
         let dequant = FrameDequant::new(4, 2, 0, 0);
         let mut tx16 =
             TransformCoefficients::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct).unwrap();
+        let tx16_ac = usize::from(scan_table(tx16.block.tx_size, tx16.block.tx_type)[1]);
         tx16.set_quantized(0, 2).unwrap();
-        tx16.set_quantized(1, 4).unwrap();
+        tx16.set_quantized(tx16_ac, 4).unwrap();
         tx16.set_eob(2).unwrap();
 
-        let output16 = dequant.dequantize(&tx16, 0);
+        let mut output16 = DequantizedCoefficients::empty();
+        dequant
+            .dequantize_into(
+                &tx16,
+                0,
+                scan_table(tx16.block.tx_size, tx16.block.tx_type),
+                &mut output16,
+            )
+            .unwrap();
         assert_eq!(output16.block, tx16.block);
         assert_eq!(output16.eob, 2);
         assert_eq!(output16.coefficients[0], 24);
-        assert_eq!(output16.coefficients[1], 44);
+        assert_eq!(output16.coefficients[tx16_ac], 44);
 
         let mut tx32 =
             TransformCoefficients::new(0, (8, 16), TxSize::Tx32x32, TxType::DctDct).unwrap();
+        let tx32_ac = usize::from(scan_table(tx32.block.tx_size, tx32.block.tx_type)[1]);
         tx32.set_quantized(0, 2).unwrap();
-        tx32.set_quantized(1, 4).unwrap();
+        tx32.set_quantized(tx32_ac, 4).unwrap();
         tx32.set_eob(2).unwrap();
 
-        let output32 = dequant.dequantize(&tx32, 0);
+        let mut output32 = DequantizedCoefficients::empty();
+        dequant
+            .dequantize_into(
+                &tx32,
+                0,
+                scan_table(tx32.block.tx_size, tx32.block.tx_type),
+                &mut output32,
+            )
+            .unwrap();
         assert_eq!(output32.block, tx32.block);
         assert_eq!(output32.eob, 2);
         assert_eq!(output32.coefficients[0], 12);
-        assert_eq!(output32.coefficients[1], 22);
+        assert_eq!(output32.coefficients[tx32_ac], 22);
     }
 
     #[test]
@@ -8323,6 +8480,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            residual: ResidualBuffers::new(),
         };
 
         assert_eq!(
@@ -8361,6 +8519,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            residual: ResidualBuffers::new(),
         };
 
         assert_eq!(
@@ -8469,6 +8628,7 @@ mod tests {
                 prev_frame_modes: Some(prev_frame_modes),
                 current_frame_modes: Some(current_frame_modes),
                 reference_frames: None,
+                residual: ResidualBuffers::new(),
             };
             let mut block = test_block(true);
             block.segment_id = 0;
@@ -8554,6 +8714,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: Some(current_modes),
             reference_frames: None,
+            residual: ResidualBuffers::new(),
         };
 
         let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();

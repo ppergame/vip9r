@@ -37,6 +37,15 @@ pub(super) struct TransformCoefficients {
 }
 
 impl TransformCoefficients {
+    pub(super) const fn empty() -> Self {
+        Self {
+            block: TransformBlock::new(0, (0, 0), TxSize::Tx4x4, TxType::DctDct),
+            coefficients: [0; MAX_TX_COEFFS],
+            eob: 0,
+        }
+    }
+
+    #[cfg(feature = "wasm-tests")]
     pub(super) fn new(
         plane: usize,
         start: (usize, usize),
@@ -52,6 +61,22 @@ impl TransformCoefficients {
             coefficients: [0; MAX_TX_COEFFS],
             eob: 0,
         })
+    }
+
+    pub(super) fn reset(
+        &mut self,
+        plane: usize,
+        start: (usize, usize),
+        tx_size: TxSize,
+        tx_type: TxType,
+    ) -> Result<(), TileSyntaxError> {
+        if plane >= PLANES {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        self.block = TransformBlock::new(plane, start, tx_size, tx_type);
+        self.eob = 0;
+        Ok(())
     }
 
     pub(super) fn set_signed(
@@ -100,6 +125,13 @@ impl TransformCoefficients {
     pub(super) const fn nonzero_context(&self) -> bool {
         self.eob > 0
     }
+
+    pub(super) fn clear_scan_prefix(&mut self, scan: &[u16], eob: usize) {
+        for &pos in scan.iter().take(eob) {
+            self.coefficients[usize::from(pos)] = 0;
+        }
+        self.eob = 0;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,6 +143,16 @@ pub(super) struct DequantizedCoefficients {
 }
 
 impl DequantizedCoefficients {
+    pub(super) const fn empty() -> Self {
+        Self {
+            block: TransformBlock::new(0, (0, 0), TxSize::Tx4x4, TxType::DctDct),
+            coefficients: [0; MAX_TX_COEFFS],
+            eob: 0,
+            nonzero_row_mask: 0,
+        }
+    }
+
+    #[cfg(feature = "wasm-tests")]
     fn new(block: TransformBlock, eob: usize) -> Self {
         Self {
             block,
@@ -118,6 +160,19 @@ impl DequantizedCoefficients {
             eob,
             nonzero_row_mask: 0,
         }
+    }
+
+    pub(super) fn reset(&mut self, block: TransformBlock, eob: usize) {
+        self.block = block;
+        self.eob = eob;
+        self.nonzero_row_mask = 0;
+    }
+
+    pub(super) fn clear_transform_extent(&mut self) {
+        let count = coefficient_count(self.block.tx_size);
+        self.coefficients[..count].fill(0);
+        self.eob = 0;
+        self.nonzero_row_mask = 0;
     }
 
     pub(super) fn inverse_transform(&mut self, lossless: bool) -> Result<(), TileSyntaxError> {
@@ -477,43 +532,48 @@ impl FrameDequant {
         ac_q(self.get_qindex_for_segment(segment_id) + delta)
     }
 
-    pub(super) fn dequantize(
+    pub(super) fn dequantize_into(
         self,
         input: &TransformCoefficients,
         segment_id: u8,
-    ) -> DequantizedCoefficients {
-        let mut output = DequantizedCoefficients::new(input.block, input.eob);
+        scan: &[u16],
+        output: &mut DequantizedCoefficients,
+    ) -> Result<(), TileSyntaxError> {
+        output.reset(input.block, input.eob);
         if input.eob == 0 {
-            return output;
+            return Ok(());
         }
 
         let count = coefficient_count(input.block.tx_size);
-        let width = transform_width(input.block.tx_size);
+        if input.eob > count {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let row_shift = 2 + input.block.tx_size.index();
         let dq_denom = dq_denom(input.block.tx_size);
         let dc_quant = self.get_dc_quant_for_segment(input.block.plane, segment_id);
         let ac_quant = self.get_ac_quant_for_segment(input.block.plane, segment_id);
 
-        if input.eob == 1 {
-            let coefficient = input.coefficients[0];
-            if coefficient != 0 {
-                output.coefficients[0] = (i32::from(coefficient) * dc_quant) / dq_denom;
-                output.nonzero_row_mask = 1;
+        for c in 0..input.eob {
+            let pos = usize::from(*scan.get(c).ok_or(TileSyntaxError::InvalidBitstream)?);
+            if pos >= count {
+                return Err(TileSyntaxError::InvalidBitstream);
             }
-            return output;
-        }
 
-        for pos in 0..count {
-            let coefficient = input.coefficients[pos];
+            let coefficient = *input
+                .coefficients
+                .get(pos)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
             if coefficient == 0 {
                 continue;
             }
 
             let quant = if pos == 0 { dc_quant } else { ac_quant };
             output.coefficients[pos] = (i32::from(coefficient) * quant) / dq_denom;
-            output.nonzero_row_mask |= 1u32 << (pos / width);
+            output.nonzero_row_mask |= 1u32 << (pos >> row_shift);
         }
 
-        output
+        Ok(())
     }
 }
 
@@ -907,12 +967,7 @@ fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSy
         }
         for i in 0..=1 {
             for j in 0..=3 {
-                h_simd(
-                    t,
-                    n1 + n3 * j + i,
-                    n1 + n2 - 5 + n3 * j - i,
-                    (j & 1) != 0,
-                );
+                h_simd(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0);
             }
         }
     }
