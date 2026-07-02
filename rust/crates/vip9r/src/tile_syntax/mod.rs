@@ -40,7 +40,6 @@ const SUBSAMPLING_Y: usize = 1;
 const MAX_TX_COEFFS: usize = 1024;
 const MAX_TX_WIDTH: usize = 32;
 const MAX_INTRA_ABOVE: usize = MAX_TX_WIDTH * 2;
-const TOKEN_TREE_NODES: usize = 10;
 const REF_LISTS: usize = 2;
 const SUB_BLOCKS: usize = 4;
 const INTRA_FRAME: u8 = 0;
@@ -2371,33 +2370,47 @@ impl TileParser<'_, '_, '_> {
         let mut token_cache = [0u8; MAX_TX_COEFFS];
         let mut check_eob = true;
         let mut c = 0usize;
+        let scan = scan_table(tx_size, tx_type);
+        let coef_bands = coef_band_table(tx_size);
+        let dc_ctx = self.contexts.coef_context(
+            self.left_row_base,
+            plane,
+            start,
+            tx_size,
+            (self.mi_rows, self.mi_cols),
+        )?;
+        let tx_index = tx_size.index();
+        let plane_type = usize::from(plane > 0);
+        let ref_type = usize::from(block.is_inter);
+        let coef_probs = &self.probabilities.coef_probs[tx_index][plane_type][ref_type];
+        let counts = &mut *self.counts;
+        let counts_more_coefs = &mut counts.counts_more_coefs[tx_index][plane_type][ref_type];
+        let counts_token = &mut counts.counts_token[tx_index][plane_type][ref_type];
+        let decoder = &mut self.decoder;
 
         while c < seg_eob {
-            let pos = scan_pos(tx_size, tx_type, c)?;
-            let band = coef_band(tx_size, c);
+            let pos = usize::from(scan[c]);
+            let band = usize::from(coef_bands[c]);
             let ctx = if c == 0 {
-                self.contexts.coef_context(
-                    self.left_row_base,
-                    plane,
-                    start,
-                    tx_size,
-                    (self.mi_rows, self.mi_cols),
-                )?
+                dc_ctx
             } else {
                 coefficient_token_context(pos, tx_size, tx_type, &token_cache)?
             };
+            let probability_row = &coef_probs[band][ctx];
 
-            if check_eob && !self.read_more_coefs(tx_size, plane, band, ctx, block)? {
+            if check_eob
+                && !read_more_coefs(decoder, probability_row, &mut counts_more_coefs[band][ctx])?
+            {
                 break;
             }
 
-            let token = self.read_token(tx_size, plane, band, ctx, block)?;
+            let token = read_token(decoder, probability_row, &mut counts_token[band][ctx])?;
             token_cache[pos] = ENERGY_CLASS[token.index()];
             if token == CoefToken::Zero {
                 check_eob = false;
             } else {
-                let coef = self.read_coef(token)?;
-                let sign_bit = self.decoder.read_literal(1)?;
+                let coef = read_coef(decoder, token)?;
+                let sign_bit = decoder.read_literal(1)?;
                 coefficients.set_signed(pos, coef, sign_bit)?;
                 check_eob = true;
             }
@@ -2433,92 +2446,6 @@ impl TileParser<'_, '_, '_> {
             IntraMode::from_raw(block.y_mode).ok_or(TileSyntaxError::InvalidBitstream)?
         };
         Ok(MODE_TO_TXFM_MAP[mode.index()])
-    }
-
-    fn read_more_coefs(
-        &mut self,
-        tx_size: TxSize,
-        plane: usize,
-        band: usize,
-        ctx: usize,
-        block: DecodedBlockInfo,
-    ) -> Result<bool, TileSyntaxError> {
-        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)]
-            [usize::from(block.is_inter)][band][ctx][0];
-        let more_coefs = self.decoder.read_bool(prob)?;
-        increment_count(
-            &mut self.counts.counts_more_coefs[tx_size.index()][usize::from(plane > 0)]
-                [usize::from(block.is_inter)][band][ctx][bool_index(more_coefs)],
-        );
-        Ok(more_coefs)
-    }
-
-    fn read_token(
-        &mut self,
-        tx_size: TxSize,
-        plane: usize,
-        band: usize,
-        ctx: usize,
-        block: DecodedBlockInfo,
-    ) -> Result<CoefToken, TileSyntaxError> {
-        let mut index = 0usize;
-        loop {
-            let node = index >> 1;
-            let probability = self.token_probability(tx_size, plane, band, ctx, node, block)?;
-            let bit = usize::from(self.decoder.read_bool(probability)?);
-            let next = *TOKEN_TREE
-                .get(
-                    index
-                        .checked_add(bit)
-                        .ok_or(TileSyntaxError::InvalidBitstream)?,
-                )
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            if next <= 0 {
-                let raw = u8::try_from(-next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-                let token = CoefToken::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-                increment_count(
-                    &mut self.counts.counts_token[tx_size.index()][usize::from(plane > 0)]
-                        [usize::from(block.is_inter)][band][ctx][core::cmp::min(2, token.index())],
-                );
-                return Ok(token);
-            }
-            index = usize::try_from(next).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        }
-    }
-
-    fn token_probability(
-        &self,
-        tx_size: TxSize,
-        plane: usize,
-        band: usize,
-        ctx: usize,
-        node: usize,
-        block: DecodedBlockInfo,
-    ) -> Result<u8, TileSyntaxError> {
-        if node >= TOKEN_TREE_NODES {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-        let prob_index = core::cmp::min(2, node + 1);
-        let prob = self.probabilities.coef_probs[tx_size.index()][usize::from(plane > 0)]
-            [usize::from(block.is_inter)][band][ctx][prob_index];
-        pareto(node, prob)
-    }
-
-    fn read_coef(&mut self, token: CoefToken) -> Result<u32, TileSyntaxError> {
-        let [cat, num_extra, base] = EXTRA_BITS[token.index()];
-        let mut coef = u32::from(base);
-
-        for e in 0..num_extra {
-            let probability = CAT_PROBS
-                .get(usize::from(cat))
-                .and_then(|probs| probs.get(usize::from(e)))
-                .copied()
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let bit = u32::from(self.decoder.read_bool(probability)?);
-            coef += bit << (u32::from(num_extra) - 1 - u32::from(e));
-        }
-
-        Ok(coef)
     }
 }
 
@@ -5668,23 +5595,6 @@ enum CoefToken {
 }
 
 impl CoefToken {
-    fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            0 => Some(Self::Zero),
-            1 => Some(Self::One),
-            2 => Some(Self::Two),
-            3 => Some(Self::Three),
-            4 => Some(Self::Four),
-            5 => Some(Self::DctValCategory1),
-            6 => Some(Self::DctValCategory2),
-            7 => Some(Self::DctValCategory3),
-            8 => Some(Self::DctValCategory4),
-            9 => Some(Self::DctValCategory5),
-            10 => Some(Self::DctValCategory6),
-            _ => None,
-        }
-    }
-
     const fn index(self) -> usize {
         self as usize
     }
@@ -6210,8 +6120,8 @@ fn clip3(min_value: i32, max_value: i32, value: i32) -> i32 {
     core::cmp::min(core::cmp::max(value, min_value), max_value)
 }
 
-fn scan_pos(tx_size: TxSize, tx_type: TxType, c: usize) -> Result<usize, TileSyntaxError> {
-    let scan: &[u16] = match tx_size {
+fn scan_table(tx_size: TxSize, tx_type: TxType) -> &'static [u16] {
+    match tx_size {
         TxSize::Tx4x4 => match tx_type {
             TxType::AdstDct => &ROW_SCAN_4X4,
             TxType::DctAdst => &COL_SCAN_4X4,
@@ -6228,23 +6138,66 @@ fn scan_pos(tx_size: TxSize, tx_type: TxType, c: usize) -> Result<usize, TileSyn
             TxType::DctDct | TxType::AdstAdst => &DEFAULT_SCAN_16X16,
         },
         TxSize::Tx32x32 => &DEFAULT_SCAN_32X32,
-    };
-    scan.get(c)
-        .copied()
-        .map(usize::from)
-        .ok_or(TileSyntaxError::InvalidBitstream)
+    }
 }
 
-const fn coef_band(tx_size: TxSize, c: usize) -> usize {
-    if matches!(tx_size, TxSize::Tx4x4) {
-        COEFBAND_4X4[c]
-    } else if c < 10 {
-        COEFBAND_8X8PLUS_FIRST[c]
-    } else if c < 21 {
-        4
-    } else {
-        5
+fn coef_band_table(tx_size: TxSize) -> &'static [u8] {
+    match tx_size {
+        TxSize::Tx4x4 => &COEFBAND_4X4,
+        TxSize::Tx8x8 => &COEFBAND_8X8,
+        TxSize::Tx16x16 => &COEFBAND_16X16,
+        TxSize::Tx32x32 => &COEFBAND_32X32,
     }
+}
+
+#[inline(always)]
+fn read_more_coefs(
+    decoder: &mut BoolDecoder<'_>,
+    probability_row: &[u8; 3],
+    counts: &mut [u32; 2],
+) -> Result<bool, TileSyntaxError> {
+    let more_coefs = decoder.read_bool(probability_row[0])?;
+    increment_count(&mut counts[bool_index(more_coefs)]);
+    Ok(more_coefs)
+}
+
+#[inline(always)]
+fn read_token(
+    decoder: &mut BoolDecoder<'_>,
+    probability_row: &[u8; 3],
+    counts: &mut [u32; 3],
+) -> Result<CoefToken, TileSyntaxError> {
+    let mut node = 0usize;
+    loop {
+        let probability = token_probability(probability_row, node)?;
+        let bit = usize::from(decoder.read_bool(probability)?);
+        match TOKEN_TREE[node][bit] {
+            TokenTreeBranch::Node(next) => node = usize::from(next),
+            TokenTreeBranch::Token(token) => {
+                increment_count(&mut counts[coef_token_count_index(token)]);
+                return Ok(token);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn coef_token_count_index(token: CoefToken) -> usize {
+    core::cmp::min(2, token.index())
+}
+
+#[inline(always)]
+fn read_coef(decoder: &mut BoolDecoder<'_>, token: CoefToken) -> Result<u32, TileSyntaxError> {
+    let [cat, num_extra, base] = EXTRA_BITS[token.index()];
+    let mut coef = u32::from(base);
+
+    for e in 0..num_extra {
+        let probability = CAT_PROBS[usize::from(cat)][usize::from(e)];
+        let bit = u32::from(decoder.read_bool(probability)?);
+        coef += bit << (u32::from(num_extra) - 1 - u32::from(e));
+    }
+
+    Ok(coef)
 }
 
 fn coefficient_token_context(
@@ -6298,44 +6251,95 @@ fn coefficient_token_context(
     Ok((1 + cache0 + cache1) >> 1)
 }
 
-fn pareto(node: usize, prob: u8) -> Result<u8, TileSyntaxError> {
-    if node < 2 {
-        return Ok(prob);
+#[inline(always)]
+fn token_probability(probability_row: &[u8; 3], node: usize) -> Result<u8, TileSyntaxError> {
+    if node == 0 {
+        Ok(probability_row[1])
+    } else if node == 1 {
+        Ok(probability_row[2])
+    } else {
+        pareto(node - 2, probability_row[2])
     }
+}
+
+#[inline(always)]
+fn pareto(table_index: usize, prob: u8) -> Result<u8, TileSyntaxError> {
     if prob == 0 {
         return Err(TileSyntaxError::InvalidBitstream);
     }
-    let table_index = node - 2;
     let x = usize::from((prob - 1) / 2);
     if prob & 1 != 0 {
-        PARETO_TABLE
-            .get(x)
-            .and_then(|row| row.get(table_index))
-            .copied()
-            .ok_or(TileSyntaxError::InvalidBitstream)
+        Ok(PARETO_TABLE[x][table_index])
     } else {
-        let a = u16::from(
-            PARETO_TABLE
-                .get(x)
-                .and_then(|row| row.get(table_index))
-                .copied()
-                .ok_or(TileSyntaxError::InvalidBitstream)?,
-        );
-        let b = u16::from(
-            PARETO_TABLE
-                .get(x.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?)
-                .and_then(|row| row.get(table_index))
-                .copied()
-                .ok_or(TileSyntaxError::InvalidBitstream)?,
-        );
+        let a = u16::from(PARETO_TABLE[x][table_index]);
+        let b = u16::from(PARETO_TABLE[usize::from(prob / 2)][table_index]);
         Ok(((a + b) >> 1) as u8)
     }
 }
 
-const COEFBAND_4X4: [usize; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
-const COEFBAND_8X8PLUS_FIRST: [usize; 10] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+const fn coef_band_8x8plus<const N: usize>() -> [u8; N] {
+    let mut bands = [0u8; N];
+    let mut c = 0usize;
+    while c < N {
+        bands[c] = if c < 10 {
+            COEFBAND_8X8PLUS_FIRST[c]
+        } else if c < 21 {
+            4
+        } else {
+            5
+        };
+        c += 1;
+    }
+    bands
+}
+
+const COEFBAND_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+const COEFBAND_8X8PLUS_FIRST: [u8; 10] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+const COEFBAND_8X8: [u8; 64] = coef_band_8x8plus::<64>();
+const COEFBAND_16X16: [u8; 256] = coef_band_8x8plus::<256>();
+const COEFBAND_32X32: [u8; 1024] = coef_band_8x8plus::<1024>();
 
 const ENERGY_CLASS: [u8; 11] = [0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5];
+
+#[derive(Clone, Copy)]
+enum TokenTreeBranch {
+    Node(u8),
+    Token(CoefToken),
+}
+
+const TOKEN_TREE: [[TokenTreeBranch; 2]; 10] = [
+    [
+        TokenTreeBranch::Token(CoefToken::Zero),
+        TokenTreeBranch::Node(1),
+    ],
+    [
+        TokenTreeBranch::Token(CoefToken::One),
+        TokenTreeBranch::Node(2),
+    ],
+    [TokenTreeBranch::Node(3), TokenTreeBranch::Node(5)],
+    [
+        TokenTreeBranch::Token(CoefToken::Two),
+        TokenTreeBranch::Node(4),
+    ],
+    [
+        TokenTreeBranch::Token(CoefToken::Three),
+        TokenTreeBranch::Token(CoefToken::Four),
+    ],
+    [TokenTreeBranch::Node(6), TokenTreeBranch::Node(7)],
+    [
+        TokenTreeBranch::Token(CoefToken::DctValCategory1),
+        TokenTreeBranch::Token(CoefToken::DctValCategory2),
+    ],
+    [TokenTreeBranch::Node(8), TokenTreeBranch::Node(9)],
+    [
+        TokenTreeBranch::Token(CoefToken::DctValCategory3),
+        TokenTreeBranch::Token(CoefToken::DctValCategory4),
+    ],
+    [
+        TokenTreeBranch::Token(CoefToken::DctValCategory5),
+        TokenTreeBranch::Token(CoefToken::DctValCategory6),
+    ],
+];
 
 const MODE_TO_TXFM_MAP: [TxType; INTRA_MODES] = [
     TxType::DctDct,
@@ -6423,29 +6427,6 @@ const SUBPEL_FILTERS: [[[i16; 8]; 16]; 4] = [
         [0, 0, 0, 16, 112, 0, 0, 0],
         [0, 0, 0, 8, 120, 0, 0, 0],
     ],
-];
-
-const TOKEN_TREE: [i8; 20] = [
-    -(CoefToken::Zero as i8),
-    2,
-    -(CoefToken::One as i8),
-    4,
-    6,
-    10,
-    -(CoefToken::Two as i8),
-    8,
-    -(CoefToken::Three as i8),
-    -(CoefToken::Four as i8),
-    12,
-    14,
-    -(CoefToken::DctValCategory1 as i8),
-    -(CoefToken::DctValCategory2 as i8),
-    16,
-    18,
-    -(CoefToken::DctValCategory3 as i8),
-    -(CoefToken::DctValCategory4 as i8),
-    -(CoefToken::DctValCategory5 as i8),
-    -(CoefToken::DctValCategory6 as i8),
 ];
 
 const EXTRA_BITS: [[u8; 3]; 11] = [
@@ -6985,7 +6966,7 @@ mod tests {
         REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, STORED_MODE_INFO_BYTES,
         SUB_BLOCKS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
         TileParseBuffers, TileParser, TxSize, TxType, ZEROMV, add_residual_block,
-        inter_predict_sample, intra_predict_block, parse_intra_tiles, select_inter_mv,
+        inter_predict_sample, intra_predict_block, parse_intra_tiles, read_coef, select_inter_mv,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -7587,7 +7568,10 @@ mod tests {
             reference_frames: None,
         };
 
-        assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(5));
+        assert_eq!(
+            read_coef(&mut parser.decoder, CoefToken::DctValCategory1),
+            Ok(5)
+        );
         assert_eq!(parser.decoder.bit_offset(), 1);
         assert_eq!(parser.decoder.finish(), Ok(()));
 
@@ -7622,7 +7606,10 @@ mod tests {
             reference_frames: None,
         };
 
-        assert_eq!(parser.read_coef(CoefToken::DctValCategory1), Ok(6));
+        assert_eq!(
+            read_coef(&mut parser.decoder, CoefToken::DctValCategory1),
+            Ok(6)
+        );
         assert_eq!(parser.decoder.finish(), Ok(()));
     }
 

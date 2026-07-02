@@ -402,3 +402,18 @@ milestones, and measured optimization results.
   conditions the position penalty is ~2%. Sub-2% deltas remain
   non-credible, and orchestrator-side controls (no-op candidate) are the
   cheap way to re-anchor when the device has been under sustained load.
+
+## 2026-07-02 — coefficient token loop hoisting
+
+- Hoisted block-invariant lookups out of the coefficient token loop: the
+  probability/counts subarrays (previously a 6-level index chain re-derived
+  per bool read), the scan and band tables (now per-size const slices), and
+  the DC context. The token tree walk moved to a const-shaped
+  `TokenTreeBranch` table, dropping per-node bounds checks and error
+  mapping. Counts and syntax are bit-identical; adaptation is unaffected.
+- Grinder-measured against same-position no-op controls: ~1.7-2.0% faster
+  full decode on the X4 — at the measurement credibility threshold, kept
+  for the hot-loop simplification as much as the delta. Rejected variants
+  that measured worse: fully unrolled token tree, precomputed
+  neighbor-context tables, direct coefficient writes, small-token coef
+  fast path. Compliance corpus green (307/307).
