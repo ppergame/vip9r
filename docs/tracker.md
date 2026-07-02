@@ -275,20 +275,38 @@ for residual/copy passes, jellyfish for subpel.
       samples are diffuse V8 C++ (max 64B bucket ~0.5% of total), mostly
       excluded by the H1 window. libc memcpy/memset share is real decode
       cost, per the windowed profiles above
-- [ ] P1 (+P6) — residual path restructure: persistent per-parser coeff
-      storage with tx-size-scoped clears, eob-bounded dequant in scan
-      order, skip reconstruct at eob==0, kill by-value struct moves;
-      ride-along entropy micro (shift/mask in coefficient_token_context,
-      tx-scoped token_cache clear). Re-test "direct coef writes" inside the
-      new structure
+- [x] P1 (+P6) — residual path restructure: parser-owned ResidualBuffers,
+      scan-prefix-scoped clears, eob-bounded dequant in scan order,
+      eob==0 skips dequant/IDCT/reconstruct, no by-value struct moves,
+      shift/mask in coefficient_token_context. A55 −16.1% BBB / −14.2%
+      jellyfish (spread ~0.5%). Parse→dequant fusion not re-tested
+      (deferred; clean comparison now possible inside new structure)
+Post-P1 A55 re-attribution (inline(never) split of decode_block, BBB):
+tokens 18% / decode_residual traversal glue 16% / predict_intra 10% /
+decode_partition 4.5% / add_residual 4.3% / mode-info syntax ~6% /
+dequantize 2.4%. libc collapsed to 6%/4% (BBB/jelly) after P1, so P3
+shrank; traversal glue and intra prediction were promoted.
+
+- [x] P1b — residual traversal restructure: measured negative, not
+      merged. Three correct hoist/slice/unsafe variants all *regressed*
+      A55 (+1.6..3.1%); the skip-block context-fill fast path alone was
+      exactly noise on both clips. TurboFan already elides the checked
+      ceremony; the traversal's 16% attribution is intrinsic loop work +
+      code layout, not removable branches. Feeds the P5 icache/layout
+      question — treat decode_block-region layout as fragile
 - [ ] P2 — simd `add_residual_block`: row-slice widening add + saturating
       narrow, interior fast path, per-pixel checked path at frame edges
-- [ ] P3 — small-copy elimination in prediction paths: explicit v128 lane
-      load/stores for 4–64B row classes (integer-MV copy, edge gather,
-      interp rows); drop the 5KB interp-buffer zero-init
+      (4.3% BBB; task file ready)
+- [ ] P-intra — predict_intra fast path: 10% on BBB; profile-split first
+      (predictor kernels vs edge gather), then common-mode (DC/V/H/TM)
+      row-slice or simd paths
 - [ ] P4 — convolution kernel v2: i16-domain extmul MAC, shuffle-based tap
       gather instead of per-tap bounds-checked loads, vertical sliding
-      register window
+      register window (jellyfish subpel 21.6% post-P1). Fold in the
+      5KB interp-buffer zero-init drop from old P3
+- [ ] P3 (demoted) — small-copy elimination in prediction paths: libc is
+      down to 6%/4% post-P1; only worth a pass if profiles after P4 still
+      show libc/memcpy structure
 - [ ] conditional tail, gated on refreshed A55 profiles: P5 arm32 op-cost
       microbench + icache-refill PMU (decode_block monolith question);
       P7 bool-decoder wide-window A55 re-measure; P8 loop filter simd retry

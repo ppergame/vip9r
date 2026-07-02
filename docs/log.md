@@ -588,3 +588,25 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   **−14.2% jellyfish** (spreads 0.5/0.3%). Host validations across
   quantizer extremes/aq2/tiny-frame vectors and 88/88 wasm tests green;
   compliance corpus 307/307.
+
+## 2026-07-03 — A55 campaign: traversal negative, residual add simd
+
+- Post-P1 re-attribution with an `#[inline(never)]`-instrumented device
+  profile split the decode_block monolith: on big-buck-bunny the entropy
+  token loop is 18%, the residual traversal glue 16%, intra prediction
+  10%, the residual add 4.3%, dequantize 2.4%.
+- Traversal glue restructure measured **negative and was not merged**:
+  three correct hoist/slice variants regressed the A55 +1.6..3.1%, and a
+  skip-block context-fill fast path alone was exactly noise. TurboFan
+  already elides the checked-arithmetic ceremony the profile appeared to
+  charge; that 16% is intrinsic loop work and code layout, not removable
+  branches. Lesson recorded: decode_block-region layout is fragile,
+  scalar "cleanup" passes there are not worth grinder time.
+- `add_residual_block` interior simd merged: rows fully inside the
+  visible plane take a widen→add→two-stage-saturating-narrow v128 path
+  (7 ALU ops + 3 loads + 1 store per 8 pixels; 4-wide rows use 32-bit
+  lanes); frame-edge overhang keeps the checked scalar path. Saturating
+  u8 narrow reproduces scalar `clip1` bit-exactly, pinned by a
+  simd-vs-scalar sweep over tx sizes/overhangs/extreme residuals.
+  Measured on the A55: **−2.6% big-buck-bunny, −3.4% jellyfish**
+  (spreads ~0.4%). Compliance corpus 307/307.

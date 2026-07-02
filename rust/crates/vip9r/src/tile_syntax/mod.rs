@@ -4180,6 +4180,34 @@ fn add_residual_block(
     residuals: &[i32; MAX_TX_COEFFS],
 ) -> Result<(), TileSyntaxError> {
     let size = transform_width(tx_size);
+    if residual_block_inside(plane, start, size) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return add_residual_block_interior_simd(plane, start, size, residuals);
+        }
+    }
+
+    add_residual_block_scalar(plane, start, size, residuals)
+}
+
+#[inline(always)]
+fn residual_block_inside(plane: &CurrentPlaneMut<'_>, start: (usize, usize), size: usize) -> bool {
+    start
+        .0
+        .checked_add(size)
+        .is_some_and(|right| right <= plane.width)
+        && start
+            .1
+            .checked_add(size)
+            .is_some_and(|bottom| bottom <= plane.height)
+}
+
+fn add_residual_block_scalar(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    size: usize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
     for row in 0..size {
         let y = start
             .1
@@ -4202,6 +4230,102 @@ fn add_residual_block(
         }
     }
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn add_residual_block_interior_simd(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    size: usize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    debug_assert!(residual_block_inside(plane, start, size));
+
+    for row in 0..size {
+        let y = start
+            .1
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_start = y
+            .checked_mul(plane.stride)
+            .and_then(|base| base.checked_add(start.0))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_end = dst_start
+            .checked_add(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst = plane
+            .data
+            .get_mut(dst_start..dst_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_start = row
+            .checked_mul(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_end = residual_start
+            .checked_add(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_row = residuals
+            .get(residual_start..residual_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+        add_residual_row_simd(dst, residual_row);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn add_residual_row_simd(dst: &mut [u8], residuals: &[i32]) {
+    debug_assert_eq!(dst.len(), residuals.len());
+
+    let mut col = 0;
+    while col + 8 <= dst.len() {
+        let prediction = unsafe { v128_load64_zero(dst.as_ptr().wrapping_add(col).cast::<u64>()) };
+        let residual_lo = unsafe { v128_load(residuals.as_ptr().wrapping_add(col).cast::<v128>()) };
+        let residual_hi =
+            unsafe { v128_load(residuals.as_ptr().wrapping_add(col + 4).cast::<v128>()) };
+        let reconstruction = add_residual_8(prediction, residual_lo, residual_hi);
+        unsafe {
+            v128_store64_lane::<0>(
+                reconstruction,
+                dst.as_mut_ptr().wrapping_add(col).cast::<u64>(),
+            );
+        }
+        col += 8;
+    }
+    if col + 4 <= dst.len() {
+        let prediction = unsafe { v128_load32_zero(dst.as_ptr().wrapping_add(col).cast::<u32>()) };
+        let residuals = unsafe { v128_load(residuals.as_ptr().wrapping_add(col).cast::<v128>()) };
+        let reconstruction = add_residual_4(prediction, residuals);
+        unsafe {
+            v128_store32_lane::<0>(
+                reconstruction,
+                dst.as_mut_ptr().wrapping_add(col).cast::<u32>(),
+            );
+        }
+        col += 4;
+    }
+
+    debug_assert_eq!(col, dst.len());
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn add_residual_8(prediction: v128, residual_lo: v128, residual_hi: v128) -> v128 {
+    let predicted = i16x8_extend_low_u8x16(prediction);
+    let lo = i32x4_add(i32x4_extend_low_i16x8(predicted), residual_lo);
+    let hi = i32x4_add(i32x4_extend_high_i16x8(predicted), residual_hi);
+    let packed_i16 = i16x8_narrow_i32x4(lo, hi);
+    u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn add_residual_4(prediction: v128, residuals: v128) -> v128 {
+    let predicted = i16x8_extend_low_u8x16(prediction);
+    let reconstruction = i32x4_add(i32x4_extend_low_i16x8(predicted), residuals);
+    let packed_i16 = i16x8_narrow_i32x4(reconstruction, i32x4_splat(0));
+    u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7674,9 +7798,10 @@ mod tests {
         ResidualBuffers, STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
         SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
         TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
-        ZEROMV, add_residual_block, inter_predict_sample, inter_predict_subpel_unscaled_block,
-        inter_predict_subpel_unscaled_block_scalar, intra_predict_block, parse_intra_tiles,
-        read_coef, scan_table, select_inter_mv,
+        ZEROMV, add_residual_block, add_residual_block_scalar, inter_predict_sample,
+        inter_predict_subpel_unscaled_block, inter_predict_subpel_unscaled_block_scalar,
+        intra_predict_block, parse_intra_tiles, read_coef, scan_table, select_inter_mv,
+        transform_width,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -7950,6 +8075,83 @@ mod tests {
         assert_eq!(data[1], 0);
         assert_eq!(data[2], 120);
         assert_eq!(data[15], 99);
+    }
+
+    #[test]
+    fn reconstruction_simd_fast_path_matches_scalar_reference() -> Result<(), TileSyntaxError> {
+        const MAX_STRIDE: usize = 48;
+        const MAX_HEIGHT: usize = 40;
+        const TX_SIZES: [TxSize; 4] = [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ];
+
+        for tx_size in TX_SIZES {
+            let size = transform_width(tx_size);
+            let cases = [
+                (size + 5, size + 6, (3, 4)),
+                (size, size, (0, 0)),
+                (size + 1, size + 3, (size - 2, 1)),
+                (size + 3, size + 1, (1, size - 2)),
+                (size + 1, size + 1, (size - 2, size - 2)),
+            ];
+
+            for (case_index, (width, height, start)) in cases.into_iter().enumerate() {
+                let stride = MAX_STRIDE;
+                let mut initial = [0u8; MAX_STRIDE * MAX_HEIGHT];
+                let mut seed = 0x0102_0304u32 ^ ((size as u32) << 16) ^ ((case_index as u32) << 8);
+                fill_pseudorandom(&mut initial, &mut seed);
+
+                let mut residuals = [0i32; MAX_TX_COEFFS];
+                for (index, residual) in residuals[..size * size].iter_mut().enumerate() {
+                    *residual = match index % 8 {
+                        0 => 300,
+                        1 => -300,
+                        2 => 100_000,
+                        3 => -100_000,
+                        4 => 17,
+                        5 => -19,
+                        6 => 255,
+                        _ => -255,
+                    };
+                }
+
+                let mut scalar_data = initial;
+                let mut simd_data = initial;
+                {
+                    let mut scalar_plane = CurrentPlaneMut::new(
+                        &mut scalar_data,
+                        crate::PlaneShape::new(width as u32, height as u32, stride),
+                    )?;
+                    add_residual_block_scalar(&mut scalar_plane, start, size, &residuals)?;
+                }
+                {
+                    let mut simd_plane = CurrentPlaneMut::new(
+                        &mut simd_data,
+                        crate::PlaneShape::new(width as u32, height as u32, stride),
+                    )?;
+                    add_residual_block(&mut simd_plane, start, tx_size, &residuals)?;
+                }
+
+                if scalar_data != simd_data {
+                    let mismatch = scalar_data
+                        .iter()
+                        .zip(simd_data.iter())
+                        .position(|(scalar, simd)| scalar != simd)
+                        .expect("mismatch exists");
+                    panic!(
+                        "residual reconstruction mismatch: tx_size={tx_size:?} \
+                         case={case_index} width={width} height={height} start={start:?} \
+                         index={mismatch} scalar={} simd={}",
+                        scalar_data[mismatch], simd_data[mismatch]
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[test]
