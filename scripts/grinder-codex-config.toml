@@ -10,6 +10,7 @@ web_search = "disabled"
 model_instructions_file = "/run/system.md"
 sqlite_home = "/run/codex-state"
 check_for_update_on_startup = false
+service_tier = "fast"
 
 [features]
 apps = false
