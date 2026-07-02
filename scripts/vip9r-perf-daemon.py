@@ -300,7 +300,9 @@ def remove_stale_socket() -> None:
 
 
 def run_serve(args: argparse.Namespace) -> int:
-    serials: list[str] = args.serial
+    # Sort so device indexes are stable across sessions regardless of
+    # --serial argument order.
+    serials: list[str] = sorted(args.serial)
     if len(serials) != len(set(serials)):
         print("duplicate --serial", file=sys.stderr)
         return 2
