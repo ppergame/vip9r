@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         type=parse_non_negative_int,
-        help="daemon device index (default: VIP9R_PERF_DEVICE or 0)",
+        help="daemon device index (default: VIP9R_PERF_DEVICE)",
     )
     parser.add_argument(
         "--pin",
@@ -74,11 +74,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_frame_range,
         help="output-frame selection as START:LAST",
     )
-    bench.add_argument(
+    bench_baseline = bench.add_mutually_exclusive_group()
+    bench_baseline.add_argument(
         "--baseline",
         type=Path,
-        help="baseline wasm file (default: VIP9R_PERF_BASELINE, else the"
-        " candidate itself as a no-op control)",
+        help="baseline wasm file (default: VIP9R_PERF_BASELINE)",
+    )
+    bench_baseline.add_argument(
+        "--no-op-control",
+        action="store_true",
+        help="A/B the candidate against itself to measure harness noise",
     )
 
     tests = subparsers.add_parser("tests", help="run wasm unit tests")
@@ -155,7 +160,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"submit: {error}", file=sys.stderr)
             return 2
         device_index = args.device if args.device is not None else env_device
-        request["device"] = 0 if device_index is None else device_index
+        if device_index is None:
+            parser.error("--target device requires --device N (or VIP9R_PERF_DEVICE)")
+        request["device"] = device_index
         pin = args.pin if args.pin is not None else env_pin
         if pin is not None:
             request["pin"] = pin
@@ -213,16 +220,21 @@ def main(argv: list[str] | None = None) -> int:
 
     baseline: bytes | None = None
     if args.command == "bench":
-        baseline_path = args.baseline
-        if baseline_path is None:
-            env_baseline = os.environ.get("VIP9R_PERF_BASELINE")
-            if env_baseline:
-                baseline_path = Path(env_baseline)
-        if baseline_path is None:
-            # No-op control: an A/B run of identical wasm measures the
-            # harness, not a change.
+        if args.no_op_control:
+            # An A/B run of identical wasm measures the harness, not a
+            # change; only run one on purpose.
             baseline = candidate
         else:
+            baseline_path = args.baseline
+            if baseline_path is None:
+                env_baseline = os.environ.get("VIP9R_PERF_BASELINE")
+                if env_baseline:
+                    baseline_path = Path(env_baseline)
+            if baseline_path is None:
+                parser.error(
+                    "bench requires --baseline WASM (or VIP9R_PERF_BASELINE),"
+                    " or --no-op-control"
+                )
             try:
                 baseline = baseline_path.read_bytes()
             except OSError as error:

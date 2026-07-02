@@ -94,7 +94,7 @@ in
       usage() {
         printf '%s\n' \
           'usage:' \
-          '  grinder run TASK_FILE [--baseline WASM] [--device INDEX[:PIN]]' \
+          '  grinder run TASK_FILE [--baseline WASM] [--device INDEX:PIN]' \
           '  grinder shell [COMMAND...]' \
           '  grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]' >&2
       }
@@ -157,6 +157,12 @@ in
       fi
       if [[ -n "$baseline_file" && ! -f "$baseline_file" ]]; then
         echo "baseline file not found: $baseline_file" >&2
+        exit 2
+      fi
+      # Core choice is the orchestrator's call, not the grinder's: a device
+      # grant always names its pin.
+      if [[ -n "$device_default" && ! "$device_default" =~ ^[0-9]+:.+$ ]]; then
+        echo "grinder: --device must be INDEX:PIN" >&2
         exit 2
       fi
 
@@ -223,8 +229,8 @@ in
       # Default perf-submit routing for the sandbox: bench baseline and
       # device index:pin ride in as env, overridable per submission.
       if [[ -n "$baseline_file" ]]; then
-        cp -a "$baseline_file" "$run/rootfs/baseline.wasm"
-        podman_args+=(--env VIP9R_PERF_BASELINE=/baseline.wasm)
+        cp -a "$baseline_file" "$run/rootfs/run/baseline.wasm"
+        podman_args+=(--env VIP9R_PERF_BASELINE=/run/baseline.wasm)
       fi
       if [[ -n "$device_default" ]]; then
         podman_args+=(--env VIP9R_PERF_DEVICE="$device_default")

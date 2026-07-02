@@ -13,9 +13,9 @@ requirements.md — suggest changes rather than editing.
     topologies.
   - `./scripts/vip9r-perf-daemon.py prepare --serial <SERIAL>` sync runtime
     files onto the selected device.
-  - `./scripts/vip9r-perf-daemon.py serve --serial <SERIAL> --pin <PIN>` start
-    the queue. `--pin` sets device CPU affinity for run. Choose a CPU based on
-    topology and user request.
+  - `./scripts/vip9r-perf-daemon.py serve [--serial <SERIAL1> [--serial <SERIAL2>...]]`
+    start the device queues. Device and CPU are selected for each request or
+    grinder context.
 - Host-only work: `./scripts/vip9r-perf-daemon.py serve`.
 - `serve` blocks: run it in the background and keep it up for the session. This
   is the server allowing grinders to run wasm code.
@@ -29,9 +29,10 @@ requirements.md — suggest changes rather than editing.
 ## Grinder runs
 
 - Write a task file `temp/task-<slug>.md`.
-- Spawn `nix run .#grinder -- run temp/task-<slug>.md`. The command prints
-  progress updates until the implementor finishes, then prints the final message
-  and a sandbox location like `temp/grinder.XXXXXX`.
+- Spawn
+  `nix run .#grinder -- run temp/task-<slug>.md [--baseline WASM] [--device INDEX:PIN]`.
+  The command prints progress updates until the implementor finishes, then
+  prints the final message and a sandbox location like `temp/grinder.XXXXXX`.
   - Monitor / check up on a new job 2 minutes after starting it.
   - Poll the job every 10 minutes (or the maximum supported by the tooling if
     lower) to check its progress. No need for line-by-line running commentary.

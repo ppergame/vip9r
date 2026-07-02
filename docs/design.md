@@ -266,14 +266,17 @@ A55 ~1489.
 The daemon binds one fixed socket (`temp/perf/vip9r-perf.sock`) and serves a
 host queue plus one queue per `--serial` device, each with its own worker:
 runs on different devices proceed in parallel while access to any one device
-stays serialized. Submissions address a device by index (`--device N`, default
-0) and state the CPU pin per request; timed kinds (bench, microbench, profile)
-require an explicit pin, validate/tests default to `any`. Bench submissions
-carry their own baseline wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE`
-(set inside grinder sandboxes by `grinder run --baseline`), else the candidate
-itself, which makes the default an A/B no-op control. The daemon holds no
-baseline state, so merges do not force a restart; wasm pushes are cached per
-device by blob hash for the daemon's lifetime. Grinder sandboxes bind the
+stays serialized. Submissions address a device by index (`--device N`, or
+`VIP9R_PERF_DEVICE` inside grinder sandboxes) and state the CPU pin per
+request; timed kinds (bench, microbench, profile) require an explicit pin,
+validate/tests default to `any`. Bench submissions carry their own baseline
+wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE` (set inside grinder
+sandboxes by `grinder run --baseline`) — or say `--no-op-control` to A/B the
+candidate against itself for a harness-noise reading. There are no quiet
+fallbacks: a device request without an index or a bench without a stated
+baseline is an error. The daemon holds no baseline state, so merges do not
+force a restart; wasm pushes are cached per device by blob hash for the
+daemon's lifetime. Grinder sandboxes bind the
 socket's parent directory, so a daemon restart while a grinder runs only
 produces connection-refused errors during the gap instead of permanently
 severing the sandbox.

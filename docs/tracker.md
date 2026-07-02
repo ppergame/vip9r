@@ -70,8 +70,9 @@ forced a restart after every merge.
 - [x] `serve` takes a list of devices (`--serial` repeated), one queue and
       worker per device; pin moved entirely to request config (timed kinds
       require an explicit pin, validate/tests default `any`)
-- [x] `vip9r-perf-submit` takes an optional baseline wasm path and a device
-      index; default baseline is the current build (no-op control by default)
+- [x] `vip9r-perf-submit` takes a baseline wasm path and a device index;
+      both are required for device benches (no quiet fallbacks), with
+      `--no-op-control` as the explicit way to A/B a build against itself
 - [x] grinder spawn script: `grinder run TASK --baseline WASM --device
       INDEX[:PIN]` passes sandbox-wide submit defaults via
       `VIP9R_PERF_BASELINE` / `VIP9R_PERF_DEVICE`

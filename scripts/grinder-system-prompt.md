@@ -50,8 +50,7 @@ Workspace crates:
   - `/specs/wasm` - Wasm core spec and Rust Wasm intrinsics
 - `/bulk/vip9r` - VP9 test-vector corpus and frame md5 checksums.
 - `vip9r-perf-submit` on PATH - script to build and submit the Wasm module. The
-  only way to run the code. The orchestrator will communicate whether device
-  testing is necessary.
+  only way to run the code.
 - `/run/tools/bin` on PATH - standard shell and dev tooling for Rust, Wasm and C
   work.
 - `/nix/store` - machine-wide store mounted readonly. Please refrain from
@@ -86,17 +85,11 @@ Depending on the task, you can verify your work with
   /tmp/vip9r-profiles/):
   `vip9r-perf-submit --target device profile --media MEDIA [--frames START:LAST]`
 
-Device submissions go to the device and CPU pin the orchestrator configured
-(`VIP9R_PERF_DEVICE`); `--device N --pin PIN` overrides per submission, and
-timed runs (bench, microbench, profile) refuse to run without a pin. `bench`
-times the candidate against the orchestrator-provided baseline
-(`VIP9R_PERF_BASELINE`, or `--baseline WASM`); without one it A/Bs the
-candidate against itself — a no-op control, useful for judging measurement
-noise but not a change.
-
-Orchestrator will specify correctness and optimization objectives. In any case,
-consider using host (`--target host`, the default) to preflight correctness /
-quickly filter multiple potential approaches.
+Orchestrator will specify correctness and optimization objectives, whether
+device testing is requested. It will also env defaults for baseline wasm file
+and device selection. In any case, consider using host (`--target host`, the
+default) to preflight correctness / quickly filter multiple potential
+approaches.
 
 ## Monitoring updates
 

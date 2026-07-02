@@ -476,9 +476,9 @@ def accept_one(
 def device_lane_from_request(request: dict[str, object], lanes: list[DeviceLane]) -> DeviceLane:
     if not lanes:
         raise ValueError("target device requires a daemon started with --serial")
-    index = request.get("device", 0)
+    index = request.get("device")
     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(lanes):
-        raise ValueError(f"device must be an integer index in 0..{len(lanes) - 1}")
+        raise ValueError(f"device requests state a device index in 0..{len(lanes) - 1}")
     return lanes[index]
 
 
