@@ -32,8 +32,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="run target: host or device",
     )
     parser.add_argument(
+        "--device",
+        type=parse_non_negative_int,
+        help="daemon device index (default: VIP9R_PERF_DEVICE or 0)",
+    )
+    parser.add_argument(
         "--pin",
-        help="device CPU pin: any, all, cpu:N, or mask:HEX",
+        help="device CPU pin: any, all, cpu:N, or mask:HEX"
+        " (default: pin from VIP9R_PERF_DEVICE=INDEX:PIN)",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -67,6 +73,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--frames",
         type=parse_frame_range,
         help="output-frame selection as START:LAST",
+    )
+    bench.add_argument(
+        "--baseline",
+        type=Path,
+        help="baseline wasm file (default: VIP9R_PERF_BASELINE, else the"
+        " candidate itself as a no-op control)",
     )
 
     tests = subparsers.add_parser("tests", help="run wasm unit tests")
@@ -125,14 +137,32 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.target == "host" and args.pin is not None:
-        parser.error("--pin requires --target device")
+    if args.target == "host":
+        if args.pin is not None:
+            parser.error("--pin requires --target device")
+        if args.device is not None:
+            parser.error("--device requires --target device")
     if args.command == "asm" and args.target != "host":
         parser.error("asm runs on the daemon host; pick the ISA with --arch")
     if args.command == "profile" and args.target != "device":
         parser.error("profile requires --target device")
 
     request: dict[str, object] = {"target": args.target}
+    if args.target == "device":
+        try:
+            env_device, env_pin = device_env_default()
+        except RuntimeError as error:
+            print(f"submit: {error}", file=sys.stderr)
+            return 2
+        device_index = args.device if args.device is not None else env_device
+        request["device"] = 0 if device_index is None else device_index
+        pin = args.pin if args.pin is not None else env_pin
+        if pin is not None:
+            request["pin"] = pin
+        elif args.command in ("bench", "microbench", "profile"):
+            parser.error(
+                f"{args.command} on device requires --pin (or VIP9R_PERF_DEVICE=INDEX:PIN)"
+            )
     if args.command == "asm":
         request["kind"] = "asm"
         request["arch"] = args.arch
@@ -169,8 +199,6 @@ def main(argv: list[str] | None = None) -> int:
         tests = False
     else:
         raise AssertionError(f"unknown command: {args.command!r}")
-    if args.pin is not None:
-        request["pin"] = args.pin
 
     socket_path = default_socket_path()
     if socket_path is None:
@@ -183,6 +211,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"candidate: {error}", file=sys.stderr)
         return 2
 
+    baseline: bytes | None = None
+    if args.command == "bench":
+        baseline_path = args.baseline
+        if baseline_path is None:
+            env_baseline = os.environ.get("VIP9R_PERF_BASELINE")
+            if env_baseline:
+                baseline_path = Path(env_baseline)
+        if baseline_path is None:
+            # No-op control: an A/B run of identical wasm measures the
+            # harness, not a change.
+            baseline = candidate
+        else:
+            try:
+                baseline = baseline_path.read_bytes()
+            except OSError as error:
+                print(f"baseline: {error}", file=sys.stderr)
+                return 2
+
     if args.command == "asm":
         file_dir = asm_output_dir(socket_path, candidate, args.arch)
     elif args.command == "profile":
@@ -190,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         file_dir = None
     try:
-        response = submit_request(request, candidate, socket_path, file_dir)
+        response = submit_request(request, candidate, socket_path, file_dir, baseline)
     except RuntimeError as error:
         print(f"submit: {error}", file=sys.stderr)
         return 2
@@ -290,11 +336,22 @@ def git_root() -> Path:
     return Path(completed.stdout.strip())
 
 
+def device_env_default() -> tuple[int | None, str | None]:
+    value = os.environ.get("VIP9R_PERF_DEVICE")
+    if value is None or value == "":
+        return None, None
+    index_text, _, pin = value.partition(":")
+    if not re.fullmatch(r"0|[1-9]\d*", index_text):
+        raise RuntimeError(f"VIP9R_PERF_DEVICE must be INDEX[:PIN]: {value!r}")
+    return int(index_text), pin or None
+
+
 def submit_request(
     request: dict[str, object],
     candidate: bytes,
     socket_path: Path,
     file_dir: Path | None = None,
+    baseline: bytes | None = None,
 ) -> dict[str, object]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_CANDIDATE_BYTES)
@@ -312,6 +369,8 @@ def submit_request(
         else:
             send_json_with_dir_fd(sock, request, file_dir)
         send_record(sock, candidate)
+        if baseline is not None:
+            send_record(sock, baseline)
         while True:
             message = recv_json(sock)
             message_type = message.get("type")

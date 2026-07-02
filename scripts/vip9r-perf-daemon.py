@@ -2,8 +2,9 @@
 import argparse
 import bisect
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The socket lives in its own directory so grinder sandboxes can bind the
@@ -32,6 +34,7 @@ MAX_REQUEST_BYTES = 64 * 1024
 MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 ACCEPT_HANDSHAKE_TIMEOUT_SECONDS = 10
+CLIENT_SEND_TIMEOUT_SECONDS = 30
 RESPONSE_STRING_HEAD_BYTES = 8 * 1024
 RESPONSE_STRING_TAIL_BYTES = 8 * 1024
 U32_MAX = 2**32 - 1
@@ -101,9 +104,21 @@ class DeviceError(RuntimeError):
 @dataclass
 class Job:
     conn: socket.socket
-    request: object
-    candidate: bytes
+    request: dict[str, object]
+    # Per-job scratch directory under the daemon dir; holds the spooled wasm
+    # blobs while queued and handler outputs while running.
+    dir: Path
+    candidate_path: Path
+    candidate_sha256: str
+    baseline_path: Path | None
+    baseline_sha256: str | None
     fds: list[int]
+
+
+def discard_job(job: Job) -> None:
+    close_fds(job.fds)
+    job.conn.close()
+    shutil.rmtree(job.dir, ignore_errors=True)
 
 
 @dataclass
@@ -133,15 +148,16 @@ class DeviceContext:
     d8_version: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class DeviceSession:
     path: str
-    baseline_path: str
+    # sha256 -> device path for wasm blobs already pushed this session.
+    pushed_blobs: dict[str, str] = field(default_factory=dict)
 
 
 class JobQueue:
-    def __init__(self, target: str) -> None:
-        self.target = target
+    def __init__(self, label: str) -> None:
+        self.label = label
         self._ready = threading.Condition()
         self._pending: deque[Job] = deque()
         self._running: Job | None = None
@@ -168,6 +184,9 @@ class JobQueue:
                 self._send_queued_updates_locked()
 
     def _send_queued_updates_locked(self) -> None:
+        # Position updates are advisory and must never wedge the queue lock:
+        # queued sockets are non-blocking, so a client with a full buffer
+        # skips one update and a dead client drops out of the queue.
         live: deque[Job] = deque()
         running_count = 1 if self._running is not None else 0
         for index, job in enumerate(self._pending):
@@ -176,14 +195,24 @@ class JobQueue:
                     job.conn,
                     {
                         "type": "queued",
-                        "target": self.target,
+                        "target": self.label,
                         "ahead": running_count + index,
                     },
                 )
                 live.append(job)
+            except BlockingIOError:
+                live.append(job)
             except OSError:
-                job.conn.close()
+                discard_job(job)
         self._pending = live
+
+
+@dataclass
+class DeviceLane:
+    index: int
+    device: DeviceContext
+    session: DeviceSession
+    jobs: JobQueue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -200,14 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="adb device serial",
     )
-    serve = subparsers.add_parser("serve", help="start the performance queue")
+    serve = subparsers.add_parser("serve", help="start the performance queues")
     serve.add_argument(
         "--serial",
-        help="adb device serial; omit to run host-only",
-    )
-    serve.add_argument(
-        "--pin",
-        help=f"default device CPU pin: {PIN_HELP}",
+        action="append",
+        default=[],
+        help="adb device serial; repeat for more devices, omit to run host-only",
     )
     return parser
 
@@ -258,47 +285,6 @@ def run_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_baseline(daemon_dir: Path) -> Path:
-    source = build_release_wasm()
-    path = daemon_dir / "baseline.wasm"
-    shutil.copyfile(source, path)
-    return path
-
-
-def build_release_wasm() -> Path:
-    rust_root = rust_workspace_root()
-    target_dir = rust_root / "target/wasm-release"
-    wasm_path = target_dir / "wasm32-unknown-unknown/release/vip9r.wasm"
-    cmd = [
-        "cargo",
-        "build",
-        "--manifest-path",
-        str(rust_root / "Cargo.toml"),
-        "--target-dir",
-        str(target_dir),
-        "--target",
-        "wasm32-unknown-unknown",
-        "-p",
-        "vip9r",
-        "--release",
-    ]
-    completed = subprocess.run(cmd, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(f"baseline wasm build exited {completed.returncode}")
-    if not wasm_path.is_file():
-        raise RuntimeError(f"baseline wasm build did not create {wasm_path}")
-    return wasm_path
-
-
-def rust_workspace_root() -> Path:
-    rust_root = REPO_ROOT / "rust"
-    if (rust_root / "Cargo.toml").is_file():
-        return rust_root
-    if (REPO_ROOT / "Cargo.toml").is_file():
-        return REPO_ROOT
-    raise RuntimeError(f"could not find vip9r Cargo workspace from {REPO_ROOT}")
-
-
 def remove_stale_socket() -> None:
     if not SOCKET_PATH.exists():
         return
@@ -314,40 +300,32 @@ def remove_stale_socket() -> None:
 
 
 def run_serve(args: argparse.Namespace) -> int:
-    if args.serial is None and args.pin is not None:
-        print("--pin requires --serial", file=sys.stderr)
-        return 2
-    if args.serial is not None and args.pin is None:
-        print("--pin is required with --serial", file=sys.stderr)
+    serials: list[str] = args.serial
+    if len(serials) != len(set(serials)):
+        print("duplicate --serial", file=sys.stderr)
         return 2
 
-    args.pin = args.pin or "any"
     with tempfile.TemporaryDirectory(prefix="vip9r-perf-daemon-") as daemon_temp:
         daemon_dir = Path(daemon_temp)
         try:
             verify_local_wasm_runners()
             host_d8 = verify_host_runtime()
-            baseline_path = build_baseline(daemon_dir)
         except Exception as error:
             print(f"host setup: {error}", file=sys.stderr)
             return 2
 
-        device: DeviceContext | None = None
-        device_session: DeviceSession | None = None
-        default_pin_selection: PinSelection | None = None
-        if args.serial is not None:
+        devices: list[DeviceContext] = []
+        for serial in serials:
             try:
-                device = probe_device(args.serial, DEFAULT_DEVICE_ROOT)
-                default_pin_selection = resolve_and_verify_pin(device, args.pin)
+                devices.append(probe_device(serial, DEFAULT_DEVICE_ROOT))
             except Exception as error:
-                print(f"device setup: {error}", file=sys.stderr)
+                print(f"device setup {serial}: {error}", file=sys.stderr)
                 return 2
 
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
-        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
         remove_stale_socket()
         try:
             server.bind(str(SOCKET_PATH))
@@ -359,32 +337,31 @@ def run_serve(args: argparse.Namespace) -> int:
                 return 2
             raise
 
-        if device is not None:
+        lanes: list[DeviceLane] = []
+        try:
+            for index, device in enumerate(devices):
+                session = create_device_session(device)
+                lanes.append(
+                    DeviceLane(
+                        index=index,
+                        device=device,
+                        session=session,
+                        jobs=JobQueue(f"device{index}"),
+                    )
+                )
+        except Exception as error:
+            server.close()
             try:
-                device_session = create_device_session(device, baseline_path)
-            except Exception as error:
-                server.close()
-                try:
-                    SOCKET_PATH.unlink()
-                except FileNotFoundError:
-                    pass
-                print(f"device session setup: {error}", file=sys.stderr)
-                return 2
+                SOCKET_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"device session setup: {error}", file=sys.stderr)
+            return 2
 
         host_jobs = JobQueue("host")
-        device_jobs = JobQueue("device")
-        host_worker = threading.Thread(
-            target=run_worker,
-            args=("host", host_jobs, baseline_path, device, device_session, args.pin, daemon_dir),
-            daemon=True,
-        )
-        device_worker = threading.Thread(
-            target=run_worker,
-            args=("device", device_jobs, baseline_path, device, device_session, args.pin, daemon_dir),
-            daemon=True,
-        )
-        host_worker.start()
-        device_worker.start()
+        start_worker(host_jobs, handle_host_job)
+        for lane in lanes:
+            start_worker(lane.jobs, lambda job, lane=lane: handle_device_job(lane, job))
 
         try:
             print(
@@ -397,18 +374,17 @@ def run_serve(args: argparse.Namespace) -> int:
                             "d8": host_d8,
                             "timeout_seconds": HOST_D8_TIMEOUT_SECONDS,
                         },
-                        "device": {
-                            "serial": device.serial,
-                            "model": device.props.get("model"),
-                            "pin": pin_summary(default_pin_selection),
-                            "session_dir": device_session.path,
-                            "timeout_seconds": DEVICE_D8_TIMEOUT_SECONDS,
-                            "adb_timeout_seconds": ADB_D8_TIMEOUT_SECONDS,
-                        }
-                        if device is not None
-                        and device_session is not None
-                        and default_pin_selection is not None
-                        else None,
+                        "devices": [
+                            {
+                                "index": lane.index,
+                                "serial": lane.device.serial,
+                                "model": lane.device.props.get("model"),
+                                "session_dir": lane.session.path,
+                                "timeout_seconds": DEVICE_D8_TIMEOUT_SECONDS,
+                                "adb_timeout_seconds": ADB_D8_TIMEOUT_SECONDS,
+                            }
+                            for lane in lanes
+                        ],
                     },
                     indent=2,
                 ),
@@ -419,7 +395,7 @@ def run_serve(args: argparse.Namespace) -> int:
                 conn.settimeout(ACCEPT_HANDSHAKE_TIMEOUT_SECONDS)
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
-                accept_one(conn, host_jobs, device_jobs)
+                accept_one(conn, host_jobs, lanes, daemon_dir)
         except KeyboardInterrupt:
             return 130
         finally:
@@ -430,18 +406,49 @@ def run_serve(args: argparse.Namespace) -> int:
                 pass
 
 
-def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) -> None:
+def accept_one(
+    conn: socket.socket,
+    host_jobs: JobQueue,
+    lanes: list[DeviceLane],
+    daemon_dir: Path,
+) -> None:
     fds: list[int] = []
+    job_dir: Path | None = None
     try:
-        # An asm request carries the client's output directory as an
+        # An asm/profile request carries the client's output directory as an
         # SCM_RIGHTS fd riding on the request record.
         request_bytes, fds = recv_record_with_fds(conn, MAX_REQUEST_BYTES, "request")
-        candidate = recv_record(conn, MAX_CANDIDATE_BYTES, "candidate wasm")
-        conn.settimeout(None)
         request = json.loads(request_bytes.decode("utf-8"))
         if not isinstance(request, dict):
             raise ValueError("request must be a JSON object")
         target = target_from_request(request)
+        jobs = host_jobs if target == "host" else device_lane_from_request(request, lanes).jobs
+        candidate = recv_record(conn, MAX_CANDIDATE_BYTES, "candidate wasm")
+        # A bench submission carries its own baseline wasm.
+        baseline = (
+            recv_record(conn, MAX_CANDIDATE_BYTES, "baseline wasm")
+            if request.get("kind") == "bench"
+            else None
+        )
+        job_dir = Path(tempfile.mkdtemp(prefix="job-", dir=daemon_dir))
+        candidate_path = job_dir / "candidate.wasm"
+        candidate_path.write_bytes(candidate)
+        baseline_path: Path | None = None
+        baseline_sha256: str | None = None
+        if baseline is not None:
+            baseline_path = job_dir / "baseline.wasm"
+            baseline_path.write_bytes(baseline)
+            baseline_sha256 = hashlib.sha256(baseline).hexdigest()
+        job = Job(
+            conn=conn,
+            request=request,
+            dir=job_dir,
+            candidate_path=candidate_path,
+            candidate_sha256=hashlib.sha256(candidate).hexdigest(),
+            baseline_path=baseline_path,
+            baseline_sha256=baseline_sha256,
+            fds=fds,
+        )
     except socket.timeout:
         close_fds(fds)
         safe_send_final(
@@ -455,17 +462,24 @@ def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) 
         return
     except Exception as error:
         close_fds(fds)
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
         safe_send_final(conn, {"ok": False, "error": str(error)})
         conn.close()
         return
-    if target == "host":
-        host_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate, fds=fds))
-    elif target == "device":
-        device_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate, fds=fds))
-    else:
-        close_fds(fds)
-        safe_send_final(conn, {"ok": False, "error": f"unsupported target: {target!r}"})
-        conn.close()
+    # Non-blocking while queued so advisory position updates cannot block
+    # the queue lock; the worker restores a timeout when the job starts.
+    conn.settimeout(0)
+    jobs.enqueue(job)
+
+
+def device_lane_from_request(request: dict[str, object], lanes: list[DeviceLane]) -> DeviceLane:
+    if not lanes:
+        raise ValueError("target device requires a daemon started with --serial")
+    index = request.get("device", 0)
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(lanes):
+        raise ValueError(f"device must be an integer index in 0..{len(lanes) - 1}")
+    return lanes[index]
 
 
 def close_fds(fds: list[int]) -> None:
@@ -476,65 +490,38 @@ def close_fds(fds: list[int]) -> None:
             pass
 
 
-def run_worker(
-    target: str,
-    jobs: JobQueue,
-    baseline_path: Path,
-    device: DeviceContext | None,
-    device_session: DeviceSession | None,
-    default_pin: str,
-    daemon_dir: Path,
-) -> None:
+def start_worker(jobs: JobQueue, handler) -> None:
+    # A dead worker would silently stall its queue forever; die loudly
+    # instead. Per-job failures are handled inside run_worker.
+    def run() -> None:
+        try:
+            run_worker(jobs, handler)
+        except BaseException:
+            traceback.print_exc()
+            os._exit(70)
+
+    threading.Thread(target=run, name=f"worker-{jobs.label}", daemon=True).start()
+
+
+def run_worker(jobs: JobQueue, handler) -> None:
     while True:
         job = jobs.pop()
         try:
-            send_json(job.conn, {"type": "started", "target": target})
-            with tempfile.TemporaryDirectory(prefix=f"{target}-job-", dir=daemon_dir) as job_temp:
-                candidate_path = Path(job_temp) / "candidate.wasm"
-                candidate_path.write_bytes(job.candidate)
-                response = handle_request(
-                    target,
-                    baseline_path,
-                    device,
-                    device_session,
-                    default_pin,
-                    job.request,
-                    candidate_path,
-                    job.fds[0] if job.fds else None,
-                )
+            job.conn.settimeout(CLIENT_SEND_TIMEOUT_SECONDS)
+            send_json(job.conn, {"type": "started", "target": jobs.label})
+            response = handler(job)
         except Exception as error:
             response = {"ok": False, "error": str(error)}
         try:
             safe_send_final(job.conn, response)
         finally:
-            close_fds(job.fds)
-            job.conn.close()
+            discard_job(job)
             jobs.finish(job)
 
 
-def handle_request(
-    target: str,
-    baseline_path: Path,
-    device: DeviceContext | None,
-    device_session: DeviceSession | None,
-    default_pin: str,
-    request: object,
-    candidate_path: Path,
-    dir_fd: int | None,
-) -> dict[str, object]:
-    if not isinstance(request, dict):
-        return {"ok": False, "error": "request must be a JSON object"}
-
-    try:
-        request_target = target_from_request(request)
-    except ValueError as error:
-        return {"ok": False, "error": str(error)}
-    if request_target != target:
-        return {
-            "ok": False,
-            "error": f"request target {request_target!r} was routed to {target!r}",
-        }
-    if target == "host" and "pin" in request:
+def handle_host_job(job: Job) -> dict[str, object]:
+    request = job.request
+    if "pin" in request:
         return {"ok": False, "target": "host", "error": "pin requires target device"}
 
     kind = request.get("kind")
@@ -543,114 +530,20 @@ def handle_request(
             media = media_from_request(request)
             validation = validation_from_request(request)
         except ValueError as error:
-            return {"ok": False, "kind": "validate", "target": target, "error": str(error)}
-        if target == "host":
-            return handle_host_validate_request(candidate_path, MEDIA_ROOT / media, validation)
-        if device is None or device_session is None:
-            return {
-                "ok": False,
-                "kind": "validate",
-                "target": "device",
-                "error": "target device requires a daemon started with --serial",
-            }
-        try:
-            pin_name = pin_from_request(request, default_pin)
-        except ValueError as error:
-            return {"ok": False, "kind": "validate", "target": "device", "error": str(error)}
-        return handle_device_validate_request(
-            device,
-            device_session,
-            candidate_path,
-            media,
-            validation,
-            pin_name,
-        )
+            return {"ok": False, "kind": "validate", "target": "host", "error": str(error)}
+        return handle_host_validate_request(job.candidate_path, MEDIA_ROOT / media, validation)
     if kind == "tests":
-        if target == "host":
-            return handle_host_tests_request(request, candidate_path)
-        if device is None or device_session is None:
-            return {
-                "ok": False,
-                "kind": "tests",
-                "target": "device",
-                "error": "target device requires a daemon started with --serial",
-            }
-        try:
-            pin_name = pin_from_request(request, default_pin)
-            tests = tests_from_request(request)
-        except ValueError as error:
-            return {"ok": False, "kind": "tests", "target": "device", "error": str(error)}
-        return handle_device_tests_request(
-            device,
-            device_session,
-            candidate_path,
-            tests,
-            pin_name,
-        )
+        return handle_host_tests_request(request, job.candidate_path)
     if kind == "microbench":
-        if target == "host":
-            return handle_host_microbench_request(request, candidate_path)
-        if device is None or device_session is None:
-            return {
-                "ok": False,
-                "kind": "microbench",
-                "target": "device",
-                "error": "target device requires a daemon started with --serial",
-            }
-        try:
-            pin_name = pin_from_request(request, default_pin)
-            microbench = microbench_from_request(request)
-        except ValueError as error:
-            return {"ok": False, "kind": "microbench", "target": "device", "error": str(error)}
-        return handle_device_microbench_request(
-            device,
-            device_session,
-            candidate_path,
-            microbench,
-            pin_name,
-        )
+        return handle_host_microbench_request(request, job.candidate_path)
     if kind == "asm":
-        if target != "host":
-            return {"ok": False, "kind": "asm", "target": target, "error": "asm runs on the daemon host"}
         try:
             arch = asm_arch_from_request(request)
         except ValueError as error:
             return {"ok": False, "kind": "asm", "target": "host", "error": str(error)}
-        return handle_asm_request(arch, candidate_path, dir_fd)
+        return handle_asm_request(arch, job.candidate_path, job.fds[0] if job.fds else None)
     if kind == "profile":
-        if target != "device":
-            return {"ok": False, "kind": "profile", "target": target, "error": "profile requires target device"}
-        if device is None or device_session is None:
-            return {
-                "ok": False,
-                "kind": "profile",
-                "target": "device",
-                "error": "target device requires a daemon started with --serial",
-            }
-        if dir_fd is None:
-            return {
-                "ok": False,
-                "kind": "profile",
-                "target": "device",
-                "error": "profile request carries no output directory fd",
-            }
-        try:
-            media = media_from_request(request)
-            frame_range = frame_range_from_request(request)
-            freq = profile_freq_from_request(request)
-            pin_name = pin_from_request(request, default_pin)
-        except ValueError as error:
-            return {"ok": False, "kind": "profile", "target": "device", "error": str(error)}
-        return handle_device_profile_request(
-            device,
-            device_session,
-            candidate_path,
-            media,
-            frame_range,
-            freq,
-            pin_name,
-            dir_fd,
-        )
+        return {"ok": False, "kind": "profile", "target": "host", "error": "profile requires target device"}
     if kind != "bench":
         return {"ok": False, "error": f"unsupported request kind: {kind!r}"}
 
@@ -658,30 +551,54 @@ def handle_request(
         media = media_from_request(request)
         frame_range = frame_range_from_request(request)
     except ValueError as error:
-        return {"ok": False, "error": str(error)}
+        return {"ok": False, "kind": "bench", "target": "host", "error": str(error)}
+    assert job.baseline_path is not None
+    return handle_host_bench_request(job.baseline_path, job.candidate_path, MEDIA_ROOT / media, frame_range)
 
-    if target == "host":
-        return handle_host_bench_request(baseline_path, candidate_path, MEDIA_ROOT / media, frame_range)
 
-    if device is None or device_session is None:
-        return {
-            "ok": False,
-            "kind": "bench",
-            "target": "device",
-            "error": "target device requires a daemon started with --serial",
-        }
+def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
+    request = job.request
+    kind = request.get("kind")
+    base = {
+        "kind": kind,
+        "target": "device",
+        "device": lane.index,
+        "serial": lane.device.serial,
+    }
     try:
-        pin_name = pin_from_request(request, default_pin)
+        if kind == "validate":
+            media = media_from_request(request)
+            validation = validation_from_request(request)
+            pin_name = pin_from_request(request, required=False)
+            return handle_device_validate_request(lane, job, media, validation, pin_name)
+        if kind == "tests":
+            tests = tests_from_request(request)
+            pin_name = pin_from_request(request, required=False)
+            return handle_device_tests_request(lane, job, tests, pin_name)
+        if kind == "microbench":
+            microbench = microbench_from_request(request)
+            pin_name = pin_from_request(request, required=True)
+            return handle_device_microbench_request(lane, job, microbench, pin_name)
+        if kind == "profile":
+            if not job.fds:
+                raise ValueError("profile request carries no output directory fd")
+            media = media_from_request(request)
+            frame_range = frame_range_from_request(request)
+            freq = profile_freq_from_request(request)
+            pin_name = pin_from_request(request, required=True)
+            return handle_device_profile_request(
+                lane, job, media, frame_range, freq, pin_name, job.fds[0]
+            )
+        if kind == "asm":
+            raise ValueError("asm runs on the daemon host")
+        if kind != "bench":
+            raise ValueError(f"unsupported request kind: {kind!r}")
+        media = media_from_request(request)
+        frame_range = frame_range_from_request(request)
+        pin_name = pin_from_request(request, required=True)
+        return handle_device_bench_request(lane, job, media, frame_range, pin_name)
     except ValueError as error:
-        return {"ok": False, "kind": "bench", "target": "device", "error": str(error)}
-    return handle_device_bench_request(
-        device,
-        device_session,
-        candidate_path,
-        media,
-        frame_range,
-        pin_name,
-    )
+        return {**base, "ok": False, "error": str(error)}
 
 
 def handle_host_bench_request(
@@ -828,34 +745,52 @@ def target_from_request(request: dict[str, object]) -> str:
     return target
 
 
-def pin_from_request(request: dict[str, object], default: str) -> str:
-    pin = request.get("pin", default)
+def pin_from_request(request: dict[str, object], *, required: bool) -> str:
+    pin = request.get("pin")
+    if pin is None:
+        # Timed kinds must state a core choice; on big.LITTLE an unpinned
+        # run lands on an arbitrary core type and the numbers mislead.
+        if required:
+            raise ValueError(f"timed device runs require pin: {PIN_HELP}")
+        return "any"
     if not isinstance(pin, str) or pin == "":
         raise ValueError("pin must be a non-empty string")
     return pin
 
 
+def device_response_base(lane: DeviceLane, kind: str) -> dict[str, object]:
+    return {
+        "kind": kind,
+        "target": "device",
+        "device": lane.index,
+        "serial": lane.device.serial,
+        "model": lane.device.props.get("model"),
+    }
+
+
 def handle_device_bench_request(
-    device: DeviceContext,
-    session: DeviceSession,
-    local_candidate_path: Path,
+    lane: DeviceLane,
+    job: Job,
     media: PurePosixPath,
     frame_range: tuple[int, int] | None,
     pin_name: str,
 ) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "bench")
     try:
         pin = resolve_and_verify_pin(device, pin_name)
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
         run_dir = create_device_run_dir(device, session, "bench")
-        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
         baseline_result_path = str(PurePosixPath(run_dir) / "baseline-result.json")
         result_path = str(PurePosixPath(run_dir) / "result.json")
-        push_file_to_device(device, local_candidate_path, candidate_path)
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
+        assert job.baseline_path is not None and job.baseline_sha256 is not None
+        baseline_wasm = push_wasm_blob(lane, job.baseline_path, job.baseline_sha256)
         baseline_result = run_device_bench(
             device,
             device_session_path(session, GOLDEN_RUNNER_PATH),
-            session.baseline_path,
+            baseline_wasm,
             media_path,
             frame_range,
             pin,
@@ -864,29 +799,28 @@ def handle_device_bench_request(
         candidate_result = run_device_bench(
             device,
             device_session_path(session, GOLDEN_RUNNER_PATH),
-            candidate_path,
+            candidate_wasm,
             media_path,
             frame_range,
             pin,
             result_path,
         )
     except (DeviceError, ValueError) as error:
-        return {"ok": False, "kind": "bench", "target": "device", "serial": device.serial, "error": str(error)}
+        return {**base, "ok": False, "error": str(error)}
 
     return {
+        **base,
         "ok": baseline_result.get("ok") is True and candidate_result.get("ok") is True,
-        "kind": "bench",
-        "target": "device",
-        "serial": device.serial,
-        "device": {
-            "summary": device_summary(device),
+        "device_run": {
             "pin": pin_summary(pin),
             "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
             "result": result_path,
             "baseline_result": baseline_result_path,
-            "baseline_wasm": session.baseline_path,
+            "baseline_wasm": baseline_wasm,
+            "candidate_wasm": candidate_wasm,
+            "no_op_control": job.baseline_sha256 == job.candidate_sha256,
             "baseline": baseline_result,
             "candidate": candidate_result,
         },
@@ -894,36 +828,33 @@ def handle_device_bench_request(
 
 
 def handle_device_microbench_request(
-    device: DeviceContext,
-    session: DeviceSession,
-    local_candidate_path: Path,
+    lane: DeviceLane,
+    job: Job,
     microbench: dict[str, int],
     pin_name: str,
 ) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "microbench")
     try:
         pin = resolve_and_verify_pin(device, pin_name)
         run_dir = create_device_run_dir(device, session, "microbench")
-        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
         result_path = str(PurePosixPath(run_dir) / "result.json")
-        push_file_to_device(device, local_candidate_path, candidate_path)
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
         candidate_result = run_device_microbench(
             device,
             device_session_path(session, MICROBENCH_RUNNER_PATH),
-            candidate_path,
+            candidate_wasm,
             microbench,
             pin,
             result_path,
         )
     except (DeviceError, ValueError) as error:
-        return {"ok": False, "kind": "microbench", "target": "device", "serial": device.serial, "error": str(error)}
+        return {**base, "ok": False, "error": str(error)}
 
     return {
+        **base,
         "ok": candidate_result.get("ok") is True,
-        "kind": "microbench",
-        "target": "device",
-        "serial": device.serial,
-        "device": {
-            "summary": device_summary(device),
+        "device_run": {
             "pin": pin_summary(pin),
             "session_dir": session.path,
             "run_dir": run_dir,
@@ -934,36 +865,33 @@ def handle_device_microbench_request(
 
 
 def handle_device_tests_request(
-    device: DeviceContext,
-    session: DeviceSession,
-    local_candidate_path: Path,
+    lane: DeviceLane,
+    job: Job,
     tests: dict[str, str],
     pin_name: str,
 ) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "tests")
     try:
         pin = resolve_and_verify_pin(device, pin_name)
         run_dir = create_device_run_dir(device, session, "tests")
-        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
         result_path = str(PurePosixPath(run_dir) / "result.json")
-        push_file_to_device(device, local_candidate_path, candidate_path)
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
         candidate_result = run_device_tests(
             device,
             device_session_path(session, TESTS_RUNNER_PATH),
-            candidate_path,
+            candidate_wasm,
             tests,
             pin,
             result_path,
         )
     except (DeviceError, ValueError) as error:
-        return {"ok": False, "kind": "tests", "target": "device", "serial": device.serial, "error": str(error)}
+        return {**base, "ok": False, "error": str(error)}
 
     return {
+        **base,
         "ok": candidate_result.get("ok") is True,
-        "kind": "tests",
-        "target": "device",
-        "serial": device.serial,
-        "device": {
-            "summary": device_summary(device),
+        "device_run": {
             "pin": pin_summary(pin),
             "session_dir": session.path,
             "run_dir": run_dir,
@@ -974,40 +902,37 @@ def handle_device_tests_request(
 
 
 def handle_device_validate_request(
-    device: DeviceContext,
-    session: DeviceSession,
-    local_candidate_path: Path,
+    lane: DeviceLane,
+    job: Job,
     media: PurePosixPath,
     validation: dict[str, object],
     pin_name: str,
 ) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "validate")
     try:
         pin = resolve_and_verify_pin(device, pin_name)
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
         run_dir = create_device_run_dir(device, session, "validate")
-        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
         result_path = str(PurePosixPath(run_dir) / "result.json")
-        push_file_to_device(device, local_candidate_path, candidate_path)
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
         candidate_result = run_device_validation(
             device,
             device_session_path(session, GOLDEN_RUNNER_PATH),
-            candidate_path,
+            candidate_wasm,
             media_path,
             validation,
             pin,
             result_path,
         )
     except (DeviceError, ValueError) as error:
-        return {"ok": False, "kind": "validate", "target": "device", "serial": device.serial, "error": str(error)}
+        return {**base, "ok": False, "error": str(error)}
 
     return {
+        **base,
         "ok": candidate_result.get("ok") is True,
-        "kind": "validate",
-        "target": "device",
-        "serial": device.serial,
-        "device": {
-            "summary": device_summary(device),
+        "device_run": {
             "pin": pin_summary(pin),
             "session_dir": session.path,
             "run_dir": run_dir,
@@ -1020,15 +945,16 @@ def handle_device_validate_request(
 
 
 def handle_device_profile_request(
-    device: DeviceContext,
-    session: DeviceSession,
-    local_candidate_path: Path,
+    lane: DeviceLane,
+    job: Job,
     media: PurePosixPath,
     frame_range: tuple[int, int] | None,
     freq: int,
     pin_name: str,
     dir_fd: int,
 ) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "profile")
     try:
         pin = resolve_and_verify_pin(device, pin_name)
         missing_commands = missing_remote_commands(device, ["simpleperf"])
@@ -1037,10 +963,9 @@ def handle_device_profile_request(
         media_path = str(device.root / "media" / media)
         verify_remote_files(device, [media_path, f"{media_path}.md5"])
         run_dir = create_device_run_dir(device, session, "profile")
-        candidate_path = str(PurePosixPath(run_dir) / "candidate.wasm")
         result_path = str(PurePosixPath(run_dir) / "result.json")
         perf_data_path = str(PurePosixPath(run_dir) / "perf.data")
-        push_file_to_device(device, local_candidate_path, candidate_path)
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
         remove_device_perf_maps(device)
         d8_args = [
             "./d8",
@@ -1050,7 +975,7 @@ def handle_device_profile_request(
             "--module",
             device_session_path(session, GOLDEN_RUNNER_PATH),
             "--",
-            candidate_path,
+            candidate_wasm,
             "--bench",
         ]
         if frame_range is not None:
@@ -1066,7 +991,7 @@ def handle_device_profile_request(
         files: list[str] = []
         samples: int | None = None
         if candidate_result.get("ok") is True:
-            work_dir = local_candidate_path.parent
+            work_dir = job.dir
             pull_device_file_at(device, perf_data_path, dir_fd, "perf.data", work_dir)
             map_names = pull_device_perf_maps(device, dir_fd, work_dir)
             report_text = build_profile_report(
@@ -1076,15 +1001,13 @@ def handle_device_profile_request(
             write_file_at(dir_fd, "report.txt", report_text.encode("utf-8"))
             files = ["report.txt", "perf.data", *map_names]
     except (DeviceError, ValueError) as error:
-        return {"ok": False, "kind": "profile", "target": "device", "serial": device.serial, "error": str(error)}
+        return {**base, "ok": False, "error": str(error)}
 
     ok = candidate_result.get("ok") is True
     return {
+        **base,
         "ok": ok,
-        "kind": "profile",
-        "target": "device",
-        "serial": device.serial,
-        "device": {
+        "device_run": {
             "pin": pin_summary(pin),
             "run_dir": run_dir,
             "media": media_path,
@@ -1990,19 +1913,25 @@ def parse_pin_mask(pin_name: str) -> int:
     return int(value, 16)
 
 
-def create_device_session(device: DeviceContext, baseline_path: Path) -> DeviceSession:
+def create_device_session(device: DeviceContext) -> DeviceSession:
     session_dir = str(device.root / "runs" / unique_run_name("session"))
     ensure_remote_dir(device, session_dir)
+    ensure_remote_dir(device, str(PurePosixPath(session_dir) / "blobs"))
 
-    remote_baseline_path = str(PurePosixPath(session_dir) / "baseline.wasm")
-    push_file_to_device(device, baseline_path, remote_baseline_path)
     for local_path in sorted(GOLDEN_RUNNER_PATH.parent.glob("*.js")):
         push_file_to_device(device, local_path, str(PurePosixPath(session_dir) / local_path.name))
 
-    return DeviceSession(
-        path=session_dir,
-        baseline_path=remote_baseline_path,
-    )
+    return DeviceSession(path=session_dir)
+
+
+def push_wasm_blob(lane: DeviceLane, local_path: Path, sha256: str) -> str:
+    # Device lanes are single-threaded, so the cache needs no locking.
+    remote_path = lane.session.pushed_blobs.get(sha256)
+    if remote_path is None:
+        remote_path = str(PurePosixPath(lane.session.path) / "blobs" / f"{sha256[:16]}.wasm")
+        push_file_to_device(lane.device, local_path, remote_path)
+        lane.session.pushed_blobs[sha256] = remote_path
+    return remote_path
 
 
 def device_session_path(session: DeviceSession, local_path: Path) -> str:

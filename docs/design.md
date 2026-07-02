@@ -263,12 +263,20 @@ Margins are measured against the 33.3 ms/frame 720p30 budget. Starting-line
 (2026-07, small windows, warm device): X4 ~147 ms/frame, A720 ~207, A520 ~845,
 A55 ~1489.
 
-The daemon binds one fixed socket (`temp/perf/vip9r-perf.sock`) and one device
-per `serve`; switching devices is a daemon restart. Daemon A/B baselines are
-built once at `serve` startup, so restart after every merged optimization pass.
-Grinder sandboxes bind the socket's parent directory, so a daemon restart while
-a grinder runs only produces connection-refused errors during the gap instead
-of permanently severing the sandbox.
+The daemon binds one fixed socket (`temp/perf/vip9r-perf.sock`) and serves a
+host queue plus one queue per `--serial` device, each with its own worker:
+runs on different devices proceed in parallel while access to any one device
+stays serialized. Submissions address a device by index (`--device N`, default
+0) and state the CPU pin per request; timed kinds (bench, microbench, profile)
+require an explicit pin, validate/tests default to `any`. Bench submissions
+carry their own baseline wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE`
+(set inside grinder sandboxes by `grinder run --baseline`), else the candidate
+itself, which makes the default an A/B no-op control. The daemon holds no
+baseline state, so merges do not force a restart; wasm pushes are cached per
+device by blob hash for the daemon's lifetime. Grinder sandboxes bind the
+socket's parent directory, so a daemon restart while a grinder runs only
+produces connection-refused errors during the gap instead of permanently
+severing the sandbox.
 
 ### V8 artifacts
 
