@@ -11,8 +11,8 @@ import time
 from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-GRINDER_SOCKET_PATH = Path("/run/vip9r-perf.sock")
-HOST_SOCKET_PATH = REPO_ROOT / "temp/vip9r-perf.sock"
+GRINDER_SOCKET_PATH = Path("/run/vip9r-perf/vip9r-perf.sock")
+HOST_SOCKET_PATH = REPO_ROOT / "temp/perf/vip9r-perf.sock"
 MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 U32_MAX = 2**32 - 1

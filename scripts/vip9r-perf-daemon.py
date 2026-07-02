@@ -19,7 +19,10 @@ import threading
 import time
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SOCKET_PATH = REPO_ROOT / "temp/vip9r-perf.sock"
+# The socket lives in its own directory so grinder sandboxes can bind the
+# directory: a daemon restart replaces the socket inode, and a file bind
+# would leave running sandboxes pointing at the dead inode.
+SOCKET_PATH = REPO_ROOT / "temp/perf/vip9r-perf.sock"
 GOLDEN_RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/golden.js"
 MICROBENCH_RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/microbench.js"
 TESTS_RUNNER_PATH = REPO_ROOT / "js/dist/wasm-driver/tests.js"
@@ -296,6 +299,20 @@ def rust_workspace_root() -> Path:
     raise RuntimeError(f"could not find vip9r Cargo workspace from {REPO_ROOT}")
 
 
+def remove_stale_socket() -> None:
+    if not SOCKET_PATH.exists():
+        return
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        probe.connect(str(SOCKET_PATH))
+    except ConnectionRefusedError:
+        SOCKET_PATH.unlink()
+    except OSError:
+        pass
+    finally:
+        probe.close()
+
+
 def run_serve(args: argparse.Namespace) -> int:
     if args.serial is None and args.pin is not None:
         print("--pin requires --serial", file=sys.stderr)
@@ -330,6 +347,8 @@ def run_serve(args: argparse.Namespace) -> int:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_CANDIDATE_BYTES)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_RESPONSE_BYTES)
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        remove_stale_socket()
         try:
             server.bind(str(SOCKET_PATH))
             server.listen()

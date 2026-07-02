@@ -145,7 +145,10 @@ in
       codex_config="$repo/scripts/grinder-codex-config.toml"
       codex_events="$repo/scripts/codex-events.py"
       perf_submit="$repo/scripts/vip9r-perf-submit.py"
-      perf_socket="$repo/temp/vip9r-perf.sock"
+      # Bind the socket's directory, not the socket file: a daemon restart
+      # replaces the inode, and a file bind would leave a running sandbox
+      # holding the dead socket.
+      perf_socket_dir="$repo/temp/perf"
 
       temp_dir="$repo/temp"
       codex_home="$temp_dir/codex-home"
@@ -196,9 +199,8 @@ in
         --volume "${armIsaXml}:/specs/arm-isa:ro"
         --volume "/bulk/vip9r:/bulk/vip9r:ro"
       )
-      if [[ -S "$perf_socket" ]]; then
-        podman_args+=(--volume "$perf_socket:/run/vip9r-perf.sock:rw")
-      fi
+      mkdir -p "$perf_socket_dir"
+      podman_args+=(--volume "$perf_socket_dir:/run/vip9r-perf:rw")
       rootfs_arg="$run/rootfs:O"
 
       status=0

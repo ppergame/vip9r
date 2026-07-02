@@ -256,8 +256,12 @@ Margins are measured against the 33.3 ms/frame 720p30 budget. Starting-line
 (2026-07, small windows, warm device): X4 ~147 ms/frame, A720 ~207, A520 ~845,
 A55 ~1489.
 
-The daemon binds one fixed socket (`temp/vip9r-perf.sock`) and one device per
-`serve`; switching devices is a daemon restart.
+The daemon binds one fixed socket (`temp/perf/vip9r-perf.sock`) and one device
+per `serve`; switching devices is a daemon restart. Daemon A/B baselines are
+built once at `serve` startup, so restart after every merged optimization pass.
+Grinder sandboxes bind the socket's parent directory, so a daemon restart while
+a grinder runs only produces connection-refused errors during the gap instead
+of permanently severing the sandbox.
 
 ### V8 artifacts
 
