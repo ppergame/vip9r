@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import bisect
 from collections import deque
 from dataclasses import dataclass
 import errno
@@ -40,7 +41,7 @@ TARGETS = ("host", "device")
 ASM_D8_TIMEOUT_SECONDS = 120
 PROFILE_DEFAULT_FREQ = 1000
 PROFILE_MAX_FREQ = 100000
-PROFILE_REPORT_TIMEOUT_SECONDS = 60
+PROFILE_REPORT_PERCENT_LIMIT = 0.05
 # V8's perf map must land where simpleperf report looks for JIT symbols;
 # /data/local/tmp is the validated location (see docs/d8.md).
 DEVICE_PERF_MAP_DIR = PurePosixPath("/data/local/tmp")
@@ -1046,17 +1047,15 @@ def handle_device_profile_request(
         files: list[str] = []
         samples: int | None = None
         if candidate_result.get("ok") is True:
-            report_text = run_device_simpleperf_report(device, perf_data_path)
+            work_dir = local_candidate_path.parent
+            pull_device_file_at(device, perf_data_path, dir_fd, "perf.data", work_dir)
+            map_names = pull_device_perf_maps(device, dir_fd, work_dir)
+            report_text = build_profile_report(
+                work_dir / "perf.data", [work_dir / name for name in map_names]
+            )
             samples = profile_report_samples(report_text)
             write_file_at(dir_fd, "report.txt", report_text.encode("utf-8"))
-            files.append("report.txt")
-            pull_device_file_at(
-                device, perf_data_path, dir_fd, "perf.data", local_candidate_path.parent
-            )
-            files.append("perf.data")
-            files.extend(
-                pull_device_perf_maps(device, dir_fd, local_candidate_path.parent)
-            )
+            files = ["report.txt", "perf.data", *map_names]
     except (DeviceError, ValueError) as error:
         return {"ok": False, "kind": "profile", "target": "device", "serial": device.serial, "error": str(error)}
 
@@ -1099,32 +1098,131 @@ def profile_candidate_summary(candidate_result: dict[str, object]) -> dict[str, 
     return summary
 
 
-def run_device_simpleperf_report(device: DeviceContext, perf_data_path: str) -> str:
-    command = " ".join(
-        shlex.quote(arg)
-        for arg in [
-            "simpleperf",
-            "report",
-            "-i",
-            perf_data_path,
-            "--sort",
-            "dso,symbol",
-            "-n",
-            "--percent-limit",
-            "0.1",
-        ]
+def build_profile_report(perf_data_path: Path, map_paths: list[Path]) -> str:
+    perf_data = parse_perf_data(perf_data_path)
+    jit_ranges = load_jit_symbol_ranges(map_paths)
+    jit_starts = [start for start, _end, _symbol in jit_ranges]
+    event_counts: dict[str, int] = {}
+    sample_counts: dict[str, int] = {}
+    total_events = 0
+    for ip, period in perf_data.samples:
+        index = bisect.bisect_right(jit_starts, ip) - 1
+        if index >= 0 and ip < jit_ranges[index][1]:
+            symbol = jit_ranges[index][2]
+        else:
+            # Newest mapping wins: d8 mmaps input files and later unmaps
+            # them, and munmap is never recorded.
+            symbol = next(
+                (
+                    filename
+                    for start, end, filename in reversed(perf_data.mmaps)
+                    if start <= ip < end
+                ),
+                "<unmapped>",
+            )
+        event_counts[symbol] = event_counts.get(symbol, 0) + period
+        sample_counts[symbol] = sample_counts.get(symbol, 0) + 1
+        total_events += period
+    lines = [
+        "Host-attributed profile: V8 perf-map JIT symbols take precedence over",
+        "file mappings; non-JIT samples are aggregated per mapped file.",
+        f"Samples: {len(perf_data.samples)}",
+        f"Event count: {total_events}",
+        "",
+        f"{'Overhead':<9} {'Samples':<8} Symbol",
+    ]
+    for symbol, events in sorted(event_counts.items(), key=lambda item: -item[1]):
+        percent = 100.0 * events / total_events if total_events else 0.0
+        if percent < PROFILE_REPORT_PERCENT_LIMIT:
+            continue
+        lines.append(f"{f'{percent:.2f}%':<9} {sample_counts[symbol]:<8} {symbol}")
+    return demangle_profile_report("\n".join(lines) + "\n")
+
+
+PERF_RECORD_MMAP = 1
+PERF_RECORD_SAMPLE = 9
+PERF_RECORD_MMAP2 = 10
+PERF_SAMPLE_IP = 1 << 0
+PERF_SAMPLE_PERIOD = 1 << 8
+PERF_SAMPLE_IDENTIFIER = 1 << 16
+# 8-byte PERF_RECORD_SAMPLE fields laid out before PERIOD, in record order:
+# IDENTIFIER, IP, TID, TIME, ADDR, ID, STREAM_ID, CPU.
+PERF_SAMPLE_FIELDS_BEFORE_PERIOD = (
+    PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP,
+    1 << 1,  # TID
+    1 << 2,  # TIME
+    1 << 3,  # ADDR
+    1 << 6,  # ID
+    1 << 9,  # STREAM_ID
+    1 << 7,  # CPU
+)
+
+
+@dataclass
+class PerfData:
+    # (ip, period) per sample record.
+    samples: list[tuple[int, int]]
+    # (start, end, filename) per mmap record, in record order.
+    mmaps: list[tuple[int, int, str]]
+
+
+def parse_perf_data(path: Path) -> PerfData:
+    data = path.read_bytes()
+    if data[:8] != b"PERFILE2":
+        raise DeviceError(f"{path.name}: not a PERFILE2 perf.data file")
+    attrs_offset = struct.unpack_from("<Q", data, 24)[0]
+    data_offset, data_size = struct.unpack_from("<QQ", data, 40)
+    sample_type = struct.unpack_from("<Q", data, attrs_offset + 24)[0]
+    if not sample_type & PERF_SAMPLE_IP:
+        raise DeviceError(f"{path.name}: samples carry no IP field")
+    ip_offset = 8 if sample_type & PERF_SAMPLE_IDENTIFIER else 0
+    period_offset = sum(
+        8 for bit in PERF_SAMPLE_FIELDS_BEFORE_PERIOD if sample_type & bit
     )
-    try:
-        completed = adb_shell_completed(
-            device.serial, command, timeout=PROFILE_REPORT_TIMEOUT_SECONDS
-        )
-    except subprocess.TimeoutExpired as error:
-        raise DeviceError(
-            f"simpleperf report timed out after {PROFILE_REPORT_TIMEOUT_SECONDS}s"
-        ) from error
-    if completed.returncode != 0:
-        raise DeviceError(f"simpleperf report: {completed.stderr or completed.stdout}".strip())
-    return demangle_profile_report(completed.stdout)
+    has_period = bool(sample_type & PERF_SAMPLE_PERIOD)
+    samples: list[tuple[int, int]] = []
+    mmaps: list[tuple[int, int, str]] = []
+    position = data_offset
+    end = data_offset + data_size
+    while position + 8 <= end:
+        record_type, _misc, record_size = struct.unpack_from("<IHH", data, position)
+        if record_size < 8 or position + record_size > end:
+            break
+        body = position + 8
+        record_end = position + record_size
+        if record_type == PERF_RECORD_SAMPLE:
+            ip = struct.unpack_from("<Q", data, body + ip_offset)[0]
+            period = 1
+            if has_period and body + period_offset + 8 <= record_end:
+                period = struct.unpack_from("<Q", data, body + period_offset)[0]
+            samples.append((ip, period))
+        elif record_type in (PERF_RECORD_MMAP, PERF_RECORD_MMAP2):
+            start, length = struct.unpack_from("<QQ", data, body + 8)
+            name_offset = body + (32 if record_type == PERF_RECORD_MMAP else 64)
+            name_end = data.find(b"\0", name_offset, record_end)
+            if name_end > name_offset:
+                filename = data[name_offset:name_end].decode("utf-8", "replace")
+                mmaps.append((start, start + length, filename))
+        position += record_size
+    return PerfData(samples=samples, mmaps=mmaps)
+
+
+def load_jit_symbol_ranges(map_paths: list[Path]) -> list[tuple[int, int, str]]:
+    ranges: list[tuple[int, int, str]] = []
+    for path in map_paths:
+        for line in path.read_text(errors="replace").splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) != 3:
+                continue
+            try:
+                start = int(parts[0], 16)
+                size = int(parts[1], 16)
+            except ValueError:
+                continue
+            ranges.append((start, start + size, parts[2]))
+    ranges.sort(key=lambda entry: entry[0])
+    return ranges
 
 
 PROFILE_SYMBOL = re.compile(r"JS:(?P<mangled>\S+?)-(?P<index>\d+)-turbofan")
