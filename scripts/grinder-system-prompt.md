@@ -78,6 +78,8 @@ Depending on the task, you can verify your work with
 - `cargo clippy`
 - Full-decode validation and timing:
   `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST]`,
+- Assembly dump (one file per function):
+  `vip9r-perf-submit asm --arch {arm32,arm64,host}`
 
 Orchestrator will specify correctness and optimization objectives.
 

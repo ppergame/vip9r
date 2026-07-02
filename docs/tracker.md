@@ -39,7 +39,7 @@ Deferrable external inputs for M3 performance work.
 - [ ] collect the ffvp9 performance baseline: static ffmpeg (arm64 + armv7) run
       directly through adb, taskset-pinned, on the realworld 720p clips across
       Pixel 9a core types and the streamer
-- [ ] return native (host / ARM) assembly for the wasm module from d8 back to
+- [x] return native (host / ARM) assembly for the wasm module from d8 back to
       the grinder to close the codegen feedback loop
 - [ ] surface perf-run profile traces (simpleperf / d8 wasm samples) back to the
       orchestrator, so M3 hotspot attribution is measured rather than guessed

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
+import os
 import re
 import socket
 import subprocess
@@ -84,6 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_u32,
         help="microbenchmark slot",
     )
+
+    asm = subparsers.add_parser(
+        "asm", help="dump native asm of every declared wasm function"
+    )
+    asm.add_argument(
+        "--arch",
+        choices=("arm32", "arm64", "host"),
+        required=True,
+        help="native target architecture",
+    )
     return parser
 
 
@@ -93,9 +105,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.target == "host" and args.pin is not None:
         parser.error("--pin requires --target device")
+    if args.command == "asm" and args.target != "host":
+        parser.error("asm runs on the daemon host; pick the ISA with --arch")
 
     request: dict[str, object] = {"target": args.target}
-    if args.command == "microbench":
+    if args.command == "asm":
+        request["kind"] = "asm"
+        request["arch"] = args.arch
+        tests = False
+    elif args.command == "microbench":
         request["kind"] = "microbench"
         request["slot"] = args.slot
         tests = False
@@ -134,13 +152,27 @@ def main(argv: list[str] | None = None) -> int:
         print(f"candidate: {error}", file=sys.stderr)
         return 2
 
+    file_dir = (
+        asm_output_dir(socket_path, candidate, args.arch)
+        if args.command == "asm"
+        else None
+    )
     try:
-        response = submit_request(request, candidate, socket_path)
+        response = submit_request(request, candidate, socket_path, file_dir)
     except RuntimeError as error:
         print(f"submit: {error}", file=sys.stderr)
         return 2
+    if file_dir is not None and response.get("ok") is True:
+        response["dir"] = str(file_dir)
     print(json.dumps(response, indent=2))
     return 0 if response.get("ok") is True else 1
+
+
+def asm_output_dir(socket_path: Path, candidate: bytes, arch: str) -> Path:
+    name = f"{hashlib.sha256(candidate).hexdigest()[:8]}-{arch}"
+    if socket_path == GRINDER_SOCKET_PATH:
+        return Path("/tmp/vip9r-asm") / name
+    return REPO_ROOT / "temp/vip9r-asm" / name
 
 
 def build_candidate(tests: bool) -> Path:
@@ -217,7 +249,10 @@ def git_root() -> Path:
 
 
 def submit_request(
-    request: dict[str, object], candidate: bytes, socket_path: Path
+    request: dict[str, object],
+    candidate: bytes,
+    socket_path: Path,
+    file_dir: Path | None = None,
 ) -> dict[str, object]:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_CANDIDATE_BYTES)
@@ -230,7 +265,10 @@ def submit_request(
             f"connect {socket_path}: {error.strerror or error}"
         ) from error
     with sock:
-        send_json(sock, request)
+        if file_dir is None:
+            send_json(sock, request)
+        else:
+            send_json_with_dir_fd(sock, request, file_dir)
         send_record(sock, candidate)
         while True:
             message = recv_json(sock)
@@ -248,6 +286,22 @@ def submit_request(
             if message_type == "result":
                 return message
             raise ValueError(f"unexpected response type: {message_type!r}")
+
+
+def send_json_with_dir_fd(
+    sock: socket.socket, request: dict[str, object], file_dir: Path
+) -> None:
+    # The daemon writes result files straight into this directory via the
+    # passed fd; that works across the grinder sandbox's mount namespace.
+    file_dir.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    dir_fd = os.open(file_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        sent = socket.send_fds(sock, [payload], [dir_fd])
+        if sent != len(payload):
+            raise OSError(f"short seqpacket send: {sent}/{len(payload)} bytes")
+    finally:
+        os.close(dir_fd)
 
 
 def default_socket_path() -> Path | None:

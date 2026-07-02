@@ -10,6 +10,7 @@ import re
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,44 @@ DEVICE_D8_TIMEOUT_SECONDS = 180
 ADB_D8_TIMEOUT_SECONDS = DEVICE_D8_TIMEOUT_SECONDS + 30
 DEVICE_TIMEOUT_EXIT_CODE = 124
 TARGETS = ("host", "device")
+ASM_D8_TIMEOUT_SECONDS = 120
+JITDUMP_MAGIC = 0x4A695444
+JITDUMP_CODE_LOAD = 0
+WASM_TURBOFAN_NAME = re.compile(r"JS:(?P<mangled>.*)-(?P<index>\d+)-turbofan")
+# WebAssembly.Module construction with --no-wasm-lazy-compilation compiles
+# every declared function; nothing needs to execute, so no imports either.
+ASM_COMPILE_JS = "new WebAssembly.Module(readbuffer(arguments[0]));\n"
+# Native code depends on the CPU features the fixed d8 binary probes, not on
+# the core model beyond those bits. qemu's -cpu max advertises v8.8+ features
+# (HBC, MOPS) that no device in scope implements; pin conservative models.
+ASM_RUNTIMES = {
+    "host": {
+        "objdump_arch": "i386:x86-64",
+    },
+    "arm64": {
+        "v8_env": "V8_ANDROID_ARM64",
+        "root_env": "ANDROID_RUNTIME_ROOT_ARM64",
+        "qemu": "qemu-aarch64",
+        "cpu": "cortex-a710",
+        "objdump_arch": "aarch64",
+        "apex": True,
+    },
+    "arm32": {
+        "v8_env": "V8_ANDROID_ARM32",
+        "root_env": "ANDROID_RUNTIME_ROOT_ARM32",
+        "qemu": "qemu-arm",
+        # qemu-arm has no ARMv8-A aarch32 core model; max is the closest to
+        # the streamer's Cortex-A55 aarch32 state.
+        "cpu": "max",
+        "objdump_arch": "arm",
+        "apex": False,
+        # Bionic >= M reads personality(0xffffffff) at startup and treats
+        # failure as fatal; the devcontainer's outer seccomp denies the
+        # syscall with ENOSYS. Harmless where personality(2) works: the
+        # query returns 0 either way and bionic ignores the set.
+        "personality_shim": True,
+    },
+}
 ARM_IMPLEMENTER = 0x41
 ARM_PART_NAMES = {
     0xD05: "cortex-a55",
@@ -54,6 +93,7 @@ class Job:
     conn: socket.socket
     request: object
     candidate: bytes
+    fds: list[int]
 
 
 @dataclass
@@ -365,8 +405,11 @@ def run_serve(args: argparse.Namespace) -> int:
 
 
 def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) -> None:
+    fds: list[int] = []
     try:
-        request_bytes = recv_record(conn, MAX_REQUEST_BYTES, "request")
+        # An asm request carries the client's output directory as an
+        # SCM_RIGHTS fd riding on the request record.
+        request_bytes, fds = recv_record_with_fds(conn, MAX_REQUEST_BYTES, "request")
         candidate = recv_record(conn, MAX_CANDIDATE_BYTES, "candidate wasm")
         conn.settimeout(None)
         request = json.loads(request_bytes.decode("utf-8"))
@@ -374,6 +417,7 @@ def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) 
             raise ValueError("request must be a JSON object")
         target = target_from_request(request)
     except socket.timeout:
+        close_fds(fds)
         safe_send_final(
             conn,
             {
@@ -384,16 +428,26 @@ def accept_one(conn: socket.socket, host_jobs: JobQueue, device_jobs: JobQueue) 
         conn.close()
         return
     except Exception as error:
+        close_fds(fds)
         safe_send_final(conn, {"ok": False, "error": str(error)})
         conn.close()
         return
     if target == "host":
-        host_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate))
+        host_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate, fds=fds))
     elif target == "device":
-        device_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate))
+        device_jobs.enqueue(Job(conn=conn, request=request, candidate=candidate, fds=fds))
     else:
+        close_fds(fds)
         safe_send_final(conn, {"ok": False, "error": f"unsupported target: {target!r}"})
         conn.close()
+
+
+def close_fds(fds: list[int]) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def run_worker(
@@ -420,12 +474,14 @@ def run_worker(
                     default_pin,
                     job.request,
                     candidate_path,
+                    job.fds[0] if job.fds else None,
                 )
         except Exception as error:
             response = {"ok": False, "error": str(error)}
         try:
             safe_send_final(job.conn, response)
         finally:
+            close_fds(job.fds)
             job.conn.close()
             jobs.finish(job)
 
@@ -438,6 +494,7 @@ def handle_request(
     default_pin: str,
     request: object,
     candidate_path: Path,
+    dir_fd: int | None,
 ) -> dict[str, object]:
     if not isinstance(request, dict):
         return {"ok": False, "error": "request must be a JSON object"}
@@ -526,6 +583,14 @@ def handle_request(
             microbench,
             pin_name,
         )
+    if kind == "asm":
+        if target != "host":
+            return {"ok": False, "kind": "asm", "target": target, "error": "asm runs on the daemon host"}
+        try:
+            arch = asm_arch_from_request(request)
+        except ValueError as error:
+            return {"ok": False, "kind": "asm", "target": "host", "error": str(error)}
+        return handle_asm_request(arch, candidate_path, dir_fd)
     if kind != "bench":
         return {"ok": False, "error": f"unsupported request kind: {kind!r}"}
 
@@ -1926,6 +1991,302 @@ def run_host_tests(
     return json_stdout_result(completed, "test")
 
 
+@dataclass(frozen=True)
+class WasmFunctionCode:
+    index: int
+    mangled: str
+    demangled: str
+    code_addr: int
+    code: bytes
+
+
+def asm_arch_from_request(request: dict[str, object]) -> str:
+    arch = request.get("arch")
+    if not isinstance(arch, str) or arch not in ASM_RUNTIMES:
+        raise ValueError(f"arch must be one of: {', '.join(sorted(ASM_RUNTIMES))}")
+    return arch
+
+
+def handle_asm_request(
+    arch: str,
+    candidate_path: Path,
+    dir_fd: int | None,
+) -> dict[str, object]:
+    runtime = ASM_RUNTIMES[arch]
+    base: dict[str, object] = {"kind": "asm", "target": "host", "arch": arch}
+    if "cpu" in runtime:
+        base["cpu"] = runtime["cpu"]
+    if dir_fd is None:
+        return {**base, "ok": False, "error": "asm request carries no output directory fd"}
+    try:
+        tools = resolve_asm_tools(runtime)
+    except RuntimeError as error:
+        return {**base, "ok": False, "error": str(error)}
+
+    out_dir = candidate_path.parent / "perf-out"
+    out_dir.mkdir()
+    shutil.copyfile(candidate_path, out_dir / "candidate.wasm")
+    (out_dir / "compile.js").write_text(ASM_COMPILE_JS)
+    seccomp_fd: int | None = None
+    if runtime.get("personality_shim"):
+        bpf_path = out_dir / "personality0.bpf"
+        bpf_path.write_bytes(personality_seccomp_bpf())
+        seccomp_fd = os.open(bpf_path, os.O_RDONLY)
+    try:
+        completed = subprocess.run(
+            asm_compile_command(runtime, tools, out_dir, seccomp_fd),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=ASM_D8_TIMEOUT_SECONDS,
+            pass_fds=() if seccomp_fd is None else (seccomp_fd,),
+            # --perf-prof also opens v8.log in cwd; keep it out of the
+            # daemon's cwd.
+            cwd=out_dir,
+        )
+    except subprocess.TimeoutExpired as error:
+        return {**base, **timeout_result("asm d8", ASM_D8_TIMEOUT_SECONDS, error)}
+    finally:
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
+
+    if completed.returncode != 0:
+        return {
+            **base,
+            "ok": False,
+            "error": "wasm compile failed",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-2000:],
+            "stderr": completed.stderr[-2000:],
+        }
+
+    dumps = sorted(out_dir.glob("jit-*.dump"))
+    if len(dumps) != 1:
+        return {**base, "ok": False, "error": f"expected one jitdump, found {len(dumps)}"}
+    functions = wasm_functions_from_jitdump(dumps[0])
+    if not functions:
+        return {**base, "ok": False, "error": "no TurboFan wasm records in jitdump"}
+
+    for fn in functions:
+        text = disassemble_wasm_function(tools["objdump"], runtime["objdump_arch"], fn, out_dir)
+        write_file_at(dir_fd, asm_file_name(fn), text.encode("utf-8"))
+    return {**base, "ok": True, "functions": len(functions)}
+
+
+def write_file_at(dir_fd: int, name: str, data: bytes) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644, dir_fd=dir_fd)
+    with os.fdopen(fd, "wb") as file:
+        file.write(data)
+
+
+def resolve_asm_tools(runtime: dict[str, object]) -> dict[str, str]:
+    tools: dict[str, str] = {}
+    if "qemu" in runtime:
+        for key, env_key in (("v8_root", "v8_env"), ("runtime_root", "root_env")):
+            env_name = str(runtime[env_key])
+            value = os.environ.get(env_name)
+            if value is None:
+                raise RuntimeError(f"{env_name} is not set")
+            tools[key] = value
+        if not (Path(tools["v8_root"]) / "d8").is_file():
+            raise RuntimeError(f"missing d8 in {tools['v8_root']}")
+        for command in (str(runtime["qemu"]), "bwrap"):
+            path = shutil.which(command)
+            if path is None:
+                raise RuntimeError(f"{command} not found on PATH")
+            tools[command if command == "bwrap" else "qemu"] = path
+    objdump = os.environ.get("OBJDUMP_MULTIARCH")
+    if objdump is None:
+        raise RuntimeError("OBJDUMP_MULTIARCH is not set")
+    tools["objdump"] = objdump
+    return tools
+
+
+def personality_seccomp_bpf() -> bytes:
+    # Classic-BPF seccomp filter: make personality(2) return 0 instead of the
+    # host kernel's ENOSYS denial. Stacked filters resolve to this ERRNO(0).
+    bpf_ld_w_abs, bpf_jeq_k, bpf_ret_k = 0x20, 0x15, 0x06
+    ret_allow, ret_errno_0 = 0x7FFF0000, 0x00050000
+    personality_nr_x86_64 = 135
+    program = [
+        (bpf_ld_w_abs, 0, 0, 0),
+        (bpf_jeq_k, 0, 1, personality_nr_x86_64),
+        (bpf_ret_k, 0, 0, ret_errno_0),
+        (bpf_ret_k, 0, 0, ret_allow),
+    ]
+    return b"".join(struct.pack("<HBBI", *instruction) for instruction in program)
+
+
+def asm_compile_command(
+    runtime: dict[str, object],
+    tools: dict[str, str],
+    out_dir: Path,
+    seccomp_fd: int | None,
+) -> list[str]:
+    d8_args = [
+        "--no-liftoff",
+        "--no-wasm-lazy-compilation",
+        "--perf-prof",
+    ]
+    if "qemu" not in runtime:
+        return [
+            host_d8_path(),
+            *d8_args,
+            f"--perf-prof-path={out_dir}",
+            str(out_dir / "compile.js"),
+            "--",
+            str(out_dir / "candidate.wasm"),
+        ]
+    v8_root = Path(tools["v8_root"])
+    runtime_root = Path(tools["runtime_root"])
+    apex_binds = (
+        ["--ro-bind", str(runtime_root / "apex"), "/apex"] if runtime["apex"] else []
+    )
+    seccomp_args = [] if seccomp_fd is None else ["--seccomp", str(seccomp_fd)]
+    return [
+        tools["bwrap"],
+        *seccomp_args,
+        # 32-bit bionic packs pthread mutex owner tids into 16 bits; host
+        # tids >= 2^16 self-deadlock on the first recursive lock. A fresh
+        # pid namespace keeps guest tids small.
+        "--unshare-pid",
+        "--ro-bind", "/nix", "/nix",
+        "--ro-bind", str(runtime_root / "system"), "/system",
+        *apex_binds,
+        "--bind", str(out_dir), "/out",
+        "--tmpfs", "/tmp",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--chdir", str(v8_root),
+        tools["qemu"],
+        "-cpu", str(runtime["cpu"]),
+        str(v8_root / "d8"),
+        *d8_args,
+        "--perf-prof-path=/out",
+        "/out/compile.js",
+        "--",
+        "/out/candidate.wasm",
+    ]
+
+
+def wasm_functions_from_jitdump(path: Path) -> list[WasmFunctionCode]:
+    data = path.read_bytes()
+    if len(data) < 16:
+        raise RuntimeError(f"short jitdump: {path}")
+    magic, _version, header_size, _elf_mach = struct.unpack_from("<IIII", data, 0)
+    if magic != JITDUMP_MAGIC:
+        raise RuntimeError(f"bad jitdump magic in {path}")
+    by_index: dict[int, WasmFunctionCode] = {}
+    offset = header_size
+    while offset + 16 <= len(data):
+        record_id, total_size, _timestamp = struct.unpack_from("<IIQ", data, offset)
+        if total_size == 0 or offset + total_size > len(data):
+            break
+        if record_id == JITDUMP_CODE_LOAD:
+            _pid, _tid, _vma, code_addr, code_size, _code_index = struct.unpack_from(
+                "<IIQQQQ", data, offset + 16
+            )
+            name_offset = offset + 16 + 40
+            name_end = data.index(b"\x00", name_offset)
+            name = data[name_offset:name_end].decode("utf-8", errors="replace")
+            match = WASM_TURBOFAN_NAME.fullmatch(name)
+            if match is not None:
+                index = int(match.group("index"))
+                mangled = match.group("mangled")
+                code = data[name_end + 1 : name_end + 1 + code_size]
+                # Recompilations append later records; last one wins.
+                by_index[index] = WasmFunctionCode(
+                    index=index,
+                    mangled=mangled,
+                    demangled=demangle_rust(mangled),
+                    code_addr=code_addr,
+                    code=code,
+                )
+        offset += total_size
+    return [by_index[index] for index in sorted(by_index)]
+
+
+RUST_MANGLE_ESCAPES = {
+    "$SP$": "@",
+    "$BP$": "*",
+    "$RF$": "&",
+    "$LT$": "<",
+    "$GT$": ">",
+    "$LP$": "(",
+    "$RP$": ")",
+    "$C$": ",",
+}
+
+
+def demangle_rust(mangled: str) -> str:
+    match = re.fullmatch(r"_ZN(.*)E", mangled)
+    if match is None:
+        return mangled
+    rest = match.group(1)
+    segments: list[str] = []
+    position = 0
+    while position < len(rest):
+        length_match = re.match(r"[1-9]\d*", rest[position:])
+        if length_match is None:
+            return mangled
+        length = int(length_match.group())
+        position += len(length_match.group())
+        segment = rest[position : position + length]
+        if len(segment) != length:
+            return mangled
+        position += length
+        segments.append(segment)
+    if segments and re.fullmatch(r"h[0-9a-f]{16}", segments[-1]):
+        segments.pop()
+    decoded: list[str] = []
+    for segment in segments:
+        if segment.startswith("_$"):
+            segment = segment[1:]
+        for escape, replacement in RUST_MANGLE_ESCAPES.items():
+            segment = segment.replace(escape, replacement)
+        segment = re.sub(
+            r"\$u([0-9a-f]{2,4})\$", lambda m: chr(int(m.group(1), 16)), segment
+        )
+        decoded.append(segment.replace("..", "::"))
+    return "::".join(decoded)
+
+
+def asm_file_name(fn: WasmFunctionCode) -> str:
+    short = fn.demangled.rsplit("::", 1)[-1]
+    short = re.sub(r"[^A-Za-z0-9_.-]+", "_", short)[:48] or "fn"
+    return f"{fn.index:03d}-{short}.s"
+
+
+def disassemble_wasm_function(
+    objdump: str,
+    objdump_arch: str,
+    fn: WasmFunctionCode,
+    work_dir: Path,
+) -> str:
+    bin_path = work_dir / f"disasm-{fn.index}.bin"
+    bin_path.write_bytes(fn.code)
+    completed = subprocess.run(
+        [objdump, "-D", "-b", "binary", "-m", objdump_arch, str(bin_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"objdump failed for function index {fn.index}: {completed.stderr.strip()}"
+        )
+    lines = [
+        line for line in completed.stdout.splitlines() if re.match(r"^ *[0-9a-f]+:", line)
+    ]
+    header = [
+        f"; {fn.demangled}",
+        f"; wasm function index {fn.index}, {len(fn.code)} bytes, code address 0x{fn.code_addr:x}",
+        f"; record: JS:{fn.mangled}-{fn.index}-turbofan",
+        "; trailing constant-pool data disassembles as garbage instructions",
+    ]
+    return "\n".join(header + lines) + "\n"
+
+
 def json_stdout_result(
     completed: subprocess.CompletedProcess[str],
     json_label: str,
@@ -1993,6 +2354,22 @@ def recv_record(sock: socket.socket, max_bytes: int, label: str) -> bytes:
     if data == b"":
         raise ValueError(f"missing {label} message")
     return data
+
+
+def recv_record_with_fds(
+    sock: socket.socket, max_bytes: int, label: str
+) -> tuple[bytes, list[int]]:
+    data, fds, flags, _address = socket.recv_fds(sock, max_bytes, 1)
+    fds = list(fds)
+    if flags & (
+        getattr(socket, "MSG_TRUNC", 0) | getattr(socket, "MSG_CTRUNC", 0)
+    ):
+        close_fds(fds)
+        raise ValueError(f"{label} message exceeds {max_bytes} bytes or 1 fd")
+    if data == b"":
+        close_fds(fds)
+        raise ValueError(f"missing {label} message")
+    return data, fds
 
 
 def send_json(sock: socket.socket, value: object) -> None:
