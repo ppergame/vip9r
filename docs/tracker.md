@@ -170,12 +170,21 @@ between passes and reorder on what you see. One measured pass per grinder task;
 - [x] IDCT: dequant nonzero-row tracking + zero-row skip, DC-only DCT_DCT
       path, unchecked hot butterflies (documented malformed-stream behavior
       change). X4: 42.6 → 24.2 ms/frame
-- [ ] simd128 kernels in post-reshape profile order — convolution, loop filter,
-      IDCT, compound average, intra predictors as warranted — with `wasm-tests`
-      unit coverage per kernel and the golden corpus as oracle
+- [x] coefficient token loop hoisting: block-invariant probability/counts
+      rows, const scan/band slices, const-shaped token tree. ~2% X4, at the
+      credibility line; kept as hot-loop simplification. Wide-window bool
+      decoder, unrolled tree, neighbor tables, direct coef writes all
+      measured worse and were rejected
+- [ ] simd128 kernels in post-reshape profile order — X4 profile after the
+      scalar campaign (jellyfish 0:15, 23.1 ms/frame): inter subpel 33%,
+      decode_block 30%, loop filter 15%, IDCT 7%. Convolution first; with
+      `wasm-tests` unit coverage per kernel and the golden corpus as oracle
 - [ ] memory/layout: reference slot remap instead of full-frame
       `copy_from_slice` on refresh (~1.4 MB per slot per frame at 720p),
-      stride/alignment normalization, counts-accumulation cost check
+      stride/alignment normalization, counts-accumulation cost check.
+      2026-07: X4 headroom estimate is ~1-2%, below the A/B credibility
+      line; measure on the A55 (libc/memory share is ~9% there) or bundle
+      with the simd session
 
 ### M4 — Encode
 
