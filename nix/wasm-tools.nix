@@ -61,8 +61,10 @@ in {
       runner="$project_root/js/dist/wasm-driver/tests.js"
       require_runner "$runner"
 
-      cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
-        --target wasm32-unknown-unknown -p vip9r --release --features wasm-tests
+      # cd: cargo resolves .cargo/config.toml (target-feature flags) from cwd,
+      # not --manifest-path.
+      (cd "$rust_root" && cargo build --target-dir "$target_dir" \
+        --target wasm32-unknown-unknown -p vip9r --release --features wasm-tests)
       exec "${v8.linux64}/d8" --module "$runner" -- "$wasm_path" "$@"
     '';
   };
@@ -89,8 +91,10 @@ in {
         exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- --help
       fi
 
-      cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
-        --target wasm32-unknown-unknown -p vip9r --release
+      # cd: cargo resolves .cargo/config.toml (target-feature flags) from cwd,
+      # not --manifest-path.
+      (cd "$rust_root" && cargo build --target-dir "$target_dir" \
+        --target wasm32-unknown-unknown -p vip9r --release)
       exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };
@@ -117,8 +121,10 @@ in {
         exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- --help
       fi
 
-      cargo build --manifest-path "$rust_root/Cargo.toml" --target-dir "$target_dir" \
-        --target wasm32-unknown-unknown -p vip9r --release
+      # cd: cargo resolves .cargo/config.toml (target-feature flags) from cwd,
+      # not --manifest-path.
+      (cd "$rust_root" && cargo build --target-dir "$target_dir" \
+        --target wasm32-unknown-unknown -p vip9r --release)
       exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };

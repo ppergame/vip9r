@@ -373,6 +373,9 @@ def build_wasm() -> None:
             "-p", "vip9r", "--release",
         ],
         check=True,
+        # cwd must be the workspace: cargo resolves .cargo/config.toml (which
+        # carries target-feature flags) from cwd, not --manifest-path.
+        cwd=REPO_ROOT / "rust",
     )
 
 

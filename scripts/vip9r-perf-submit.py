@@ -296,7 +296,9 @@ def build_release_candidate() -> Path:
         "vip9r",
         "--release",
     ]
-    completed = subprocess.run(cmd, check=False)
+    # cwd must be the workspace: cargo resolves .cargo/config.toml (which
+    # carries target-feature flags) from cwd, not --manifest-path.
+    completed = subprocess.run(cmd, check=False, cwd=rust_root)
     if completed.returncode != 0:
         raise RuntimeError(f"release wasm build exited {completed.returncode}")
     return wasm_path
@@ -321,7 +323,7 @@ def build_wasm_tests_candidate() -> Path:
         "--features",
         "wasm-tests",
     ]
-    completed = subprocess.run(cmd, check=False)
+    completed = subprocess.run(cmd, check=False, cwd=rust_root)
     if completed.returncode != 0:
         raise RuntimeError(f"wasm-tests build exited {completed.returncode}")
     return wasm_path

@@ -236,7 +236,7 @@ in
       # Default perf-submit routing for the sandbox: bench baseline and
       # device index:pin ride in as env, overridable per submission.
       if [[ -n "$baseline_file" ]]; then
-        cp -a "$baseline_file" "$run/rootfs/run/baseline.wasm"
+        cp -a "$baseline_file" "$run/baseline.wasm"
         podman_args+=(--env VIP9R_PERF_BASELINE=/run/baseline.wasm)
       fi
       if [[ -n "$device_default" ]]; then
