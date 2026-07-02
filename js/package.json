@@ -5,10 +5,11 @@
   "packageManager": "pnpm@11.4.0",
   "scripts": {
     "build": "pnpm typecheck && pnpm build:wasm-driver && pnpm build:web",
+    "dev": "vite",
     "build:wasm-driver": "vite build --config vite.wasm-driver.config.ts",
     "build:web": "vite build",
     "test": "vitest run",
-    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && tsc -p tsconfig.node.json"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",

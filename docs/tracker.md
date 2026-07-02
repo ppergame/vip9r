@@ -426,6 +426,40 @@ shrank; traversal glue and intra prediction were promoted.
       decode_block region is layout-fragile (P1b), so judge strictly
       by counterbalanced A/B. Candidate rider on the fusion pass
 
+### M5a — demo page: play + race
+
+Decode-and-play demo in desktop/device Chrome. No MSE/H.264 — that stays M5.
+Gated on M2 only; independent of M3/M4 and can run in parallel with the simd
+campaign. Vanilla TS + DOM, no web framework. Local dev only; hosting (VPS,
+COOP/COEP headers, CDN media) is out of scope until it exists.
+
+- [ ] demo shell: tabbed race/play modes; media dropdown (canned manifest) plus
+      URL textbox (direct fetch plays the CORS lottery; vite dev-server proxy
+      route as the local escape hatch); config via URL params (`mode`, `media`,
+      `wc`, `lanes`, `autostart`) with a copy-link button — F5 is the rerun
+- [ ] worker decode pipeline: vip9r in a dedicated worker (postMessage +
+      transferable planes, no SAB/COOP/COEP needed), `VideoFrame` I420
+      construction and canvas present on main; two clocks — worker-side decode
+      ms/frame vs main-side presented fps and drop count — so slow blits on
+      TV-class compositors can't pollute decoder numbers
+- [ ] playback mode: real-time pacing off WebM timestamps, bounded frame
+      queue, drop counter
+- [ ] race mode: side-by-side flat-out decode, vip9r vs WebCodecs
+      `VideoDecoder`; `wc` param maps to `hardwareAcceleration` (default
+      prefer-software; it is a preference — display the accepted config,
+      Chrome may fall back silently); throughput totals, ms/frame sparklines,
+      finish times; `lanes` runs one side alone for honest device numbers
+      (simultaneous lanes contend for cores — fine on the workstation,
+      invalid on the A55)
+- [ ] canned media manifest: curated /bulk/vip9r subset served through vite
+- [ ] spike, time-boxed: Cobalt on the streamer — can an arbitrary page load
+      at all, and does it expose `VideoFrame` construction; sideloaded
+      Chrome/WebView shell is the fallback device target
+- Parked, explicit later decisions: optimization time-travel wasm-vintage
+  selector (verify ABI stability across M3 merges first), live per-frame md5
+  badge vs golden sidecars, X-ray overlay (needs decoder side-data exports —
+  weigh against the no-unused-affordances rule)
+
 ### M4 — Encode
 
 minih264 in, MSE-playable H.264 out. Fitness gains a VMAF/size floor.
