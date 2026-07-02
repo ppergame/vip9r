@@ -2,6 +2,7 @@
   inherit (pkgs) lib;
 
   android = pkgs.pkgsCross.aarch64-android-prebuilt;
+  android32 = pkgs.pkgsCross.armv7a-android-prebuilt;
 
   commonConfigureFlags = [
     "--prefix=${placeholder "out"}"
@@ -140,5 +141,30 @@ in {
     dontPatchELF = true;
     noAuditTmpdir = true;
     platforms = ["aarch64-linux"];
+  };
+
+  androidArm32 = mkFfmpegVp9 {
+    pname = "ffmpeg-android-arm32-vp9";
+    stdenv = android32.stdenv;
+    nativeBuildInputs = [
+      android32.buildPackages.pkg-config
+    ];
+    preConfigure = ''
+      configureFlagsArray+=("--extra-ldexeflags=-static -no-pie")
+    '';
+    targetConfigureFlags = [
+      "--target-os=android"
+      "--arch=arm"
+      "--cpu=armv7-a"
+      "--cross-prefix=${android32.stdenv.cc.targetPrefix}"
+      "--cc=${android32.stdenv.cc.targetPrefix}clang"
+      "--cxx=${android32.stdenv.cc.targetPrefix}clang++"
+      "--host-cc=${pkgs.stdenv.cc}/bin/cc"
+      "--pkg-config=${android32.buildPackages.pkg-config}/bin/${android32.buildPackages.pkg-config.targetPrefix}pkg-config"
+      "--enable-cross-compile"
+    ];
+    dontPatchELF = true;
+    noAuditTmpdir = true;
+    platforms = ["armv7a-linux"];
   };
 }

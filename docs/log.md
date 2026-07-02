@@ -527,3 +527,37 @@ baseline (49bac22), X4 = Pixel 9a cpu7, A55 = TV streamer cpu0:
   what the deferred ffvp9 baseline needs to answer (whether *any*
   single-device software decode fits the streamer, or the A55 target
   moves to M6 stretch scope).
+
+## 2026-07-02 — ffvp9 baseline: both devices, all core types
+
+Static NEON ffmpeg (ffvp9 8.1) run directly through adb by the new
+`scripts/ffvp9-baseline.py` (armv7 static build added to the flake next to
+the existing arm64/linux64). 600-frame windows, taskset-pinned, best-of-2,
+ffmpeg `-benchmark` rtime, so numbers include process startup and demux.
+Full matrix with per-run telemetry:
+`temp/perf/ffvp9-baseline-20260702T222432Z.json`. ms/frame:
+
+| clip (720p unless noted) | A55 x1t | A55 x4t | A520 x1t | A720 x1t | X4 x1t |
+|--------------------------|---------|---------|----------|----------|--------|
+| jellyfish p30            | 23.1    | 7.9     | 13.3     | 4.4      | 2.7    |
+| big-buck-bunny p25       | 17.5    | 5.8     | 9.6      | 3.2      | 2.1    |
+| caminandes p24           | 22.9    | 8.4     | 13.2     | 4.5      | 2.9    |
+| cosmos-laundromat p24    | 9.5     | 3.4     | 4.6      | 1.6      | 1.0    |
+| spring 2048×858 p24      | 27.2    | 9.7     | 14.3     | 4.7      | 2.8    |
+| tears-of-steel p24       | 15.0    | 5.4     | 8.2      | 2.8      | 1.7    |
+
+- The M6 scope question is answered: ffvp9 decodes every clip inside its
+  realtime budget **single-threaded on the A55** (worst 720p30 clip 23.1
+  vs 33.3 ms, ~30% margin, cool start). Single-device software decode
+  fits the streamer without threads; the A55 target is an optimization
+  gap, not a hardware bound.
+- Gap to vip9r post-simd128: A55 jellyfish 210 vs 23.1 ms/frame (~9x),
+  X4 17.1 vs 2.7 (~6.4x). Part of that is native NEON vs V8 wasm
+  codegen; the rest is decoder maturity.
+- Frame threading (`-threads N`) scales ~2.9x on the homogeneous A55
+  quad. On the Pixel's heterogeneous clusters multithreaded numbers
+  mislead — A720 x3t is slower than x1t and all-cores x8t is gated by
+  the little cores — so the single-core columns are the meaningful
+  bound there.
+- Host (x86-64, `-threads 1`): 0.7–2.1 ms/frame, collected under
+  concurrent build load; rough numbers only.

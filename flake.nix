@@ -27,6 +27,7 @@
         || name == "ndk"
         || nixpkgs.lib.hasPrefix "system-image-" name
         || nixpkgs.lib.hasPrefix "aarch64-unknown-linux-android-" name
+        || nixpkgs.lib.hasPrefix "armv7a-unknown-linux-androideabi-" name
         || nixpkgs.lib.hasPrefix "android-sdk-" name
         || nixpkgs.lib.hasPrefix "android-ndk" name
         || nixpkgs.lib.hasPrefix "platform-tools" name;
@@ -82,6 +83,7 @@
       OBJDUMP_MULTIARCH = "${pkgs.binutils-unwrapped-all-targets}/bin/objdump";
       FFMPEG_VP9_LINUX64 = "${ffmpegVp9.linux64}/bin/ffmpeg";
       FFMPEG_VP9_ANDROID_ARM64 = "${ffmpegVp9.androidArm64}/bin/ffmpeg";
+      FFMPEG_VP9_ANDROID_ARM32 = "${ffmpegVp9.androidArm32}/bin/ffmpeg";
       SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       NODE_EXTRA_CA_CERTS = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";

@@ -28,12 +28,12 @@ Deferrable external inputs for M3 performance work.
 
 - [x] user: root the Pixel 9a
 - [x] user: 720p performance corpus
-- [ ] user: collect the ffvp9 performance baseline: static ffmpeg (arm64 +
+- [x] user: collect the ffvp9 performance baseline: static ffmpeg (arm64 +
       armv7) run directly through adb, taskset-pinned, on the realworld 720p
-      clips across Pixel 9a core types and the streamer. Deferred by the user
-      2026-07. Strategically it bounds the A55 target: if ffvp9 can't do
-      single-threaded 720p30 there, that's a threads/M6 scope decision, not an
-      optimization gap
+      clips across Pixel 9a core types and the streamer. 2026-07-02: done via
+      `scripts/ffvp9-baseline.py`; ffvp9 does 720p30 single-threaded on the
+      A55 with ~30% margin on the worst clip, so the streamer target is an
+      optimization gap (~9x), not a scope decision. Table in log.md
 
 ## Later
 
