@@ -158,19 +158,18 @@ between passes and reorder on what you see. One measured pass per grinder task;
       4% IDCT; A55 27% loop_filter / 25% predict_inter / 16% decode_block /
       6% IDCT (2-frame keyframe-weighted window). Flag flip neutral on both
       (X4 within noise, A55 dead even); kept in the baseline
-- [ ] inter prediction: block-level two-pass separable convolution. The current
-      `inter_predict_sample` path is 64 MACs/pixel with per-sample clamped
-      access and checked math; two-pass is 16 MACs/pixel with straight-line
-      inner loops. Unscaled (`step == 16`) fast path with per-block filter
-      phase, integer-MV block copy, edge clamping hoisted out of inner loops —
-      likely via reference-plane border extension, which touches
-      `WorkspaceLayout` and deserves its own reviewable step
-- [ ] loop filter: per-superblock filter-mask precomputation and
-      edge-directional processing over contiguous memory, scalar first
-- [ ] bool decoder: wide window with byte-granularity refill (`read_bool`
-      currently renormalizes bit-by-bit); move validation to block/tile setup so
-      token loops lose checked math and per-call `Result` plumbing
-- [ ] IDCT: eob-based fast paths (DC-only, low-eob) before any butterfly work
+- [x] inter prediction: block-level two-pass separable convolution, unscaled
+      fast path, integer-MV copy, per-block clamped edge gather (no
+      `WorkspaceLayout` change needed). X4 jellyfish: 143.6 → 77.3 ms/frame
+- [x] loop filter: strength LUTs, per-SB decision cache, span filtering,
+      sliding-sum wide filter, scalar. X4: 76.2 → 43.5 ms/frame
+- [x] bool decoder wide window: measured negative (≈ +0.4% after position-bias
+      control), not merged. Under V8 the refill is not the bottleneck;
+      remaining `decode_block` cost is token/syntax structure above the
+      primitive — a different, deeper reshape if entropy stays hot
+- [x] IDCT: dequant nonzero-row tracking + zero-row skip, DC-only DCT_DCT
+      path, unchecked hot butterflies (documented malformed-stream behavior
+      change). X4: 42.6 → 24.2 ms/frame
 - [ ] simd128 kernels in post-reshape profile order — convolution, loop filter,
       IDCT, compound average, intra predictors as warranted — with `wasm-tests`
       unit coverage per kernel and the golden corpus as oracle

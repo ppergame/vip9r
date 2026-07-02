@@ -385,3 +385,20 @@ milestones, and measured optimization results.
 - Measured on `jellyfish-720p30` frames 0:15, Pixel 9a X4: 42.6 → 24.2
   ms/frame (-43%). Compliance corpus green (307/307). The X4 is now under
   the 33.3 ms/frame 720p30 budget on this clip.
+
+## 2026-07-02 — bool decoder wide window: measured negative
+
+- Rebuilt `BoolDecoder` around a 32-bit combined value/window with
+  byte-granularity refill and clz renormalization (several variants: u64/u16
+  side windows, branchless split, out-of-line refill, literal(1) fast path).
+  All validated bit-exact, none beat the existing 16-bit bit-at-a-time
+  decoder on the X4: net effect ≈ +0.4% after subtracting position bias.
+  Not merged. Under V8/TurboFan the per-bit refill is not the bottleneck;
+  `decode_block`'s cost sits in the token/syntax structure above the
+  primitive.
+- Measurement caveat discovered on the way: with the device heat-soaked by
+  hours of continuous back-to-back runs, the A/B bench's second position
+  reads ~13% slow (a no-op candidate reproduced it). Under normal cool-start
+  conditions the position penalty is ~2%. Sub-2% deltas remain
+  non-credible, and orchestrator-side controls (no-op candidate) are the
+  cheap way to re-anchor when the device has been under sustained load.

@@ -219,6 +219,13 @@ Empirical behavior that shapes the protocol:
   ≤1% with no CPU control at all; back-to-back baseline/candidate runs of
   identical wasm agree within 0.02–0.5%. A/B deltas ≥~2% are credible from a
   single daemon bench run.
+- A/B bench runs execute baseline first, candidate second. Under sustained
+  multi-hour device load (grinder sessions hammering benches/validations
+  back-to-back) the second position read ~13% slow on the X4; a no-op
+  candidate reproduced it, so it is position bias, not a code delta. Under
+  normal cool-start conditions the position penalty is ~2%. When a grinder
+  reports a surprising regression after heavy device use, re-anchor with a
+  no-op control (candidate == baseline) before believing it.
 - The Pixel X4 heat-soaks: ~6% ms/frame degradation over 8 minutes of
   continuous decode at 89–94 °C on the BIG sensor, while `scaling_cur_freq`
   reports a constant 3105 MHz and `scaling_max_freq` never clamps. cpufreq
