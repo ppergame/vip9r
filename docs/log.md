@@ -461,3 +461,21 @@ milestones, and measured optimization results.
   and wide filters need many blended variants, both of which cost more
   than the lanes save under V8. Candidate for a relaxed-simd or
   multi-thread era retry.
+
+## 2026-07-02 — simd128 inverse DCT
+
+- DCT_DCT 2-D inverse transforms now run 4 lanes wide: the row pass
+  compacts set bits of `nonzero_row_mask` into groups of 4 (leftovers
+  scalar), the column pass takes 4 contiguous columns per step, and the
+  butterfly network (`b`/`h`) is a structural clone of the scalar
+  recursion on `i32x4` state — `i64x2_extmul` products, `(+8192)>>14`
+  rounding in i64 lanes, low-32 packing reproducing the scalar wrapping
+  narrow bit-exactly. ADST/WHT stay scalar (~1.3% share didn't justify
+  lanes). Sparse fast paths (eob 0/1, zero-row skip) preserved.
+- The delta beats the profiler's 6-7% `inverse_dct` share because the 2-D
+  driver's strided gather/scatter and final i64 rounding were inlined
+  into `decode_block`'s attribution; the simd path captures those too.
+- Measured vs post-convolution baseline, jellyfish: X4 0:15 −13.0% (20.1
+  → 17.5 ms/frame, spread 1.1%); A55 0:5 −9.6% (233 → 211, spread 0.2%).
+  Grinder cross-check big-buck-bunny −5.1%. simd-vs-scalar wasm test
+  sweep across sizes/types/sparsity patterns; compliance corpus 307/307.

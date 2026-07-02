@@ -227,8 +227,11 @@ ms/frame): inter subpel 33%, decode_block 30%, loop filter 15%, IDCT 7%.
       harness hole: cargo builds outside `rust/` dropped
       `.cargo/config.toml` target features; harness cargo invocations now
       pin cwd to the workspace
-- [ ] loop filter simd — spans/LUT reshape already batches up to 8
-      positions; vertical-edge transpose is the review risk
+- [x] loop filter simd — measured negative, not merged. Best variant
+      (pass-1 Tx4x4 narrow only) −0.6/−0.7% vs 1.1/0.8% spread on X4;
+      fuller variants slower. The scalar span reshape already amortized
+      decisions; pass-0 transpose and wide-filter blends cost more than
+      lanes save under V8. Relaxed-simd/threads-era retry candidate
 - [ ] IDCT simd — scalar butterflies use i64 products for exactness; a simd
       version must prove bit-exact 32-bit-lane behavior for conformant
       streams (`wasm-tests` sweep vs the scalar reference, plus the corpus)

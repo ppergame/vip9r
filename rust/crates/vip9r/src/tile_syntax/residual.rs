@@ -2,6 +2,9 @@ use crate::header::{SEG_LVL_ALT_Q, SegmentationParams, UncompressedFrameHeader};
 
 use super::{MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType};
 
+#[cfg(target_arch = "wasm32")]
+use core::arch::wasm32::*;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TransformBlock {
     pub(super) tx_size: TxSize,
@@ -140,7 +143,48 @@ impl DequantizedCoefficients {
         self.inverse_transform_2d(lossless, n, width, self.nonzero_row_mask)
     }
 
+    #[cfg(feature = "wasm-tests")]
+    fn inverse_transform_scalar(&mut self, lossless: bool) -> Result<(), TileSyntaxError> {
+        if lossless {
+            if self.block.tx_size != TxSize::Tx4x4 || self.block.tx_type != TxType::DctDct {
+                return Err(TileSyntaxError::InvalidBitstream);
+            }
+        } else if self.block.tx_size == TxSize::Tx32x32 && self.block.tx_type != TxType::DctDct {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let n = 2 + self.block.tx_size.index();
+        let width = transform_width(self.block.tx_size);
+
+        if self.eob == 0 {
+            return Ok(());
+        }
+
+        if !lossless && self.block.tx_type == TxType::DctDct && self.eob == 1 {
+            return self.inverse_dct_dct_dc_only(n, width);
+        }
+
+        self.inverse_transform_2d_scalar(lossless, n, width, self.nonzero_row_mask)
+    }
+
     fn inverse_transform_2d(
+        &mut self,
+        lossless: bool,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if !lossless && self.block.tx_type == TxType::DctDct {
+                return self.inverse_transform_2d_dct_dct_simd(n, width, nonzero_row_mask);
+            }
+        }
+
+        self.inverse_transform_2d_scalar(lossless, n, width, nonzero_row_mask)
+    }
+
+    fn inverse_transform_2d_scalar(
         &mut self,
         lossless: bool,
         n: usize,
@@ -194,6 +238,118 @@ impl DequantizedCoefficients {
                 } else {
                     narrow_i32(round2_i64(i64::from(value), final_shift))?
                 };
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_2d_dct_dct_simd(
+        &mut self,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        self.inverse_dct_rows_simd(n, width, nonzero_row_mask)?;
+        self.inverse_dct_columns_simd(n, width)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_dct_rows_simd(
+        &mut self,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        let active_rows = width.min(u32::BITS as usize - nonzero_row_mask.leading_zeros() as usize);
+        let mut rows = [0usize; SIMD_DCT_LANES];
+        let mut row_count = 0usize;
+
+        for row in 0..active_rows {
+            if nonzero_row_mask & (1u32 << row) == 0 {
+                continue;
+            }
+
+            rows[row_count] = row;
+            row_count += 1;
+            if row_count == SIMD_DCT_LANES {
+                self.inverse_dct_row_group_simd(n, width, rows)?;
+                row_count = 0;
+            }
+        }
+
+        let mut t = [0i32; MAX_TX_WIDTH];
+        for &row in rows.iter().take(row_count) {
+            for (col, slot) in t.iter_mut().take(width).enumerate() {
+                *slot = self.coefficients[row * width + col];
+            }
+            inverse_dct_permutation(&mut t, n);
+            inverse_dct(&mut t, n)?;
+            for (col, value) in t.iter().take(width).copied().enumerate() {
+                self.coefficients[row * width + col] = value;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_dct_row_group_simd(
+        &mut self,
+        n: usize,
+        width: usize,
+        rows: [usize; SIMD_DCT_LANES],
+    ) -> Result<(), TileSyntaxError> {
+        let mut t = [i32x4_splat(0); MAX_TX_WIDTH];
+        for (col, slot) in t.iter_mut().take(width).enumerate() {
+            *slot = i32x4_from_lanes(
+                self.coefficients[rows[0] * width + col],
+                self.coefficients[rows[1] * width + col],
+                self.coefficients[rows[2] * width + col],
+                self.coefficients[rows[3] * width + col],
+            );
+        }
+
+        inverse_dct_permutation_simd(&mut t, n);
+        inverse_dct_simd(&mut t, n)?;
+
+        for (col, &values) in t.iter().take(width).enumerate() {
+            self.coefficients[rows[0] * width + col] = i32x4_extract_lane::<0>(values);
+            self.coefficients[rows[1] * width + col] = i32x4_extract_lane::<1>(values);
+            self.coefficients[rows[2] * width + col] = i32x4_extract_lane::<2>(values);
+            self.coefficients[rows[3] * width + col] = i32x4_extract_lane::<3>(values);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_dct_columns_simd(&mut self, n: usize, width: usize) -> Result<(), TileSyntaxError> {
+        let final_shift = core::cmp::min(6, n + 2);
+        let mut t = [i32x4_splat(0); MAX_TX_WIDTH];
+
+        for col in (0..width).step_by(SIMD_DCT_LANES) {
+            for (row, slot) in t.iter_mut().take(width).enumerate() {
+                *slot = load_i32x4(self.coefficients.as_ptr().wrapping_add(row * width + col));
+            }
+
+            inverse_dct_permutation_simd(&mut t, n);
+            inverse_dct_simd(&mut t, n)?;
+
+            for (row, &values) in t.iter().take(width).enumerate() {
+                // Scalar DCT narrows `round2_i64(i64::from(value), final_shift)`.
+                // Since `value` is already i32 and final_shift is 4..=6 here,
+                // that checked narrow cannot fail. Keep the rounding in i64
+                // lanes anyway so malformed streams near i32::MAX do not get
+                // an extra pre-shift i32 wrap.
+                let values = round_shift_i32x4(values, final_shift);
+                store_i32x4(
+                    self.coefficients
+                        .as_mut_ptr()
+                        .wrapping_add(row * width + col),
+                    values,
+                );
             }
         }
 
@@ -366,6 +522,8 @@ pub(super) const fn coefficient_count(tx_size: TxSize) -> usize {
 }
 
 const MAX_TX_WIDTH: usize = 32;
+#[cfg(target_arch = "wasm32")]
+const SIMD_DCT_LANES: usize = 4;
 
 const COS64_LOOKUP: [i32; 33] = [
     16384, 16364, 16305, 16207, 16069, 15893, 15679, 15426, 15137, 14811, 14449, 14053, 13623,
@@ -466,6 +624,111 @@ fn h(t: &mut [i32; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     t[y_index] = narrow_i32_butterfly(x - y);
 }
 
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn i32x4_from_lanes(a: i32, b: i32, c: i32, d: i32) -> v128 {
+    let value = i32x4_replace_lane::<0>(i32x4_splat(0), a);
+    let value = i32x4_replace_lane::<1>(value, b);
+    let value = i32x4_replace_lane::<2>(value, c);
+    i32x4_replace_lane::<3>(value, d)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_i32x4(src: *const i32) -> v128 {
+    // Wasm vector loads are byte-addressed and permit unaligned addresses. The
+    // callers pass four in-bounds contiguous i32 coefficients.
+    unsafe { v128_load(src.cast::<v128>()) }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn store_i32x4(dst: *mut i32, value: v128) {
+    // Wasm vector stores are byte-addressed and permit unaligned addresses. The
+    // callers pass four in-bounds contiguous i32 coefficient slots.
+    unsafe { v128_store(dst.cast::<v128>(), value) }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn pack_i64x2_low_i32s(lo: v128, hi: v128) -> v128 {
+    i32x4_shuffle::<0, 2, 4, 6>(lo, hi)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_shift_i64x2(value: v128, bits: usize) -> v128 {
+    let rounding = i64x2_splat(1i64 << (bits - 1));
+    i64x2_shr(i64x2_add(value, rounding), bits as u32)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_shift_i32x4(value: v128, bits: usize) -> v128 {
+    let lo = round_shift_i64x2(i64x2_extend_low_i32x4(value), bits);
+    let hi = round_shift_i64x2(i64x2_extend_high_i32x4(value), bits);
+    pack_i64x2_low_i32s(lo, hi)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn b_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, flip: bool) {
+    let ta = t[a];
+    let tb = t[b_index];
+    let cos = i32x4_splat(cos64(angle));
+    let sin = i32x4_splat(sin64(angle));
+
+    let x_lo = round_shift_i64x2(
+        i64x2_sub(
+            i64x2_extmul_low_i32x4(ta, cos),
+            i64x2_extmul_low_i32x4(tb, sin),
+        ),
+        14,
+    );
+    let x_hi = round_shift_i64x2(
+        i64x2_sub(
+            i64x2_extmul_high_i32x4(ta, cos),
+            i64x2_extmul_high_i32x4(tb, sin),
+        ),
+        14,
+    );
+    let y_lo = round_shift_i64x2(
+        i64x2_add(
+            i64x2_extmul_low_i32x4(ta, sin),
+            i64x2_extmul_low_i32x4(tb, cos),
+        ),
+        14,
+    );
+    let y_hi = round_shift_i64x2(
+        i64x2_add(
+            i64x2_extmul_high_i32x4(ta, sin),
+            i64x2_extmul_high_i32x4(tb, cos),
+        ),
+        14,
+    );
+
+    let x = pack_i64x2_low_i32s(x_lo, x_hi);
+    let y = pack_i64x2_low_i32s(y_lo, y_hi);
+
+    if flip {
+        t[a] = y;
+        t[b_index] = x;
+    } else {
+        t[a] = x;
+        t[b_index] = y;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn h_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
+    let (x_index, y_index) = if flip { (b_index, a) } else { (a, b_index) };
+    let x = t[x_index];
+    let y = t[y_index];
+    t[x_index] = i32x4_add(x, y);
+    t[y_index] = i32x4_sub(x, y);
+}
+
 fn sb(
     t: &[i32; MAX_TX_WIDTH],
     s: &mut [i64; MAX_TX_WIDTH],
@@ -505,6 +768,15 @@ fn inverse_dct_permutation(t: &mut [i32; MAX_TX_WIDTH], n: usize) {
     let len = 1usize << n;
     let mut copy_t = [0i32; MAX_TX_WIDTH];
     copy_t[..len].copy_from_slice(&t[..len]);
+    for (i, slot) in t.iter_mut().take(len).enumerate() {
+        *slot = copy_t[brev(n, i)];
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn inverse_dct_permutation_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) {
+    let len = 1usize << n;
+    let copy_t = *t;
     for (i, slot) in t.iter_mut().take(len).enumerate() {
         *slot = copy_t[brev(n, i)];
     }
@@ -586,6 +858,93 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
 
     for i in 0..n1 {
         h(t, i, n0 - 1 - i, false);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
+    if !(2..=5).contains(&n) {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let n0 = 1usize << n;
+    let n1 = 1usize << (n - 1);
+    let n2 = 1usize << (n - 2);
+
+    if n == 2 {
+        b_simd(t, 0, 1, 16, true);
+    } else {
+        inverse_dct_simd(t, n - 1)?;
+    }
+
+    for i in 0..n2 {
+        b_simd(t, n1 + i, n0 - 1 - i, 32 - brev(5, n1 + i) as i32, false);
+    }
+
+    if n >= 3 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..n3 {
+            for j in 0..=1 {
+                h_simd(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
+            }
+        }
+    }
+
+    if n == 5 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..=1 {
+            for j in 0..=1 {
+                b_simd(
+                    t,
+                    n0 - n + 3 - n2 * j - 4 * i,
+                    n1 + n - 4 + n2 * j + 4 * i,
+                    28 - 16 * i as i32 + 56 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..=1 {
+            for j in 0..=3 {
+                h_simd(
+                    t,
+                    n1 + n3 * j + i,
+                    n1 + n2 - 5 + n3 * j - i,
+                    (j & 1) != 0,
+                );
+            }
+        }
+    }
+
+    if n >= 4 {
+        for i in 0..=usize::from(n == 5) {
+            for j in 0..=1 {
+                b_simd(
+                    t,
+                    n0 - n + 2 - i - n2 * j,
+                    n1 + n - 3 + i + n2 * j,
+                    24 + 48 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..=(2 * n - 7) {
+            for j in 0..=1 {
+                h_simd(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0);
+            }
+        }
+    }
+
+    if n >= 3 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..n3 {
+            b_simd(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
+        }
+    }
+
+    for i in 0..n1 {
+        h_simd(t, i, n0 - 1 - i, false);
     }
 
     Ok(())
@@ -837,6 +1196,23 @@ const AC_QLOOKUP_8BIT: [i32; 256] = [
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    enum TransformPattern {
+        SingleCoeff,
+        SingleRow,
+        Full,
+    }
+
+    impl TransformPattern {
+        const fn name(self) -> &'static str {
+            match self {
+                Self::SingleCoeff => "single-coeff",
+                Self::SingleRow => "single-row",
+                Self::Full => "full",
+            }
+        }
+    }
+
     fn block(tx_size: TxSize, tx_type: TxType, values: &[(usize, i32)]) -> DequantizedCoefficients {
         let eob = match values {
             [] => 0,
@@ -853,6 +1229,94 @@ mod tests {
             }
         }
         block
+    }
+
+    fn pseudo_dequantized_value(seed: u32, index: usize, limit: i32) -> i32 {
+        let mut x = seed ^ (index as u32).wrapping_mul(0x9e37_79b9);
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+
+        let span = (2 * limit + 1) as u32;
+        let value = (x % span) as i32 - limit;
+        if value == 0 {
+            if (x & 1) == 0 { 1 } else { -1 }
+        } else {
+            value
+        }
+    }
+
+    fn patterned_block(
+        tx_size: TxSize,
+        tx_type: TxType,
+        pattern: TransformPattern,
+        seed: u32,
+    ) -> DequantizedCoefficients {
+        let width = transform_width(tx_size);
+        let count = coefficient_count(tx_size);
+        let mut block =
+            DequantizedCoefficients::new(TransformBlock::new(0, (0, 0), tx_size, tx_type), count);
+        // Exercise realistic dequantized magnitudes without going anywhere near
+        // raw i32 extremes. This spans roughly a medium coefficient multiplied
+        // by the largest 8-bit AC dequantizer.
+        let limit = AC_QLOOKUP_8BIT[255] * 32;
+
+        match pattern {
+            TransformPattern::SingleCoeff => {
+                let index = width + 1;
+                block.coefficients[index] = pseudo_dequantized_value(seed, index, limit);
+                block.nonzero_row_mask = 1u32 << (index / width);
+            }
+            TransformPattern::SingleRow => {
+                let row = width / 2;
+                block.nonzero_row_mask = 1u32 << row;
+                for col in 0..width {
+                    let index = row * width + col;
+                    block.coefficients[index] = pseudo_dequantized_value(seed, index, limit);
+                }
+            }
+            TransformPattern::Full => {
+                block.nonzero_row_mask = (1u32 << width) - 1;
+                for index in 0..count {
+                    block.coefficients[index] = pseudo_dequantized_value(seed, index, limit);
+                }
+            }
+        }
+
+        block
+    }
+
+    fn assert_current_matches_scalar(
+        block: DequantizedCoefficients,
+        lossless: bool,
+        pattern: &str,
+    ) {
+        let tx_size = block.block.tx_size;
+        let tx_type = block.block.tx_type;
+        let count = coefficient_count(tx_size);
+        let mut current = block.clone();
+        let mut scalar = block;
+
+        let current_result = current.inverse_transform(lossless);
+        let scalar_result = scalar.inverse_transform_scalar(lossless);
+        assert_eq!(
+            current_result, scalar_result,
+            "result mismatch for {tx_size:?} {tx_type:?} {pattern}"
+        );
+
+        if current_result.is_ok()
+            && let Some(index) = current.coefficients[..count]
+                .iter()
+                .zip(scalar.coefficients[..count].iter())
+                .position(|(current, scalar)| current != scalar)
+        {
+            panic!(
+                "coefficient mismatch for {tx_size:?} {tx_type:?} {pattern} at {index}: simd={} scalar={}",
+                current.coefficients[index], scalar.coefficients[index]
+            );
+        }
     }
 
     #[test]
@@ -880,6 +1344,53 @@ mod tests {
         let mut wht = block(TxSize::Tx4x4, TxType::DctDct, &[]);
         assert_eq!(wht.inverse_transform(true), Ok(()));
         assert_eq!(&wht.coefficients[..16], [0; 16]);
+    }
+
+    #[test]
+    fn inverse_transform_current_path_matches_scalar_sweep() {
+        for tx_size in [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ] {
+            let tx_types: &[TxType] = if tx_size == TxSize::Tx32x32 {
+                &[TxType::DctDct]
+            } else {
+                &[
+                    TxType::DctDct,
+                    TxType::AdstDct,
+                    TxType::DctAdst,
+                    TxType::AdstAdst,
+                ]
+            };
+
+            for &tx_type in tx_types {
+                for pattern in [
+                    TransformPattern::SingleCoeff,
+                    TransformPattern::SingleRow,
+                    TransformPattern::Full,
+                ] {
+                    let seed = 0x51ed_600d
+                        ^ ((tx_size.index() as u32) << 12)
+                        ^ ((tx_type as u32) << 8)
+                        ^ pattern.name().as_bytes()[0] as u32;
+                    let block = patterned_block(tx_size, tx_type, pattern, seed);
+                    assert_current_matches_scalar(block, false, pattern.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lossless_wht_current_path_matches_scalar() {
+        let block = patterned_block(
+            TxSize::Tx4x4,
+            TxType::DctDct,
+            TransformPattern::Full,
+            0x1055_1e55,
+        );
+        assert_current_matches_scalar(block, true, "lossless-wht-full");
     }
 
     #[test]
