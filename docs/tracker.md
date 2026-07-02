@@ -51,6 +51,33 @@ Deferrable external inputs for M3 performance work.
       `wasm-golden` validation, `wasm-golden --bench`, and `wasm-microbench`;
       `wasm-tests` keeps explicit `--json` because its human output is useful
 
+### Perf oracle hardening — supports M3+
+
+Motivated by the 2026-07 scalar campaign: A/B position bias (~2% cool-start,
+~13% heat-soaked) made sub-5% deltas unjudgeable, and daemon-held baselines
+forced a restart after every merge.
+
+- [ ] counterbalanced bench: one submission runs B, C, C, B so both sides
+      average the same position and monotone thermal drift cancels
+- [ ] position-corrected reporting: response carries the corrected delta
+      `mean(C2,C3)/mean(B1,B4) - 1` as the headline number, the four raw
+      per-run measurements, and the `B1` vs `B4` spread as a built-in no-op
+      control / error-bar signal so callers can tell when a run was too
+      drifty to conclude anything
+- [ ] baseline moves from daemon state to request payload: `serve` no longer
+      builds a baseline, so merges stop forcing daemon restarts; cache device
+      pushes by blob hash
+- [ ] `serve` takes a list of devices (serial plus per-device pin), one
+      queue per device
+- [ ] `vip9r-perf-submit` takes an optional baseline wasm path and a device
+      index; default baseline is the current build (no-op control by default)
+- [ ] grinder spawn script takes a default baseline file (or builds one from
+      `orchestrator-base` at sandbox creation) and a default device
+      index:pin, passed into the sandbox for all submissions
+- [ ] cool-start gate in the device-side run script: before a timed run,
+      wait up to ~10 s or until the temperature's rate of decrease levels
+      off, whichever comes first; record the wait in telemetry
+
 ### M1 — Decode, code-complete (implement campaign)
 
 The whole decode path, code-complete; correctness is M2's job. Gated on the M0

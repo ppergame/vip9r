@@ -10,6 +10,7 @@
   caBundle = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
   env = lib.getExe' pkgs.coreutils "env";
   fuseOverlayfs = lib.getExe pkgs.fuse-overlayfs;
+  setsid = lib.getExe' pkgs.util-linux "setsid";
   sandboxPackages =
     (with pkgs; [
       # Shell and baseline userland.
@@ -201,6 +202,10 @@ in
       )
       mkdir -p "$perf_socket_dir"
       podman_args+=(--volume "$perf_socket_dir:/run/vip9r-perf:rw")
+      # Name the container after the sandbox so it can be stopped by name;
+      # TaskStop/SIGTERM on this wrapper must not orphan a running codex.
+      container_name="$(basename "$run")"
+      podman_args+=(--name "$container_name")
       rootfs_arg="$run/rootfs:O"
 
       status=0
@@ -211,20 +216,47 @@ in
           # durable record that outlives "$run".
           preserve="$temp_dir/traces/$(date -u +%Y%m%dT%H%M%SZ)-$(basename "$run")"
           echo "trace -> $preserve" >&2
+          echo "container: $container_name" >&2
+          # Stop tastefully on TERM/INT: kill the container so codex exits,
+          # let the pipeline drain, and fall through to normal trace
+          # preservation. The pipeline runs in the background because bash
+          # defers traps while a foreground pipeline runs. The kill is
+          # detached via setsid because the stop signal usually escalates to
+          # KILL on this wrapper before a synchronous podman call returns; a
+          # SIGKILLed wrapper then cannot orphan the container. Traces
+          # stream to $run/trace continuously, so an immediate kill loses
+          # nothing that a graceful stop would save.
+          interrupted=0
+          trap '
+            interrupted=1
+            echo "grinder: stop requested; killing $container_name" >&2
+            ${setsid} -f podman kill "$container_name" >/dev/null 2>&1 || true
+          ' TERM INT
           set +e
-          podman "''${podman_args[@]}" "$rootfs_arg" \
-            /run/tools/bin/codex exec \
-              --json \
-              -o /run/trace/final.md \
-              - \
-              < "$run/task.md" \
-            | "$codex_events" stream "$run/trace/codex.jsonl"
-          pipeline_status=("''${PIPESTATUS[@]}")
-          status="''${pipeline_status[0]}"
-          renderer_status="''${pipeline_status[1]:-0}"
+          {
+            podman "''${podman_args[@]}" "$rootfs_arg" \
+              /run/tools/bin/codex exec \
+                --json \
+                -o /run/trace/final.md \
+                - \
+                < "$run/task.md"
+            echo "$?" > "$run/trace/podman-status"
+          } | "$codex_events" stream "$run/trace/codex.jsonl" &
+          pipeline_pid=$!
+          renderer_status=0
+          while :; do
+            wait "$pipeline_pid"
+            renderer_status=$?
+            kill -0 "$pipeline_pid" 2>/dev/null || break
+          done
+          status="$(cat "$run/trace/podman-status" 2>/dev/null || echo 125)"
           set -e
+          trap - TERM INT
           if [[ "$status" -eq 0 && "$renderer_status" -ne 0 ]]; then
             status="$renderer_status"
+          fi
+          if [[ "$interrupted" -ne 0 ]]; then
+            echo "grinder: run stopped by request" >&2
           fi
           thread_id=""
           if [[ -s "$run/trace/codex.jsonl" ]]; then
