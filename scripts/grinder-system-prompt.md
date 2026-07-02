@@ -75,7 +75,7 @@ Depending on the task, you can verify your work with
 - Wasm microbench slots:
   `vip9r-perf-submit [--target host|device] microbench --slot N` for an ad-hoc
   `vip9r_bench_run(slot, inner_iters)` export
-- `cargo clippy`
+- `cargo clippy --workspace` -- clippy. wasm32 is the default and only target
 - Full-decode validation and timing:
   `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST]`,
 - Assembly dump (one file per function):
