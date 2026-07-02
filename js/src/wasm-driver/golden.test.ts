@@ -20,6 +20,8 @@ import {
   parseVp9Input,
   planBenchmarkDecode,
   passes,
+  runTimedDecodePasses,
+  runTimedWarmupValidation,
 } from "./golden";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 
@@ -452,6 +454,103 @@ describe("wasm golden runner helpers", () => {
     ).toThrow(
       "benchmark warmup validation pass 1 exceeded 5ms before completing decode window: selected 1/2 output frames",
     );
+  });
+
+  test("records per-pass wall times across measurement passes", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+    let timeMs = 0;
+    const now = () => timeMs;
+    const perFrameMs = [5, 10];
+    let pass = 0;
+    const makeDecoder = (): FrameDecoder => {
+      const stepMs = perFrameMs[pass];
+      pass += 1;
+      const inner = scriptedDecoder(frames);
+      return {
+        ...inner,
+        decodeNext() {
+          timeMs += stepMs;
+          return inner.decodeNext();
+        },
+      };
+    };
+
+    const measurement = runTimedDecodePasses(
+      ivf,
+      golden,
+      { outputOffset: 0, outputFrames: 4 },
+      makeDecoder,
+      30,
+      1000,
+      now,
+      true,
+      "measurement",
+    );
+
+    expect(measurement.passes).toBe(2);
+    expect(measurement.passMs).toEqual([20, 40]);
+    expect(measurement.minPassMs).toBe(20);
+    expect(measurement.maxPassMs).toBe(40);
+    expect(measurement.elapsedMs).toBe(60);
+    expect(measurement.msPerFrame).toBe(7.5);
+  });
+
+  test("records per-pass wall times including the warmup validation pass", () => {
+    const ivf = parseIvf(sampleIvf());
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+      scriptedFrame(2, 2, 7, 8, 9, 20),
+      scriptedFrame(2, 2, 10, 11, 12, 30),
+    ];
+    const golden = parseGolden(
+      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+    );
+    let timeMs = 0;
+    const now = () => timeMs;
+    const perFrameMs = [5, 10];
+    let pass = 0;
+    const makeDecoder = (): FrameDecoder => {
+      const stepMs = perFrameMs[pass];
+      pass += 1;
+      const inner = scriptedDecoder(frames);
+      return {
+        ...inner,
+        decodeNext() {
+          timeMs += stepMs;
+          return inner.decodeNext();
+        },
+      };
+    };
+
+    const { validation, warmup } = runTimedWarmupValidation(
+      "input.ivf",
+      "input.ivf.md5",
+      ivf,
+      golden,
+      { outputOffset: 0, outputFrames: 4 },
+      0,
+      makeDecoder,
+      30,
+      1000,
+      now,
+    );
+
+    expect(matchedCount(validation)).toBe(4);
+    expect(warmup.passes).toBe(2);
+    expect(warmup.passMs).toEqual([20, 40]);
+    expect(warmup.minPassMs).toBe(20);
+    expect(warmup.maxPassMs).toBe(40);
+    expect(warmup.elapsedMs).toBe(60);
   });
 
   test("validates only the selected benchmark output window", () => {

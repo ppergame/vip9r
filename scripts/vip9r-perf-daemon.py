@@ -999,6 +999,80 @@ def run_device_json(
     json_label: str,
     result_path: str,
 ) -> dict[str, object]:
+    telemetry: dict[str, object] = {}
+    record_telemetry(telemetry, device, pin, "start")
+    result = execute_device_json(device, d8_args, pin, json_label, result_path)
+    record_telemetry(telemetry, device, pin, "end")
+    if telemetry:
+        result["telemetry"] = telemetry
+    return result
+
+
+def record_telemetry(
+    telemetry: dict[str, object],
+    device: DeviceContext,
+    pin: PinSelection,
+    edge: str,
+) -> None:
+    freq = read_pinned_cpu_freq_khz(device, pin)
+    if freq is not None:
+        telemetry[f"freq_{edge}_khz"] = freq
+    temp = read_cpu_temp_c(device)
+    if temp is not None:
+        telemetry[f"temp_{edge}_c"] = temp
+
+
+def read_pinned_cpu_freq_khz(device: DeviceContext, pin: PinSelection) -> int | None:
+    cpus = pin.verified_cpus or pin.cpus or device.online_cpus
+    if not cpus:
+        return None
+    path = f"/sys/devices/system/cpu/cpu{cpus[0]}/cpufreq/scaling_cur_freq"
+    completed = adb_shell_completed(device.serial, f"cat {path}")
+    if completed.returncode != 0:
+        return None
+    return parse_optional_int(completed.stdout.strip())
+
+
+def read_cpu_temp_c(device: DeviceContext) -> float | None:
+    completed = adb_shell_completed(device.serial, "dumpsys thermalservice")
+    if completed.returncode != 0:
+        return None
+    return parse_hal_cpu_temp(completed.stdout)
+
+
+def parse_hal_cpu_temp(text: str) -> float | None:
+    # Only the "Current temperatures from HAL" section tracks the sensor;
+    # "Cached temperatures" is event-driven and can be stale by tens of C.
+    # Prefer the Pixel's BIG cluster sensor, else the first CPU-type sensor
+    # (streamer: soc_max).
+    in_hal = False
+    big = None
+    cpu = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":"):
+            in_hal = stripped == "Current temperatures from HAL:"
+            continue
+        if not in_hal:
+            continue
+        match = re.search(r"mValue=([0-9]+(?:\.[0-9]+)?)", stripped)
+        if match is None:
+            continue
+        value = float(match.group(1))
+        if "mName=BIG" in stripped:
+            big = value
+        elif "mType=0," in stripped and cpu is None:
+            cpu = value
+    return big if big is not None else cpu
+
+
+def execute_device_json(
+    device: DeviceContext,
+    d8_args: list[str],
+    pin: PinSelection,
+    json_label: str,
+    result_path: str,
+) -> dict[str, object]:
     try:
         completed = adb_shell_completed(
             device.serial,

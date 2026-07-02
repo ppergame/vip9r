@@ -218,10 +218,19 @@ Empirical behavior that shapes the protocol:
   `Current temperatures from HAL` tracks the root-only sysfs sensor
   (`/sys/class/thermal/thermal_zone0`, type `BIG`) within a few °C. The
   `Cached temperatures` section and derived thermal status are event-driven
-  and can be stale by tens of °C; never use them. The streamer exposes no
-  thermal read to shell — per-CPU `scaling_cur_freq` (cluster-wide policy) is
-  its only telemetry, and it showed flat timings under 3.5 min of sustained
-  load.
+  and can be stale by tens of °C; never use them. `dumpsys thermalservice`
+  works on the streamer too (its sysfs thermal zones are what shell can't
+  read); its HAL section has no `BIG`, but reports a CPU-type `soc_max`
+  sensor. The streamer showed flat timings under 3.5 min of sustained load.
+- Confidence instrumentation (in every daemon device response and bench
+  report): the daemon brackets each device d8 run with pinned-CPU
+  `scaling_cur_freq` and the HAL temperature (`BIG`, else first CPU-type
+  sensor), attached per run as `telemetry.{freq,temp}_{start,end}_*`;
+  `temp_start_c` drives the cool-start rule for absolute margins. Bench
+  reports carry per-pass wall times (`passMs`, `minPassMs`, `maxPassMs`) in
+  warmup and measurement — pass drift is the throttle/contention signal that
+  works on both devices. Freq brackets sample outside the run and usually
+  show idle governor state; they catch pin/policy mistakes, not throttling.
 - The bench runner's per-pass deadline equals `targetMs` (5 s), and the
   binding pass is the md5 validation pass (md5 overhead ≈ +15% on X4, +60% on
   A55 vs a measurement pass). At 720p this caps decode windows at roughly

@@ -154,6 +154,9 @@ export type BenchmarkTimedPasses = {
   targetMs: number;
   elapsedMs: number;
   passes: number;
+  passMs: number[];
+  minPassMs: number;
+  maxPassMs: number;
   codedFrames: number;
   decodedOutputFrames: number;
   outputFrames: number;
@@ -686,7 +689,7 @@ function validateGoldenWindow(golden: GoldenFrame[], window: DecodeWindow): void
   }
 }
 
-function runTimedWarmupValidation(
+export function runTimedWarmupValidation(
   inputPath: string,
   goldenPath: string,
   input: DemuxedVp9,
@@ -701,18 +704,21 @@ function runTimedWarmupValidation(
   const start = now();
   let elapsedMs = 0;
   let passCount = 0;
+  const passMs: number[] = [];
   let codedFrames = 0;
   let decodedOutputFrames = 0;
   let outputFrames = 0;
   let skippedOutputFrames = 0;
 
-  const recordPass = (stats: DecodeWindowStats): void => {
+  const recordPass = (passStartMs: number, stats: DecodeWindowStats): void => {
     passCount += 1;
     codedFrames += stats.codedFrames;
     decodedOutputFrames += stats.decodedOutputFrames;
     outputFrames += stats.selectedOutputFrames;
     skippedOutputFrames += stats.skippedOutputFrames;
-    elapsedMs = now() - start;
+    const passEnd = now();
+    passMs.push(passEnd - passStartMs);
+    elapsedMs = passEnd - start;
     if (elapsedMs < 0) {
       throw new Error("benchmark clock moved backwards");
     }
@@ -745,7 +751,7 @@ function runTimedWarmupValidation(
       `benchmark validation failed: ${matchedCount(validation)} matched, ${mismatchCount(validation)} mismatched, ${missingCount(validation)} missing, ${extraCount(validation)} extra`,
     );
   }
-  recordPass({
+  recordPass(passStart, {
     codedFrames: validation.codedFrames,
     decodedOutputFrames: validation.decodedOutputFrames,
     skippedOutputFrames: validation.skippedOutputFrames,
@@ -769,7 +775,7 @@ function runTimedWarmupValidation(
         `benchmark decode window incomplete: selected ${stats.selectedOutputFrames}/${window.outputFrames} output frames`,
       );
     }
-    recordPass(stats);
+    recordPass(warmupPassStart, stats);
   }
 
   return {
@@ -778,6 +784,8 @@ function runTimedWarmupValidation(
       targetMs: warmupMs,
       elapsedMs,
       passes: passCount,
+      passMs,
+      ...passRange(passMs),
       codedFrames,
       decodedOutputFrames,
       outputFrames,
@@ -789,7 +797,7 @@ function runTimedWarmupValidation(
   };
 }
 
-function runTimedDecodePasses(
+export function runTimedDecodePasses(
   input: DemuxedVp9,
   golden: GoldenFrame[],
   window: DecodeWindow,
@@ -803,6 +811,7 @@ function runTimedDecodePasses(
   const start = now();
   let elapsedMs = 0;
   let passes = 0;
+  const passMs: number[] = [];
   let codedFrames = 0;
   let decodedOutputFrames = 0;
   let outputFrames = 0;
@@ -830,7 +839,9 @@ function runTimedDecodePasses(
     decodedOutputFrames += stats.decodedOutputFrames;
     outputFrames += stats.selectedOutputFrames;
     skippedOutputFrames += stats.skippedOutputFrames;
-    elapsedMs = now() - start;
+    const passEnd = now();
+    passMs.push(passEnd - passStart);
+    elapsedMs = passEnd - start;
     if (elapsedMs < 0) {
       throw new Error("benchmark clock moved backwards");
     }
@@ -847,6 +858,8 @@ function runTimedDecodePasses(
     targetMs,
     elapsedMs,
     passes,
+    passMs,
+    ...passRange(passMs),
     codedFrames,
     decodedOutputFrames,
     outputFrames,
@@ -855,6 +868,13 @@ function runTimedDecodePasses(
     outputFramesPerPass: passes === 0 ? 0 : outputFrames / passes,
     ...frameRate(outputFrames, elapsedMs),
   };
+}
+
+function passRange(passMs: number[]): { minPassMs: number; maxPassMs: number } {
+  if (passMs.length === 0) {
+    return { minPassMs: 0, maxPassMs: 0 };
+  }
+  return { minPassMs: Math.min(...passMs), maxPassMs: Math.max(...passMs) };
 }
 
 function frameRate(frames: number, elapsedMs: number): { msPerFrame: number; fps: number } {
