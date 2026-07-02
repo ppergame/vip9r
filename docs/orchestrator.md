@@ -30,12 +30,16 @@ requirements.md — suggest changes rather than editing.
 
 - Write a task file `temp/task-<slug>.md`.
 - Spawn
-  `nix run .#grinder -- run temp/task-<slug>.md --baseline WASM [--device INDEX:PIN]`.
-  The command prints progress updates until the implementor finishes, then
-  prints the final message and a sandbox location like `temp/grinder.XXXXXX`.
-  - Monitor / check up on a new job 2 minutes after starting it.
-  - Poll the job every 10 minutes (or the maximum supported by the tooling if
-    lower) to check its progress. No need for line-by-line running commentary.
+  `nix run .#grinder -- run temp/task-<slug>.md --baseline WASM [--device INDEX:PIN]`
+  in the background. The command prints progress updates until the implementor
+  finishes, then prints the final message and a sandbox location like
+  `temp/grinder.XXXXXX`.
+  - Check up on a new job 2 minutes after starting it, then every 10 minutes.
+    No need for line-by-line running commentary.
+  - Claude Code: background jobs notify on exit, and background `sleep` jobs
+    make good check-up timers (foreground sleep is blocked). Idle between
+    timers; when the job's completion notification arrives, TaskStop the
+    pending timer instead of waiting it out.
 - Known failure: the grinder codex occasionally hangs or emits a malformed
   tool_search call on the first turn. Kill and retry, up to 3 times.
 - Traces are copied to `temp/traces/` automatically; preserve that directory for
