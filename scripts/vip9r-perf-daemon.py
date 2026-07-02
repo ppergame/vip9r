@@ -1060,7 +1060,9 @@ def handle_device_profile_request(
             pull_device_file_at(device, perf_data_path, dir_fd, "perf.data", work_dir)
             map_names = pull_device_perf_maps(device, dir_fd, work_dir)
             report_text = build_profile_report(
-                work_dir / "perf.data", [work_dir / name for name in map_names]
+                work_dir / "perf.data",
+                [work_dir / name for name in map_names],
+                candidate_measurement_ms(candidate_result),
             )
             samples = profile_report_samples(report_text)
             write_file_at(dir_fd, "report.txt", report_text.encode("utf-8"))
@@ -1086,6 +1088,17 @@ def handle_device_profile_request(
     }
 
 
+def candidate_measurement_ms(candidate_result: dict[str, object]) -> float | None:
+    report = candidate_result.get("report")
+    if isinstance(report, dict):
+        measurement = report.get("measurement")
+        if isinstance(measurement, dict):
+            elapsed = measurement.get("elapsedMs")
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed > 0:
+                return float(elapsed)
+    return None
+
+
 def profile_candidate_summary(candidate_result: dict[str, object]) -> dict[str, object]:
     summary: dict[str, object] = {"ok": candidate_result.get("ok")}
     report = candidate_result.get("report")
@@ -1105,14 +1118,32 @@ def profile_candidate_summary(candidate_result: dict[str, object]) -> dict[str, 
     return summary
 
 
-def build_profile_report(perf_data_path: Path, map_paths: list[Path]) -> str:
+def build_profile_report(
+    perf_data_path: Path, map_paths: list[Path], measurement_ms: float | None = None
+) -> str:
     perf_data = parse_perf_data(perf_data_path)
+    samples = perf_data.samples
+    # The bench driver's measurement passes are the final phase of the run;
+    # everything earlier (d8 startup, JIT compile, md5 validation, warmup)
+    # pollutes attribution. Keep only samples in the trailing window whose
+    # length the driver itself reported as measurement.elapsedMs. The tail
+    # past the last measurement pass (JSON print + exit) is a few ms.
+    window_note = "Window: full run (no measurement window available)"
+    if measurement_ms is not None and perf_data.has_time and samples:
+        window_end = max(time for _ip, _period, time in samples)
+        window_start = window_end - int(measurement_ms * 1e6)
+        windowed = [sample for sample in samples if sample[2] >= window_start]
+        window_note = (
+            f"Window: final {measurement_ms:.0f}ms (measurement passes), "
+            f"{len(windowed)}/{len(samples)} samples"
+        )
+        samples = windowed
     jit_ranges = load_jit_symbol_ranges(map_paths)
     jit_starts = [start for start, _end, _symbol in jit_ranges]
     event_counts: dict[str, int] = {}
     sample_counts: dict[str, int] = {}
     total_events = 0
-    for ip, period in perf_data.samples:
+    for ip, period, _time in samples:
         index = bisect.bisect_right(jit_starts, ip) - 1
         if index >= 0 and ip < jit_ranges[index][1]:
             symbol = jit_ranges[index][2]
@@ -1133,7 +1164,8 @@ def build_profile_report(perf_data_path: Path, map_paths: list[Path]) -> str:
     lines = [
         "Host-attributed profile: V8 perf-map JIT symbols take precedence over",
         "file mappings; non-JIT samples are aggregated per mapped file.",
-        f"Samples: {len(perf_data.samples)}",
+        window_note,
+        f"Samples: {len(samples)}",
         f"Event count: {total_events}",
         "",
         f"{'Overhead':<9} {'Samples':<8} Symbol",
@@ -1150,6 +1182,7 @@ PERF_RECORD_MMAP = 1
 PERF_RECORD_SAMPLE = 9
 PERF_RECORD_MMAP2 = 10
 PERF_SAMPLE_IP = 1 << 0
+PERF_SAMPLE_TIME = 1 << 2
 PERF_SAMPLE_PERIOD = 1 << 8
 PERF_SAMPLE_IDENTIFIER = 1 << 16
 # 8-byte PERF_RECORD_SAMPLE fields laid out before PERIOD, in record order:
@@ -1158,20 +1191,26 @@ PERF_SAMPLE_FIELDS_BEFORE_PERIOD = (
     PERF_SAMPLE_IDENTIFIER,
     PERF_SAMPLE_IP,
     1 << 1,  # TID
-    1 << 2,  # TIME
+    PERF_SAMPLE_TIME,
     1 << 3,  # ADDR
     1 << 6,  # ID
     1 << 9,  # STREAM_ID
     1 << 7,  # CPU
 )
+PERF_SAMPLE_FIELDS_BEFORE_TIME = (
+    PERF_SAMPLE_IDENTIFIER,
+    PERF_SAMPLE_IP,
+    1 << 1,  # TID
+)
 
 
 @dataclass
 class PerfData:
-    # (ip, period) per sample record.
-    samples: list[tuple[int, int]]
+    # (ip, period, time) per sample record; time is 0 when absent.
+    samples: list[tuple[int, int, int]]
     # (start, end, filename) per mmap record, in record order.
     mmaps: list[tuple[int, int, str]]
+    has_time: bool
 
 
 def parse_perf_data(path: Path) -> PerfData:
@@ -1188,7 +1227,11 @@ def parse_perf_data(path: Path) -> PerfData:
         8 for bit in PERF_SAMPLE_FIELDS_BEFORE_PERIOD if sample_type & bit
     )
     has_period = bool(sample_type & PERF_SAMPLE_PERIOD)
-    samples: list[tuple[int, int]] = []
+    has_time = bool(sample_type & PERF_SAMPLE_TIME)
+    time_offset = sum(
+        8 for bit in PERF_SAMPLE_FIELDS_BEFORE_TIME if sample_type & bit
+    )
+    samples: list[tuple[int, int, int]] = []
     mmaps: list[tuple[int, int, str]] = []
     position = data_offset
     end = data_offset + data_size
@@ -1203,7 +1246,10 @@ def parse_perf_data(path: Path) -> PerfData:
             period = 1
             if has_period and body + period_offset + 8 <= record_end:
                 period = struct.unpack_from("<Q", data, body + period_offset)[0]
-            samples.append((ip, period))
+            time = 0
+            if has_time and body + time_offset + 8 <= record_end:
+                time = struct.unpack_from("<Q", data, body + time_offset)[0]
+            samples.append((ip, period, time))
         elif record_type in (PERF_RECORD_MMAP, PERF_RECORD_MMAP2):
             start, length = struct.unpack_from("<QQ", data, body + 8)
             name_offset = body + (32 if record_type == PERF_RECORD_MMAP else 64)
@@ -1212,7 +1258,7 @@ def parse_perf_data(path: Path) -> PerfData:
                 filename = data[name_offset:name_end].decode("utf-8", "replace")
                 mmaps.append((start, start + length, filename))
         position += record_size
-    return PerfData(samples=samples, mmaps=mmaps)
+    return PerfData(samples=samples, mmaps=mmaps, has_time=has_time)
 
 
 def load_jit_symbol_ranges(map_paths: list[Path]) -> list[tuple[int, int, str]]:

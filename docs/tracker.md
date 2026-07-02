@@ -251,6 +251,52 @@ ms/frame): inter subpel 33%, decode_block 30%, loop filter 15%, IDCT 7%.
       jellyfish-class 720p30 — even ideal 4-core scaling leaves it 1.6x
       over, which bounds the threads / ffvp9-baseline scope decision (M6)
 
+A55 freeform campaign (scoped 2026-07-02). Primary A/B target is the A55
+streamer (device 1, pin cpu:0); X4 confirmation secondary. Constraint: keep
+changes principled — plausibly beneficial under future V8 versions and in the
+browser, not tuned to one d8 build. Evidence base: 2026-07-02 A55 profiles
+(temp/vip9r-profiles/c599be6a-*) — decode_block 26/35% (jellyfish/BBB), d8
+binary 15%, subpel 13/4%, loop_filter 10/5%, libc 9/15% (93% memcpy/memset);
+detailed findings with file:line evidence in temp/orchestrator-notes.md.
+Sequential grinder passes (everything touches tile_syntax/); corpus golden
+gates each merge, `--all` at campaign boundaries; BBB is the sensitive clip
+for residual/copy passes, jellyfish for subpel.
+
+- [x] H1 — measurement-window-only profiling: profile reports now window
+      samples to the final measurement.elapsedMs of the recording
+      (daemon-side sample-time filter, no driver change). Clean A55
+      attribution — jellyfish: decode_block 38% / subpel 18% /
+      loop_filter 15% / libc 11%; BBB: decode_block 50% / libc 20% /
+      loop_filter 7% / subpel 6%. Real d8 share during decode is 1-2%
+- [x] H2 — resolved, no hot memory.copy trampoline exists: the 0xea79xx
+      cluster is Builtin:DoubleToI (md5 validation JS, correctly
+      attributed all along; the exploration session's raw histogram
+      double-counted map-covered samples). Remaining unattributed d8
+      samples are diffuse V8 C++ (max 64B bucket ~0.5% of total), mostly
+      excluded by the H1 window. libc memcpy/memset share is real decode
+      cost, per the windowed profiles above
+- [ ] P1 (+P6) — residual path restructure: persistent per-parser coeff
+      storage with tx-size-scoped clears, eob-bounded dequant in scan
+      order, skip reconstruct at eob==0, kill by-value struct moves;
+      ride-along entropy micro (shift/mask in coefficient_token_context,
+      tx-scoped token_cache clear). Re-test "direct coef writes" inside the
+      new structure
+- [ ] P2 — simd `add_residual_block`: row-slice widening add + saturating
+      narrow, interior fast path, per-pixel checked path at frame edges
+- [ ] P3 — small-copy elimination in prediction paths: explicit v128 lane
+      load/stores for 4–64B row classes (integer-MV copy, edge gather,
+      interp rows); drop the 5KB interp-buffer zero-init
+- [ ] P4 — convolution kernel v2: i16-domain extmul MAC, shuffle-based tap
+      gather instead of per-tap bounds-checked loads, vertical sliding
+      register window
+- [ ] conditional tail, gated on refreshed A55 profiles: P5 arm32 op-cost
+      microbench + icache-refill PMU (decode_block monolith question);
+      P7 bool-decoder wide-window A55 re-measure; P8 loop filter simd retry
+      A55-only; P9 SB-row-fused loop filtering (needs L2-miss evidence);
+      P10 drop per-frame 1.4MB neutral fill if edge semantics allow
+- [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
+      close-out
+
 ### M4 — Encode
 
 minih264 in, MSE-playable H.264 out. Fitness gains a VMAF/size floor.
