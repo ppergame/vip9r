@@ -232,17 +232,24 @@ ms/frame): inter subpel 33%, decode_block 30%, loop filter 15%, IDCT 7%.
       fuller variants slower. The scalar span reshape already amortized
       decisions; pass-0 transpose and wide-filter blends cost more than
       lanes save under V8. Relaxed-simd/threads-era retry candidate
-- [ ] IDCT simd — scalar butterflies use i64 products for exactness; a simd
-      version must prove bit-exact 32-bit-lane behavior for conformant
-      streams (`wasm-tests` sweep vs the scalar reference, plus the corpus)
-- [ ] conditional tail, by post-IDCT profile: compound average, intra
-      prediction, and the memory/layout items — reference slot remap instead
-      of full-frame `copy_from_slice` on refresh (~1.4 MB per slot per frame
-      at 720p), stride/alignment normalization, counts-accumulation cost
-      check. X4 headroom ~1-2% (below the A/B credibility line); measure on
-      the A55, where libc/memory share is ~9%
-- [ ] end-of-campaign: both-device margin table in log.md; the A55 residue
-      feeds the threads / ffvp9-baseline scope decision
+- [x] IDCT simd — DCT rows/columns in 4-wide i32 lanes, i64x2 extmul
+      butterflies with wrapping-narrow packs reproducing scalar
+      bit-exactly; ADST/WHT stay scalar. X4 −13.0% (20.1 → 17.5 ms/frame),
+      A55 −9.6% (233 → 211). Overshoot vs the 6% profile share is the 2-D
+      driver work that inlining had attributed to decode_block
+- [x] conditional tail, by post-IDCT profile: reference slot remap merged
+      (9 physical buffers + slot table, refresh is a table write; perf at
+      the noise line, taken for structure — kills the per-frame copy and
+      the "current precedes refs" constraint ahead of threads). Compound
+      average already covered by the convolution Average path; intra
+      prediction <0.3% of samples and counts accumulation not separately
+      attributable — both skipped. Stride normalization dropped: no
+      profile evidence
+- [x] end-of-campaign: both-device margin table in log.md (2026-07-02).
+      Campaign total X4 −29.5% jellyfish / −24.3% BBB; A55 −22.8% /
+      −9.2%. X4 sits ~2x under the realtime budget; A55 is 6.3x over on
+      jellyfish-class 720p30 — even ideal 4-core scaling leaves it 1.6x
+      over, which bounds the threads / ffvp9-baseline scope decision (M6)
 
 ### M4 — Encode
 

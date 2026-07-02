@@ -498,3 +498,32 @@ milestones, and measured optimization results.
   the indirection is the structure the threads milestone needs (no copy
   serialization), with alias/free-selection unit tests and the
   resize/svc/skip vectors green. Compliance corpus 307/307.
+
+## 2026-07-02 — simd128 campaign wrap: both-device margins
+
+Whole-campaign position-corrected A/B, final tree vs the pre-simd scalar
+baseline (49bac22), X4 = Pixel 9a cpu7, A55 = TV streamer cpu0:
+
+| device | clip                  | before → after ms/frame | delta  | budget    | margin      |
+|--------|-----------------------|-------------------------|--------|-----------|-------------|
+| X4     | jellyfish-720p30 0:15 | 24.2 → 17.1             | −29.5% | 33.3 ms   | 1.95x under |
+| X4     | big-buck-bunny 0:15   | 20.0 → 15.2             | −24.3% | 40 ms @25 | 2.6x under  |
+| A55    | jellyfish-720p30 0:5  | 272 → 210               | −22.8% | 33.3 ms   | 6.3x over   |
+| A55    | big-buck-bunny 0:5    | 168 → 152.5             | −9.2%  | 40 ms @25 | 3.8x over   |
+
+- Campaign ledger: subpel convolution simd merged (−16.7% X4), loop
+  filter simd measured negative and not merged, inverse DCT simd merged
+  (−13.0% X4), reference slot remap merged at the noise line for
+  structure. Compliance corpus green at every merge; `--all` green at
+  every pass boundary (337/337).
+- Post-campaign X4 profile (jellyfish): decode_block 38% / loop_filter
+  20% / subpel 17% / IDCT-simd 4.3% / libc 5%. The residual is dominated
+  by serial entropy decode — not simd-shaped; a decode_block structural
+  reshape is the next distinct campaign if the X4 margin needs to grow.
+- A55 residue for the threads/scope decision (M6): perfect 4-core scaling
+  would put jellyfish at ~52 ms/frame — still 1.6x over the 720p30
+  budget — and BBB-class content just under its 25 fps budget. Threads
+  alone cannot close jellyfish-class 720p30 on the streamer; that bounds
+  what the deferred ffvp9 baseline needs to answer (whether *any*
+  single-device software decode fits the streamer, or the A55 target
+  moves to M6 stretch scope).
