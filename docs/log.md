@@ -320,3 +320,23 @@ milestones, and measured optimization results.
   in 5.1 s). Host and X4 full-clip runs measure 7.3 and 12.0 ms/frame.
 - 720p per-core starting-line numbers against the 33.3 ms/frame 720p30 budget
   are in `docs/design.md`: X4 ~147, A720 ~207, A520 ~845, A55 ~1489 ms/frame.
+## 2026-07-02 — M3 attribution refresh and simd128 baseline
+
+- Fixed device profile reports: `simpleperf report` on device attributes JIT
+  samples to stale file mappings (d8 mmaps input files, munmap is never
+  recorded, V8 JITs into the freed ranges). The daemon now attributes raw
+  `perf.data` sample IPs on the host with the V8 perf map taking precedence.
+  The old reports had hidden a 25% `loop_filter_frame` share entirely.
+- Refreshed 720p hotspot attribution on `jellyfish-720p30` (144.5 ms/frame on
+  the X4, matching the starting line):
+  - X4: `predict_inter` 51%, `loop_filter_frame` 25%, `decode_block` 10%,
+    `inverse_dct` 4%, `residual::b` 3%
+  - A55: `loop_filter_frame` 27%, `predict_inter` 25%, `decode_block` 16%,
+    `inverse_dct` 6% (2-output-frame window, keyframe-weighted; d8/libc native
+    overhead is ~16% on arm32 vs ~3% on arm64)
+- Measured the bare `+simd128` flag flip (autovectorization only): X4
+  145.4 → 147.0 ms/frame (min-pass +1.7%, below the 2% credibility line), A55
+  1473.4 → 1473.5 (dead even). No autovectorization win on the spec-literal
+  loops, as expected. The flag is now part of the baseline
+  (`rust/.cargo/config.toml`) so later hand-written kernel deltas are not
+  confounded with the flag; compliance corpus green with the flag (307/307).

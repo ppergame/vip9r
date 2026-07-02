@@ -151,9 +151,13 @@ between passes and reorder on what you see. One measured pass per grinder task;
 `scripts/vip9r-corpus-golden.py` (compliance set, ~1 min) gates each merge and
 `--all` runs at pass boundaries; log measured device deltas.
 
-- [ ] refresh hotspot attribution on 720p realworld clips (Pixel + streamer);
+- [x] refresh hotspot attribution on 720p realworld clips (Pixel + streamer);
       measure a bare `+simd128` flag flip (autovectorization only) so the flag
-      is part of the baseline before any hand-written kernels
+      is part of the baseline before any hand-written kernels. 2026-07-02:
+      X4 jellyfish 51% predict_inter / 25% loop_filter / 10% decode_block /
+      4% IDCT; A55 27% loop_filter / 25% predict_inter / 16% decode_block /
+      6% IDCT (2-frame keyframe-weighted window). Flag flip neutral on both
+      (X4 within noise, A55 dead even); kept in the baseline
 - [ ] inter prediction: block-level two-pass separable convolution. The current
       `inter_predict_sample` path is 64 MACs/pixel with per-sample clamped
       access and checked math; two-pass is 16 MACs/pixel with straight-line

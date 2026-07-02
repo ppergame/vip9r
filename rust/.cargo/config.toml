@@ -2,4 +2,4 @@
 target = "wasm32-unknown-unknown"
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "panic=abort"]
+rustflags = ["-C", "panic=abort", "-C", "target-feature=+simd128"]
