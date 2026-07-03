@@ -294,9 +294,10 @@ shrank; traversal glue and intra prediction were promoted.
       ceremony; the traversal's 16% attribution is intrinsic loop work +
       code layout, not removable branches. Feeds the P5 icache/layout
       question — treat decode_block-region layout as fragile
-- [ ] P2 — simd `add_residual_block`: row-slice widening add + saturating
-      narrow, interior fast path, per-pixel checked path at frame edges
-      (4.3% BBB; task file ready)
+- [x] P2 — simd `add_residual_block`: interior v128
+      widen/add/saturating-narrow rows (clip1-exact), scalar edge
+      fallback, simd-vs-scalar sweep test. A55 −2.6% BBB / −3.4%
+      jellyfish (spreads ~0.4%)
 - [ ] P-intra — predict_intra fast path: 10% on BBB; profile-split first
       (predictor kernels vs edge gather), then common-mode (DC/V/H/TM)
       row-slice or simd paths
