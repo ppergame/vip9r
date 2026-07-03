@@ -677,3 +677,27 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   host+device, validates incl. tile-4x1 and 66x66. Portable-simd
   lesson for the campaign: prefer `v128_any_true`/`v128_all_true` over
   `*_bitmask` for emptiness checks in register-heavy arm32 kernels.
+
+## 2026-07-03 — A55 campaign: persistent intra edges
+
+- The post-P-intra profile put libc at 6.2% of BBB decode (~62% of it
+  memcpy), and a wasm dump attributed a per-intra-block **96-byte
+  `memory.copy`** to `intra_prediction_edges` returning its edge
+  struct by value, plus the `[127; _]`/`[129; _]` init fills. Fix:
+  `IntraPredictionEdges` becomes a persistent field on the
+  parser-owned intra buffers, filled in place; missing-edge defaults
+  (127/129) are written explicitly only over the `size`/`2·size`
+  spans that consumers read, and the `have_above` interior gather
+  copies the contiguous plane row as fixed-width 4/8/16/32/64-byte
+  chunks (per-sample clamped path kept for the frame-right overhang
+  and the `not_on_right && Tx4x4` extension). Both the copy and the
+  fills verified gone from the release wasm dump.
+- A55 BBB −3.6% on the 1080p libvpx clip (0.3% spread), −1.2% on the
+  canonical 720p wikimedia clip (0.3% spread); jellyfish noise-level,
+  as expected for an inter-heavy clip. Compliance 307/307, 93/93 tests
+  host+device, validates incl. quantizer-00 (all-intra, hammers the
+  missing-edge defaults), size-18x34, resize.
+- Side finding from the same dump: the remaining per-block 512-byte
+  copy+fill sites are simd inverse-DCT scratch — the zero-init of
+  `[v128; MAX_TX_WIDTH]` and `inverse_dct_permutation_simd`'s
+  `let copy_t = *t`. Queued as a candidate follow-up.

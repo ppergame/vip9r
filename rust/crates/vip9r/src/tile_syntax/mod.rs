@@ -589,12 +589,14 @@ struct TileParser<'a, 'b, 'r> {
 }
 
 struct IntraPredictionBuffers {
+    edges: IntraPredictionEdges,
     pred: [u8; MAX_TX_COEFFS],
 }
 
 impl IntraPredictionBuffers {
     const fn new() -> Self {
         Self {
+            edges: IntraPredictionEdges::new(),
             pred: [0; MAX_TX_COEFFS],
         }
     }
@@ -717,6 +719,16 @@ struct IntraPredictionEdges {
     above_left: u8,
     above_row: [u8; MAX_INTRA_ABOVE],
     left_col: [u8; MAX_TX_WIDTH],
+}
+
+impl IntraPredictionEdges {
+    const fn new() -> Self {
+        Self {
+            above_left: 127,
+            above_row: [127; MAX_INTRA_ABOVE],
+            left_col: [129; MAX_TX_WIDTH],
+        }
+    }
 }
 
 impl TileParser<'_, '_, '_> {
@@ -2238,25 +2250,26 @@ impl TileParser<'_, '_, '_> {
         };
         let size = transform_width(context.tx_size);
         let plane = current_frame.plane_mut(context.plane)?;
-        let edges = intra_prediction_edges(plane, context)?;
+        intra_prediction_edges(plane, context, &mut self.intra.edges)?;
         let request = IntraPredictionRequest {
             mode,
             have_left: context.have_left,
             have_above: context.have_above,
             size,
         };
+        let edges = &self.intra.edges;
         if write_common_intra_prediction_direct(
             plane,
             context.start_x,
             context.start_y,
             request,
-            &edges,
+            edges,
         )? {
             return Ok(());
         }
 
         let pred = &mut self.intra.pred;
-        intra_predict_block(request, &edges, pred)?;
+        intra_predict_block(request, edges, pred)?;
         write_prediction_block(plane, context.start_x, context.start_y, size, pred)
     }
 
@@ -3785,41 +3798,51 @@ fn subpel_filter(
 fn intra_prediction_edges(
     plane: &CurrentPlaneMut<'_>,
     context: IntraPredictionContext,
-) -> Result<IntraPredictionEdges, TileSyntaxError> {
+    edges: &mut IntraPredictionEdges,
+) -> Result<(), TileSyntaxError> {
     let size = transform_width(context.tx_size);
-    let mut edges = IntraPredictionEdges {
-        above_left: 127,
-        above_row: [127; MAX_INTRA_ABOVE],
-        left_col: [129; MAX_TX_WIDTH],
-    };
+    let above_len = size
+        .checked_mul(2)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
 
     if context.have_above {
         let above_y = context
             .start_y
             .checked_sub(1)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        for i in 0..size {
-            edges.above_row[i] = plane.sample_clamped(
-                context
-                    .start_x
-                    .checked_add(i)
-                    .ok_or(TileSyntaxError::InvalidBitstream)?,
-                above_y,
-            )?;
-        }
-        for i in size..(2 * size) {
-            edges.above_row[i] = if context.not_on_right && context.tx_size == TxSize::Tx4x4 {
-                plane.sample_clamped(
+        if !store_intra_edge_plane_row(
+            plane,
+            context.start_x,
+            above_y,
+            size,
+            &mut edges.above_row[..size],
+        )? {
+            for i in 0..size {
+                edges.above_row[i] = plane.sample_clamped(
                     context
                         .start_x
                         .checked_add(i)
                         .ok_or(TileSyntaxError::InvalidBitstream)?,
                     above_y,
-                )?
-            } else {
-                edges.above_row[size - 1]
-            };
+                )?;
+            }
         }
+
+        if context.not_on_right && context.tx_size == TxSize::Tx4x4 {
+            for i in size..above_len {
+                edges.above_row[i] = plane.sample_clamped(
+                    context
+                        .start_x
+                        .checked_add(i)
+                        .ok_or(TileSyntaxError::InvalidBitstream)?,
+                    above_y,
+                )?;
+            }
+        } else {
+            let edge = edges.above_row[size - 1];
+            fill_intra_edge_span(&mut edges.above_row[size..above_len], edge, size);
+        }
+
         edges.above_left = if context.have_left {
             plane.sample_clamped(
                 context
@@ -3831,6 +3854,9 @@ fn intra_prediction_edges(
         } else {
             129
         };
+    } else {
+        edges.above_left = 127;
+        fill_intra_edge_span(&mut edges.above_row[..above_len], 127, above_len);
     }
 
     if context.have_left {
@@ -3847,9 +3873,129 @@ fn intra_prediction_edges(
                     .ok_or(TileSyntaxError::InvalidBitstream)?,
             )?;
         }
+    } else {
+        fill_intra_edge_span(&mut edges.left_col[..size], 129, size);
     }
 
-    Ok(edges)
+    Ok(())
+}
+
+fn store_intra_edge_plane_row(
+    plane: &CurrentPlaneMut<'_>,
+    start_x: usize,
+    y: usize,
+    len: usize,
+    dst: &mut [u8],
+) -> Result<bool, TileSyntaxError> {
+    debug_assert_eq!(dst.len(), len);
+
+    let Some(end_x) = start_x.checked_add(len) else {
+        return Ok(false);
+    };
+    if plane.width == 0 || plane.height == 0 || y >= plane.height || end_x > plane.width {
+        return Ok(false);
+    }
+
+    let start = y
+        .checked_mul(plane.stride)
+        .and_then(|row| row.checked_add(start_x))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let end = start
+        .checked_add(len)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let src = plane
+        .data
+        .get(start..end)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    store_intra_edge_span(dst, src, len);
+    Ok(true)
+}
+
+#[inline(always)]
+fn fill_intra_edge_span(dst: &mut [u8], value: u8, len: usize) {
+    debug_assert_eq!(dst.len(), len);
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        let value = u8x16_splat(value);
+        match len {
+            4 => v128_store32_lane::<0>(value, dst.as_mut_ptr().cast::<u32>()),
+            8 => v128_store64_lane::<0>(value, dst.as_mut_ptr().cast::<u64>()),
+            16 => v128_store(dst.as_mut_ptr().cast::<v128>(), value),
+            32 => {
+                v128_store(dst.as_mut_ptr().cast::<v128>(), value);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), value);
+            }
+            64 => {
+                v128_store(dst.as_mut_ptr().cast::<v128>(), value);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), value);
+                v128_store(dst.as_mut_ptr().add(32).cast::<v128>(), value);
+                v128_store(dst.as_mut_ptr().add(48).cast::<v128>(), value);
+            }
+            _ => unreachable!("invalid intra edge span width"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    match len {
+        4 => dst[..4].fill(value),
+        8 => dst[..8].fill(value),
+        16 => dst[..16].fill(value),
+        32 => dst[..32].fill(value),
+        64 => dst[..64].fill(value),
+        _ => unreachable!("invalid intra edge span width"),
+    }
+}
+
+#[inline(always)]
+fn store_intra_edge_span(dst: &mut [u8], src: &[u8], len: usize) {
+    debug_assert_eq!(dst.len(), len);
+    debug_assert!(src.len() >= len);
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        match len {
+            4 => {
+                let value = v128_load32_zero(src.as_ptr().cast::<u32>());
+                v128_store32_lane::<0>(value, dst.as_mut_ptr().cast::<u32>());
+            }
+            8 => {
+                let value = v128_load64_zero(src.as_ptr().cast::<u64>());
+                v128_store64_lane::<0>(value, dst.as_mut_ptr().cast::<u64>());
+            }
+            16 => {
+                let value = v128_load(src.as_ptr().cast::<v128>());
+                v128_store(dst.as_mut_ptr().cast::<v128>(), value);
+            }
+            32 => {
+                let lo = v128_load(src.as_ptr().cast::<v128>());
+                let hi = v128_load(src.as_ptr().add(16).cast::<v128>());
+                v128_store(dst.as_mut_ptr().cast::<v128>(), lo);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), hi);
+            }
+            64 => {
+                let a = v128_load(src.as_ptr().cast::<v128>());
+                let b = v128_load(src.as_ptr().add(16).cast::<v128>());
+                let c = v128_load(src.as_ptr().add(32).cast::<v128>());
+                let d = v128_load(src.as_ptr().add(48).cast::<v128>());
+                v128_store(dst.as_mut_ptr().cast::<v128>(), a);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), b);
+                v128_store(dst.as_mut_ptr().add(32).cast::<v128>(), c);
+                v128_store(dst.as_mut_ptr().add(48).cast::<v128>(), d);
+            }
+            _ => unreachable!("invalid intra edge span width"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    match len {
+        4 => dst[..4].copy_from_slice(&src[..4]),
+        8 => dst[..8].copy_from_slice(&src[..8]),
+        16 => dst[..16].copy_from_slice(&src[..16]),
+        32 => dst[..32].copy_from_slice(&src[..32]),
+        64 => dst[..64].copy_from_slice(&src[..64]),
+        _ => unreachable!("invalid intra edge span width"),
+    }
 }
 
 fn intra_predict_block(
