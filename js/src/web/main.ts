@@ -1,10 +1,12 @@
-import wasmUrl from "../../../rust/target/wasm32-unknown-unknown/release/vip9r.wasm?url";
 import { Vp9Decoder } from "../wasm";
-import { formatWasmLog, instanceMemory, makeVip9rImports } from "../wasm-driver/wasm-env";
+import { startBench } from "./bench";
+import type { BenchHandle } from "./bench";
 import { startPlayback } from "./player";
 import type { PlaybackHandle } from "./player";
+import { Sparkline } from "./sparkline";
+import { instantiateVip9r, wasmUrl } from "./vip9r-instance";
 
-type Mode = "play" | "race";
+type Mode = "play" | "bench";
 
 type CannedClip = { name: string; path: string; label: string };
 
@@ -52,14 +54,13 @@ const mediaUrl = el<HTMLInputElement>("media-url");
 const copyLink = el<HTMLButtonElement>("copy-link");
 const tabs: Record<Mode, HTMLButtonElement> = {
   play: el<HTMLButtonElement>("tab-play"),
-  race: el<HTMLButtonElement>("tab-race"),
+  bench: el<HTMLButtonElement>("tab-bench"),
 };
 const sections: Record<Mode, HTMLElement> = {
   play: el<HTMLElement>("play"),
-  race: el<HTMLElement>("race"),
+  bench: el<HTMLElement>("bench"),
 };
-const wcSelect = el<HTMLSelectElement>("wc");
-const lanesSelect = el<HTMLSelectElement>("lanes");
+const framesInput = el<HTMLInputElement>("frames");
 const logPane = el<HTMLDivElement>("log");
 
 function log(message: string, kind: "info" | "error" = "info"): void {
@@ -83,8 +84,7 @@ window.addEventListener("unhandledrejection", (event) => {
 const DEFAULTS: Record<string, string> = {
   mode: "play",
   media: CANNED[0].name,
-  wc: "software",
-  lanes: "both",
+  frames: "300",
 };
 
 function setParam(key: string, value: string): void {
@@ -103,16 +103,20 @@ function getParam(key: string): string {
 }
 
 function setMode(mode: Mode): void {
-  for (const m of ["play", "race"] as const) {
+  for (const m of ["play", "bench"] as const) {
     tabs[m].classList.toggle("active", m === mode);
     sections[m].hidden = m !== mode;
   }
   setParam("mode", mode);
 }
 
-function syncMediaControls(): void {
+function onMediaChanged(): void {
   mediaUrl.hidden = mediaSelect.value !== CUSTOM;
   setParam("media", mediaSelect.value === CUSTOM ? mediaUrl.value.trim() : mediaSelect.value);
+  // The page always autostarts; picking media restarts through a clean load.
+  if (mediaSelect.value !== CUSTOM || mediaUrl.value.trim() !== "") {
+    location.reload();
+  }
 }
 
 type MediaChoice = { label: string; url: string };
@@ -147,13 +151,36 @@ async function fetchMedia(): Promise<{ choice: MediaChoice; bytes: ArrayBuffer }
 }
 
 let playback: PlaybackHandle | undefined;
+let bench: BenchHandle | undefined;
+const playSpark = new Sparkline(el<HTMLCanvasElement>("play-spark"));
+
+function resetSessions(): void {
+  playback?.stop();
+  playback = undefined;
+  bench?.stop();
+  bench = undefined;
+  el<HTMLSpanElement>("play-stats").textContent = "";
+  playSpark.reset();
+  const canvas = el<HTMLCanvasElement>("play-canvas");
+  canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+  el<HTMLPreElement>("bench-results").textContent = "";
+}
+
+function switchMode(mode: Mode): void {
+  if (getParam("mode") === mode) {
+    return;
+  }
+  resetSessions();
+  setMode(mode);
+  void (mode === "bench" ? startBenchRun() : startPlay());
+}
 
 async function startPlay(): Promise<void> {
   const media = await fetchMedia();
   if (media === undefined) {
     return;
   }
-  playback?.stop();
+  resetSessions();
   playback = startPlayback({
     media: media.bytes,
     canvas: el<HTMLCanvasElement>("play-canvas"),
@@ -161,32 +188,28 @@ async function startPlay(): Promise<void> {
     stats: (text) => {
       el<HTMLSpanElement>("play-stats").textContent = text;
     },
+    onFrameDecoded: (decodeMs, budgetMs) => playSpark.push(decodeMs, budgetMs),
   });
 }
 
-async function startRace(): Promise<void> {
-  if ((await fetchMedia()) === undefined) {
+async function startBenchRun(): Promise<void> {
+  const media = await fetchMedia();
+  if (media === undefined) {
     return;
   }
-  log(
-    `race: lanes=${lanesSelect.value} webcodecs=${wcSelect.value} — not implemented yet`,
-    "error",
-  );
+  resetSessions();
+  bench = startBench({
+    media: media.bytes,
+    packetLimit: Math.max(0, Number(framesInput.value) || 0),
+    log,
+    results: (text) => {
+      el<HTMLPreElement>("bench-results").textContent = text;
+    },
+  });
 }
 
 async function bootWasmCheck(): Promise<void> {
-  let memory: WebAssembly.Memory | undefined;
-  const imports = makeVip9rImports(
-    () => {
-      if (memory === undefined) {
-        throw new Error("wasm logged before instantiation completed");
-      }
-      return memory;
-    },
-    (entry) => log(formatWasmLog(entry), "error"),
-  );
-  const { instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), imports);
-  memory = instanceMemory(instance);
+  const { instance } = await instantiateVip9r((message) => log(message, "error"));
   new Vp9Decoder(instance, 1280, 720);
   log(`wasm ok: ${wasmUrl.split("/").pop()}`);
 }
@@ -211,18 +234,16 @@ function initControls(): void {
     mediaUrl.value = media;
     mediaUrl.hidden = false;
   }
-  wcSelect.value = getParam("wc");
-  lanesSelect.value = getParam("lanes");
-  setMode(getParam("mode") === "race" ? "race" : "play");
+  framesInput.value = getParam("frames");
+  setMode(getParam("mode") === "bench" ? "bench" : "play");
 
-  mediaSelect.addEventListener("change", syncMediaControls);
-  mediaUrl.addEventListener("change", syncMediaControls);
-  wcSelect.addEventListener("change", () => setParam("wc", wcSelect.value));
-  lanesSelect.addEventListener("change", () => setParam("lanes", lanesSelect.value));
-  tabs.play.addEventListener("click", () => setMode("play"));
-  tabs.race.addEventListener("click", () => setMode("race"));
+  mediaSelect.addEventListener("change", onMediaChanged);
+  mediaUrl.addEventListener("change", onMediaChanged);
+  framesInput.addEventListener("change", () => setParam("frames", framesInput.value));
+  tabs.play.addEventListener("click", () => switchMode("play"));
+  tabs.bench.addEventListener("click", () => switchMode("bench"));
   el<HTMLButtonElement>("play-start").addEventListener("click", () => void startPlay());
-  el<HTMLButtonElement>("race-start").addEventListener("click", () => void startRace());
+  el<HTMLButtonElement>("bench-start").addEventListener("click", () => void startBenchRun());
   copyLink.addEventListener("click", () => {
     void navigator.clipboard.writeText(location.href).then(() => log(`link: ${location.href}`));
   });
@@ -231,10 +252,7 @@ function initControls(): void {
 async function main(): Promise<void> {
   initControls();
   await bootWasmCheck();
-  if (getParam("autostart") === "1") {
-    log("autostart");
-    await (getParam("mode") === "race" ? startRace() : startPlay());
-  }
+  await (getParam("mode") === "bench" ? startBenchRun() : startPlay());
 }
 
 void main();

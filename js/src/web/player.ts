@@ -9,6 +9,9 @@ export type PlaybackOptions = {
   canvas: HTMLCanvasElement;
   log: (message: string, kind?: "info" | "error") => void;
   stats: (text: string) => void;
+  // Decode-clock series: fires per decoded frame on arrival, before pacing,
+  // with the running frame-budget estimate from media timestamps.
+  onFrameDecoded?: (decodeMs: number, budgetMs: number) => void;
   onFinished?: () => void;
 };
 
@@ -38,6 +41,9 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
   let dropped = 0;
   let presentedDecodeMs = 0;
   let done: { frames: number; totalDecodeMs: number } | undefined;
+  let decoded = 0;
+  let firstTimestampUs = 0;
+  let lastTimestampUs = 0;
 
   const init: WorkerInit = { media: options.media, queueDepth: QUEUE_DEPTH };
   worker.postMessage(init, { transfer: [options.media] });
@@ -56,6 +62,15 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
           break;
         }
         queue.push({ frame: message.frame, decodeMs: message.decodeMs });
+        if (decoded === 0) {
+          firstTimestampUs = message.frame.timestamp;
+        }
+        lastTimestampUs = message.frame.timestamp;
+        decoded += 1;
+        options.onFrameDecoded?.(
+          message.decodeMs,
+          decoded < 2 ? 0 : (lastTimestampUs - firstTimestampUs) / 1000 / (decoded - 1),
+        );
         if (rafId === undefined) {
           rafId = requestAnimationFrame(tick);
         }

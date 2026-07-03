@@ -436,7 +436,9 @@ COOP/COEP headers, CDN media) is out of scope until it exists.
 - [ ] demo shell: tabbed race/play modes; media dropdown (canned manifest) plus
       URL textbox (direct fetch plays the CORS lottery; vite dev-server proxy
       route as the local escape hatch); config via URL params (`mode`, `media`,
-      `wc`, `lanes`, `autostart`) with a copy-link button — F5 is the rerun
+      `wc`, `lanes`) with a copy-link button; every load autostarts the active
+      mode, media selection restarts via reload, tab switch resets playback —
+      F5 is the rerun
 - [x] worker decode pipeline: vip9r in a dedicated worker (postMessage, no
       SAB/COOP/COEP needed); worker demuxes via `parseVp9Input`, constructs
       I420 `VideoFrame`s directly over wasm memory, and transfers them to
@@ -447,13 +449,18 @@ COOP/COEP headers, CDN media) is out of scope until it exists.
       frame queue (8 in flight), drop counter. 2026-07-02: jellyfish 720p30
       on the workstation: 300/300 presented @30 fps, 0 dropped, decode avg
       25.1 ms/frame
-- [ ] race mode: side-by-side flat-out decode, vip9r vs WebCodecs
-      `VideoDecoder`; `wc` param maps to `hardwareAcceleration` (default
-      prefer-software; it is a preference — display the accepted config,
-      Chrome may fall back silently); throughput totals, ms/frame sparklines,
-      finish times; `lanes` runs one side alone for honest device numbers
-      (simultaneous lanes contend for cores — fine on the workstation,
-      invalid on the A55)
+- [x] bench mode (pivoted from side-by-side race): sequential pure-decode
+      benchmark as the Chrome honesty check against d8 oracle numbers. Lanes
+      vip9r / WebCodecs prefer-software / prefer-hardware, run one at a time
+      in a worker; per lane 60-packet untimed warmup then a timed pass over
+      a packet prefix (`frames` param, default 300, 0 = whole clip). vip9r
+      headline is summed `decodeNext` (same measurand as d8); VideoFrame
+      construction cost measured and reported separately, not folded in.
+      `lanes` param isolates one lane. hardwareAcceleration is a preference —
+      unsupported configs are reported as skipped via `isConfigSupported`,
+      but "software" still means "asked for software". 2026-07-02
+      workstation, jellyfish 300: vip9r 25.0 ms/frame (VideoFrame +0.0),
+      wc-software 0.4, wc-hardware 1.1
 - [ ] canned media manifest: curated /bulk/vip9r subset served through vite
 - [ ] spike, time-boxed: Cobalt on the streamer — can an arbitrary page load
       at all, and does it expose `VideoFrame` construction; sideloaded

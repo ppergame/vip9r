@@ -60,6 +60,14 @@
         gap: 0.5rem;
         margin-bottom: 0.75rem;
       }
+      canvas.spark {
+        display: block;
+        width: 100%;
+        height: 48px;
+        margin-bottom: 0.75rem;
+        background: #101216;
+        border: 1px solid #33363c;
+      }
       .lanes {
         display: flex;
         gap: 1rem;
@@ -80,6 +88,19 @@
         background: #000;
         border: 1px solid #33363c;
         display: block;
+      }
+      input#frames {
+        width: 5rem;
+      }
+      #bench-results {
+        margin: 0;
+        padding: 0.5rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+        background: #101216;
+        border: 1px solid #33363c;
+        min-height: 4.5rem;
+        overflow-x: auto;
       }
       #log {
         margin: 0 1rem 1rem;
@@ -106,13 +127,14 @@
     </header>
     <nav class="tabs">
       <button id="tab-play">play</button>
-      <button id="tab-race">race</button>
+      <button id="tab-bench">bench</button>
     </nav>
     <section id="play" class="mode" hidden>
       <div class="controls">
         <button id="play-start">start</button>
         <span id="play-stats"></span>
       </div>
+      <canvas id="play-spark" class="spark"></canvas>
       <div class="lanes">
         <figure class="lane">
           <figcaption>vip9r</figcaption>
@@ -120,36 +142,15 @@
         </figure>
       </div>
     </section>
-    <section id="race" class="mode" hidden>
+    <section id="bench" class="mode" hidden>
       <div class="controls">
-        <button id="race-start">start</button>
+        <button id="bench-start">start</button>
         <label>
-          webcodecs:
-          <select id="wc">
-            <option value="software">software</option>
-            <option value="hardware">hardware</option>
-            <option value="auto">auto</option>
-          </select>
-        </label>
-        <label>
-          lanes:
-          <select id="lanes">
-            <option value="both">both</option>
-            <option value="vip9r">vip9r only</option>
-            <option value="webcodecs">webcodecs only</option>
-          </select>
+          frames:
+          <input id="frames" type="number" min="0" />
         </label>
       </div>
-      <div class="lanes">
-        <figure class="lane">
-          <figcaption>vip9r</figcaption>
-          <canvas id="race-canvas-vip9r"></canvas>
-        </figure>
-        <figure class="lane">
-          <figcaption>webcodecs</figcaption>
-          <canvas id="race-canvas-webcodecs"></canvas>
-        </figure>
-      </div>
+      <pre id="bench-results"></pre>
     </section>
     <div id="log"></div>
     <script type="module" src="/src/web/main.ts"></script>

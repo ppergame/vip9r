@@ -1,9 +1,8 @@
-import wasmUrl from "../../../rust/target/wasm32-unknown-unknown/release/vip9r.wasm?url";
 import { Vp9Decoder } from "../wasm";
 import type { NativeFrame } from "../wasm";
 import { parseVp9Input } from "../wasm-driver/golden";
-import type { DemuxedVp9 } from "../wasm-driver/golden";
-import { formatWasmLog, instanceMemory, makeVip9rImports } from "../wasm-driver/wasm-env";
+import { packetTimestampUs } from "./media-time";
+import { instantiateVip9r } from "./vip9r-instance";
 
 export type WorkerInit = {
   media: ArrayBuffer;
@@ -62,16 +61,6 @@ self.onmessage = (event: MessageEvent<WorkerInit | WorkerAck>) => {
   });
 };
 
-function packetTimestampUs(input: DemuxedVp9, timestamp: bigint): number {
-  if (input.container === "ivf") {
-    const numerator = input.timebaseNumerator ?? 1;
-    const denominator = input.timebaseDenominator ?? 30;
-    return Math.round((Number(timestamp) * 1e6 * numerator) / denominator);
-  }
-  // WebM: timestamps are in ticks of timestampScale nanoseconds.
-  return Math.round((Number(timestamp) * (input.timestampScale ?? 1e6)) / 1000);
-}
-
 function makeVideoFrame(memory: WebAssembly.Memory, native: NativeFrame, timestamp: number): VideoFrame {
   return new VideoFrame(memory.buffer, {
     format: "I420",
@@ -97,18 +86,9 @@ async function decodeAll(media: ArrayBuffer): Promise<void> {
     packets: input.packets.length,
   });
 
-  let memory: WebAssembly.Memory | undefined;
-  const imports = makeVip9rImports(
-    () => {
-      if (memory === undefined) {
-        throw new Error("wasm logged before instantiation completed");
-      }
-      return memory;
-    },
-    (entry) => post({ type: "log", message: formatWasmLog(entry), error: true }),
+  const { instance, memory } = await instantiateVip9r((message) =>
+    post({ type: "log", message, error: true }),
   );
-  const { instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), imports);
-  memory = instanceMemory(instance);
   const decoder = new Vp9Decoder(instance, input.width, input.height);
 
   let frames = 0;

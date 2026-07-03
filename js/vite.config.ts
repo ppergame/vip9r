@@ -25,6 +25,7 @@ function mediaCorpus(): Plugin {
         }
 
         let size: number;
+        let etag: string;
         try {
           const stat = statSync(file);
           if (!stat.isFile()) {
@@ -32,11 +33,18 @@ function mediaCorpus(): Plugin {
             return;
           }
           size = stat.size;
+          etag = `"${stat.size.toString(16)}-${Math.trunc(stat.mtimeMs).toString(16)}"`;
         } catch {
           next();
           return;
         }
 
+        res.setHeader("etag", etag);
+        if (req.headers["if-none-match"] === etag) {
+          res.statusCode = 304;
+          res.end();
+          return;
+        }
         res.setHeader(
           "content-type",
           file.endsWith(".webm") ? "video/webm" : "application/octet-stream",
