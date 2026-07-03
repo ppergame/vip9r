@@ -1016,11 +1016,10 @@ impl TileParser<'_, '_, '_> {
                     .checked_mul(self.mi_cols)
                     .and_then(|value| value.checked_add(mode_col))
                     .ok_or(TileSyntaxError::InvalidBitstream)?;
-                let info = prev_frame_modes.get(index)?;
-                if !info.valid {
-                    return Err(TileSyntaxError::InvalidBitstream);
-                }
-                segment_id = core::cmp::min(segment_id, info.segment_map_id);
+                let segment_map_id = prev_frame_modes
+                    .segment_map_id(index)?
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                segment_id = core::cmp::min(segment_id, segment_map_id);
             }
         }
         Ok(segment_id)
@@ -1072,7 +1071,7 @@ impl TileParser<'_, '_, '_> {
         for (ref_list, mv) in mvs.iter_mut().enumerate() {
             *mv = block.block_mvs[ref_list][3];
         }
-        let mut stored = StoredModeInfo {
+        let stored = StoredModeInfo {
             valid: true,
             skip: block.skip,
             tx_size: block.tx_size,
@@ -1084,6 +1083,8 @@ impl TileParser<'_, '_, '_> {
             mvs,
             sub_mvs: block.block_mvs,
         };
+        let mut encoded = [0; STORED_MODE_INFO_BYTES];
+        encode_stored_mode_info(stored, &mut encoded);
         let segment_map_updates = self.segmentation.enabled && self.segmentation.update_map;
         let preserve_segment_map = !self.segment_map_reset && !segment_map_updates;
         let prev_frame_modes = self.prev_frame_modes;
@@ -1107,15 +1108,11 @@ impl TileParser<'_, '_, '_> {
                     .checked_mul(self.mi_cols)
                     .and_then(|value| value.checked_add(mode_col))
                     .ok_or(TileSyntaxError::InvalidBitstream)?;
-                stored.segment_map_id = if preserve_segment_map {
+                encoded[STORED_MODE_INFO_SEGMENT_MAP_ID_OFFSET] = if preserve_segment_map {
                     match prev_frame_modes {
-                        Some(prev_frame_modes) => {
-                            let previous = prev_frame_modes.get(index)?;
-                            if !previous.valid {
-                                return Err(TileSyntaxError::InvalidBitstream);
-                            }
-                            previous.segment_map_id
-                        }
+                        Some(prev_frame_modes) => prev_frame_modes
+                            .segment_map_id(index)?
+                            .ok_or(TileSyntaxError::InvalidBitstream)?,
                         None => 0,
                     }
                 } else if self.segment_map_reset && !segment_map_updates {
@@ -1123,7 +1120,7 @@ impl TileParser<'_, '_, '_> {
                 } else {
                     block.segment_id
                 };
-                current_frame_modes.set(index, stored)?;
+                current_frame_modes.set_encoded(index, &encoded)?;
             }
         }
         Ok(())
@@ -1760,7 +1757,8 @@ impl TileParser<'_, '_, '_> {
                     .ok_or(TileSyntaxError::InvalidBitstream)?;
                 for ref_list in 0..REF_LISTS {
                     if info.ref_frames[ref_list] == ref_frame {
-                        let mv = get_sub_block_mv(info, ref_list, candidate[1], block)?;
+                        let mv =
+                            self.candidate_sub_block_mv(info, ref_list, candidate[1], block)?;
                         state.add_mv_ref(mv);
                         break;
                     }
@@ -1775,8 +1773,13 @@ impl TileParser<'_, '_, '_> {
             }
         }
 
+        let prev_candidate = if self.use_prev_frame_mvs {
+            self.prev_mv_ref_candidate(row, col)?
+        } else {
+            None
+        };
         if self.use_prev_frame_mvs {
-            if_same_prev_frame_add_mv(&mut state, self.prev_mv_ref_candidate(row, col)?, ref_frame);
+            if_same_prev_frame_add_mv(&mut state, prev_candidate, ref_frame);
         }
         if different_ref_found {
             for &candidate in search {
@@ -1788,7 +1791,7 @@ impl TileParser<'_, '_, '_> {
         if self.use_prev_frame_mvs {
             if_diff_prev_frame_add_mv(
                 &mut state,
-                self.prev_mv_ref_candidate(row, col)?,
+                prev_candidate,
                 ref_frame,
                 self.ref_sign_biases(),
             )?;
@@ -1922,8 +1925,9 @@ impl TileParser<'_, '_, '_> {
                 .checked_mul(self.mi_cols)
                 .and_then(|value| value.checked_add(candidate_c))
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let info = current_frame_modes.get(index)?;
-            return Ok(info.valid.then_some(CandidateModeInfo::from(info)));
+            return current_frame_modes
+                .as_view()
+                .mv_ref_candidate(index, CandidateSubMvs::StoredCurrent { index });
         }
         if candidate_r < self.left_row_base {
             return self
@@ -1953,7 +1957,7 @@ impl TileParser<'_, '_, '_> {
         &self,
         row: usize,
         col: usize,
-    ) -> Result<Option<StoredModeInfo>, TileSyntaxError> {
+    ) -> Result<Option<CandidateModeInfo>, TileSyntaxError> {
         let Some(prev_frame_modes) = self.prev_frame_modes else {
             return Ok(None);
         };
@@ -1964,8 +1968,42 @@ impl TileParser<'_, '_, '_> {
             .checked_mul(self.mi_cols)
             .and_then(|value| value.checked_add(col))
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let info = prev_frame_modes.get(index)?;
-        Ok(info.valid.then_some(info))
+        prev_frame_modes.mv_ref_candidate(index, CandidateSubMvs::Unavailable)
+    }
+
+    fn candidate_sub_block_mv(
+        &self,
+        info: CandidateModeInfo,
+        ref_list: usize,
+        delta_col: i8,
+        block: i8,
+    ) -> Result<MotionVector, TileSyntaxError> {
+        if block < 0 {
+            return info
+                .mvs
+                .get(ref_list)
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream);
+        }
+
+        match info.sub_mvs {
+            CandidateSubMvs::RepeatedMvs => info
+                .mvs
+                .get(ref_list)
+                .copied()
+                .ok_or(TileSyntaxError::InvalidBitstream),
+            CandidateSubMvs::StoredCurrent { index } => {
+                let sub_block = sub_block_mv_index(delta_col, block)?;
+                let current_frame_modes = self
+                    .current_frame_modes
+                    .as_ref()
+                    .ok_or(TileSyntaxError::InvalidBitstream)?;
+                current_frame_modes
+                    .as_view()
+                    .sub_mv(index, ref_list, sub_block)
+            }
+            CandidateSubMvs::Unavailable => Err(TileSyntaxError::InvalidBitstream),
+        }
     }
 
     fn clamp_mv_ref(

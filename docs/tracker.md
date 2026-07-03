@@ -439,12 +439,11 @@ gate. Competes with M6 threads for effort.
       powers of two; udiv + mls gone from the edge walk
       (asm-verified). A55 jelly −0.6% (spread 0.5%), BBB −0.2%
       (spread 0.2%) — credibility line, directionally consistent
-- [ ] StoredModeInfo access specialization: mv candidate scan,
-      loop-filter SB setup, and decode_block store path decode/encode
-      the full 49-byte record where callers need a few fields (32-byte
-      sub_mvs copied and dropped); specialized getters or field-split
-      layout. Spread across mv_ref_candidate (81% of fn in one
-      region), inter_block_mode_info, loop_filter setup, decode_block
+- [x] StoredModeInfo access specialization: specialized ModeInfoView
+      getters (candidate header, lazy sub_mv, loop-filter record,
+      segment_map_id byte), template-encoded stores, prev-candidate
+      decode hoisted. A55 jelly −4.4% / BBB −3.8%, X4 −5.4% / −3.5%
+      (asm: sub_mvs copies gone, mv_ref_candidate 53→19KB)
 - [ ] inverse_dct_simd_i16 size specialization: recursive schedule
       keeps dynamic brev/cos64 quadrant logic and indirect calls in
       hot code; straight-line per-n schedules trade code size (icache

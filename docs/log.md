@@ -1011,3 +1011,29 @@ streamer cpu0:
   wins are noise-dominated on this in-order core unless they remove
   memory traffic or whole code regions; rank the remaining items
   accordingly.
+
+## 2026-07-03 — A55 asm-audit pass 3: StoredModeInfo access specialization
+
+- Grinder pass on the audit's finding: MV candidate scans, loop-filter
+  SB setup, and the decode_block store path all round-tripped the full
+  49-byte StoredModeInfo record where callers need a few fields.
+  Changes, layout-preserving (access paths only):
+  - `ModeInfoView` grew specialized getters: candidate header
+    (valid/y_mode/ref_frames/mvs — no sub_mvs copy, no tx/mi_size
+    validation), lazy per-sub-block `sub_mv` read, loop-filter
+    mini-record, one-byte `segment_map_id`.
+  - Candidate sub-MVs became `CandidateSubMvs` (RepeatedMvs /
+    StoredCurrent{index} / Unavailable); the `block < 0` path reads
+    `mvs[ref_list]` directly, exact because stored `mvs` is defined as
+    `sub_mvs[..][3]` at encode time.
+  - `find_mv_refs` decodes the prev-frame candidate once and reuses it
+    across the same-ref/diff-ref passes.
+  - `update_current_frame_modes` encodes one 49-byte template and
+    copies it per covered MI, patching only the segment_map_id byte.
+- Asm (arm32): mv_ref_candidate 53.1 → 19.2KB with zero vld1/vst1
+  (sub_mvs copy gone); find_mv_refs vld/vst sites 125 → 3;
+  loop-filter record load reads exactly the needed bytes.
+- A55 **jellyfish −4.4% / BBB −3.8%** (spreads 0.8/0.3%); X4 confirm
+  **−5.4% / −3.5%** (0.2/1.1%). First clearly-real win of the
+  asm-audit backlog — memory-traffic removal, where the session's two
+  divide eliminations (instruction-level) were noise.

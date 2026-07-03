@@ -194,7 +194,7 @@ pub(super) fn loop_filter_superblock_info(
                 .checked_add(local_col)
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
             let info = loop_filter_mode_info(config, mode_row, mode_col)?;
-            let ref_frame = info.ref_frames[0];
+            let ref_frame = info.ref_frame;
             let mode_type = loop_filter_mode_type(info.y_mode);
             let strength = if usize::from(info.segment_id) < MAX_SEGMENTS
                 && usize::from(ref_frame) < LOOP_FILTER_REF_FRAMES
@@ -452,7 +452,7 @@ pub(super) fn loop_filter_mode_info(
     config: LoopFilterConfig<'_>,
     row: usize,
     col: usize,
-) -> Result<StoredModeInfo, TileSyntaxError> {
+) -> Result<StoredLoopFilterModeInfo, TileSyntaxError> {
     if row >= config.mi_rows || col >= config.mi_cols {
         return Err(TileSyntaxError::InvalidBitstream);
     }
@@ -460,11 +460,10 @@ pub(super) fn loop_filter_mode_info(
         .checked_mul(config.mi_cols)
         .and_then(|value| value.checked_add(col))
         .ok_or(TileSyntaxError::InvalidBitstream)?;
-    let info = config.modes.get(index)?;
-    if !info.valid {
-        return Err(TileSyntaxError::InvalidBitstream);
-    }
-    Ok(info)
+    config
+        .modes
+        .loop_filter_info(index)?
+        .ok_or(TileSyntaxError::InvalidBitstream)
 }
 
 pub(super) fn loop_filter_is_block_edge(

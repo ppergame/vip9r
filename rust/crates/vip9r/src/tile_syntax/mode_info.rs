@@ -41,9 +41,25 @@ impl NeighborModeInfo {
 pub(super) struct CandidateModeInfo {
     pub(super) y_mode: u8,
     pub(super) ref_frames: [u8; REF_LISTS],
-    pub(super) interp_filter: u8,
     pub(super) mvs: [MotionVector; REF_LISTS],
-    pub(super) sub_mvs: [[MotionVector; SUB_BLOCKS]; REF_LISTS],
+    pub(super) sub_mvs: CandidateSubMvs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CandidateSubMvs {
+    RepeatedMvs,
+    StoredCurrent { index: usize },
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct StoredLoopFilterModeInfo {
+    pub(super) skip: bool,
+    pub(super) tx_size: TxSize,
+    pub(super) segment_id: u8,
+    pub(super) mi_size: BlockSize,
+    pub(super) y_mode: u8,
+    pub(super) ref_frame: u8,
 }
 
 impl From<NeighborModeInfo> for CandidateModeInfo {
@@ -51,21 +67,8 @@ impl From<NeighborModeInfo> for CandidateModeInfo {
         Self {
             y_mode: info.y_mode,
             ref_frames: info.ref_frames,
-            interp_filter: info.interp_filter,
             mvs: info.mvs,
-            sub_mvs: [[info.mvs[0]; SUB_BLOCKS], [info.mvs[1]; SUB_BLOCKS]],
-        }
-    }
-}
-
-impl From<StoredModeInfo> for CandidateModeInfo {
-    fn from(info: StoredModeInfo) -> Self {
-        Self {
-            y_mode: info.y_mode,
-            ref_frames: info.ref_frames,
-            interp_filter: SWITCHABLE_FILTER_SENTINEL,
-            mvs: info.mvs,
-            sub_mvs: info.sub_mvs,
+            sub_mvs: CandidateSubMvs::RepeatedMvs,
         }
     }
 }
@@ -119,16 +122,94 @@ impl<'a> ModeInfoView<'a> {
         Ok(Self { data })
     }
 
-    pub(super) fn get(self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
+    fn entry(self, index: usize) -> Result<&'a [u8], TileSyntaxError> {
         let start = mode_info_offset(index)?;
         let end = start
             .checked_add(STORED_MODE_INFO_BYTES)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let entry = self
-            .data
+        self.data
             .get(start..end)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn get(self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
+        let entry = self.entry(index)?;
         decode_stored_mode_info(entry)
+    }
+
+    pub(super) fn mv_ref_candidate(
+        self,
+        index: usize,
+        sub_mvs: CandidateSubMvs,
+    ) -> Result<Option<CandidateModeInfo>, TileSyntaxError> {
+        let entry = self.entry(index)?;
+        if entry[STORED_MODE_INFO_VALID_OFFSET] == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(CandidateModeInfo {
+            y_mode: entry[STORED_MODE_INFO_Y_MODE_OFFSET],
+            ref_frames: [
+                entry[STORED_MODE_INFO_REF_FRAMES_OFFSET],
+                entry[STORED_MODE_INFO_REF_FRAMES_OFFSET + 1],
+            ],
+            mvs: [
+                decode_motion_vector(entry, STORED_MODE_INFO_MVS_OFFSET)?,
+                decode_motion_vector(entry, STORED_MODE_INFO_MVS_OFFSET + 4)?,
+            ],
+            sub_mvs,
+        }))
+    }
+
+    pub(super) fn sub_mv(
+        self,
+        index: usize,
+        ref_list: usize,
+        sub_block: usize,
+    ) -> Result<MotionVector, TileSyntaxError> {
+        if ref_list >= REF_LISTS || sub_block >= SUB_BLOCKS {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let offset = ref_list
+            .checked_mul(SUB_BLOCKS)
+            .and_then(|base| base.checked_add(sub_block))
+            .and_then(|slot| slot.checked_mul(4))
+            .and_then(|byte_offset| byte_offset.checked_add(STORED_MODE_INFO_SUB_MVS_OFFSET))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        decode_motion_vector(self.entry(index)?, offset)
+    }
+
+    pub(super) fn loop_filter_info(
+        self,
+        index: usize,
+    ) -> Result<Option<StoredLoopFilterModeInfo>, TileSyntaxError> {
+        let entry = self.entry(index)?;
+        if entry[STORED_MODE_INFO_VALID_OFFSET] == 0 {
+            return Ok(None);
+        }
+
+        let tx_size = TxSize::from_raw(entry[STORED_MODE_INFO_TX_SIZE_OFFSET])
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let mi_size = BlockSize::from_raw(entry[STORED_MODE_INFO_MI_SIZE_OFFSET])
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+        Ok(Some(StoredLoopFilterModeInfo {
+            skip: entry[STORED_MODE_INFO_SKIP_OFFSET] != 0,
+            tx_size,
+            segment_id: entry[STORED_MODE_INFO_SEGMENT_ID_OFFSET],
+            mi_size,
+            y_mode: entry[STORED_MODE_INFO_Y_MODE_OFFSET],
+            ref_frame: entry[STORED_MODE_INFO_REF_FRAMES_OFFSET],
+        }))
+    }
+
+    pub(super) fn segment_map_id(self, index: usize) -> Result<Option<u8>, TileSyntaxError> {
+        let entry = self.entry(index)?;
+        if entry[STORED_MODE_INFO_VALID_OFFSET] == 0 {
+            return Ok(None);
+        }
+        Ok(Some(entry[STORED_MODE_INFO_SEGMENT_MAP_ID_OFFSET]))
     }
 }
 
@@ -157,24 +238,37 @@ impl<'a> ModeInfoViewMut<'a> {
         ModeInfoViewMut { data: self.data }
     }
 
+    #[allow(dead_code)]
     pub(super) fn get(&self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
         self.as_view().get(index)
     }
 
+    fn entry_mut(&mut self, index: usize) -> Result<&mut [u8], TileSyntaxError> {
+        let start = mode_info_offset(index)?;
+        let end = start
+            .checked_add(STORED_MODE_INFO_BYTES)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        self.data
+            .get_mut(start..end)
+            .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    #[allow(dead_code)]
     pub(super) fn set(
         &mut self,
         index: usize,
         info: StoredModeInfo,
     ) -> Result<(), TileSyntaxError> {
-        let start = mode_info_offset(index)?;
-        let end = start
-            .checked_add(STORED_MODE_INFO_BYTES)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let entry = self
-            .data
-            .get_mut(start..end)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        encode_stored_mode_info(info, entry);
+        encode_stored_mode_info(info, self.entry_mut(index)?);
+        Ok(())
+    }
+
+    pub(super) fn set_encoded(
+        &mut self,
+        index: usize,
+        bytes: &[u8; STORED_MODE_INFO_BYTES],
+    ) -> Result<(), TileSyntaxError> {
+        self.entry_mut(index)?.copy_from_slice(bytes);
         Ok(())
     }
 }
@@ -225,6 +319,7 @@ pub(super) fn mode_info_offset(index: usize) -> Result<usize, TileSyntaxError> {
         .ok_or(TileSyntaxError::InvalidBitstream)
 }
 
+#[allow(dead_code)]
 pub(super) fn decode_stored_mode_info(bytes: &[u8]) -> Result<StoredModeInfo, TileSyntaxError> {
     if bytes.len() != STORED_MODE_INFO_BYTES {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -1073,24 +1168,11 @@ pub(super) fn comp_ref_context(
     Ok(ctx)
 }
 
-pub(super) fn get_sub_block_mv(
-    info: CandidateModeInfo,
-    ref_list: usize,
-    delta_col: i8,
-    block: i8,
-) -> Result<MotionVector, TileSyntaxError> {
-    let idx = if block >= 0 {
-        let block = usize::try_from(block).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        *IDX_N_COLUMN_TO_SUBBLOCK
-            .get(block)
-            .and_then(|row| row.get(usize::from(delta_col == 0)))
-            .ok_or(TileSyntaxError::InvalidBitstream)?
-    } else {
-        3
-    };
-    info.sub_mvs
-        .get(ref_list)
-        .and_then(|mvs| mvs.get(idx))
+pub(super) fn sub_block_mv_index(delta_col: i8, block: i8) -> Result<usize, TileSyntaxError> {
+    let block = usize::try_from(block).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    IDX_N_COLUMN_TO_SUBBLOCK
+        .get(block)
+        .and_then(|row| row.get(usize::from(delta_col == 0)))
         .copied()
         .ok_or(TileSyntaxError::InvalidBitstream)
 }
@@ -1110,7 +1192,7 @@ pub(super) fn if_same_ref_frame_add_mv(
 
 pub(super) fn if_same_prev_frame_add_mv(
     state: &mut MvRefState,
-    info: Option<StoredModeInfo>,
+    info: Option<CandidateModeInfo>,
     ref_frame: u8,
 ) {
     let Some(info) = info else {
@@ -1162,7 +1244,7 @@ pub(super) fn if_diff_ref_frame_add_mv(
 
 pub(super) fn if_diff_prev_frame_add_mv(
     state: &mut MvRefState,
-    info: Option<StoredModeInfo>,
+    info: Option<CandidateModeInfo>,
     ref_frame: u8,
     sign_biases: [bool; 4],
 ) -> Result<(), TileSyntaxError> {
@@ -1413,6 +1495,13 @@ mod tests {
 
         assert_eq!(candidate.y_mode, NEARESTMV);
         assert_eq!(candidate.mvs[0], exact_mv);
-        assert_eq!(candidate.sub_mvs[0], exact_sub_mvs);
+        assert_eq!(
+            parser.candidate_sub_block_mv(candidate, 0, 0, 0).unwrap(),
+            exact_sub_mvs[2]
+        );
+        assert_eq!(
+            parser.candidate_sub_block_mv(candidate, 0, 0, -1).unwrap(),
+            exact_mv
+        );
     }
 }
