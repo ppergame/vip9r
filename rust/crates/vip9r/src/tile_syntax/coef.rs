@@ -294,20 +294,22 @@ mod tests {
                 test_block(false),
             )
             .unwrap();
-        let coefficients = &parser.residual.coefficients;
+        let coefficients = &parser.residual.dequantized;
 
         assert!(!coefficients.nonzero_context());
         assert_eq!(coefficients.eob, 0);
         assert_eq!(coefficients.coefficients[..16], [0; 16]);
+        assert_eq!(coefficients.nonzero_row_mask, 0);
+        assert!(!parser.residual.dequantized_dirty);
         assert_eq!(parser.decoder.bit_offset(), 1);
         assert_eq!(parser.decoder.finish(), Ok(()));
     }
 
     #[test]
-    fn token_sign_bits_store_coefficients_in_raster_position_order() {
+    fn token_sign_bits_store_dequantized_coefficients_in_raster_position_order() {
         let probabilities = sign_bit_test_probabilities();
 
-        for (data, expected) in [([0x01, 0x80], 1), ([0x40, 0x80], -1)] {
+        for (data, expected) in [([0x01, 0x80], 4), ([0x40, 0x80], -4)] {
             let mut contexts = TileModeContexts::new(1).unwrap();
             let mut counts = SyntaxCounts::default();
             let mut parser = TileParser {
@@ -352,7 +354,7 @@ mod tests {
                     test_block(false),
                 )
                 .unwrap();
-            let coefficients = &parser.residual.coefficients;
+            let coefficients = &parser.residual.dequantized;
 
             assert!(coefficients.nonzero_context());
             assert_eq!(coefficients.eob, 2);
@@ -363,12 +365,14 @@ mod tests {
             assert_eq!(coefficients.coefficients[0], 0);
             assert_eq!(coefficients.coefficients[1], 0);
             assert_eq!(coefficients.coefficients[4], expected);
+            assert_eq!(coefficients.nonzero_row_mask, 0b10);
+            assert!(parser.residual.dequantized_dirty);
             assert_eq!(parser.decoder.finish(), Ok(()));
         }
     }
 
     #[test]
-    fn token_workspace_clears_previous_scan_prefix_before_reuse() {
+    fn token_workspace_clears_previous_dequantized_block_before_reuse() {
         let sign_probabilities = sign_bit_test_probabilities();
         let zero_probabilities = FrameContext::DEFAULT;
         let mut contexts = TileModeContexts::new(1).unwrap();
@@ -415,7 +419,9 @@ mod tests {
                 test_block(false),
             )
             .unwrap();
-        assert_eq!(parser.residual.coefficients.coefficients[4], 1);
+        assert_eq!(parser.residual.dequantized.coefficients[4], 4);
+        assert_eq!(parser.residual.dequantized.nonzero_row_mask, 0b10);
+        assert!(parser.residual.dequantized_dirty);
         assert_eq!(parser.residual.token_cache[..16], [0; 16]);
 
         parser.decoder = BoolDecoder::new(&[0x00, 0x00]).unwrap();
@@ -431,9 +437,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(parser.residual.coefficients.eob, 0);
-        assert_eq!(parser.residual.coefficients.coefficients[4], 0);
-        assert!(parser.residual.quantized_dirty.is_none());
+        assert_eq!(parser.residual.dequantized.eob, 0);
+        assert_eq!(parser.residual.dequantized.coefficients[4], 0);
+        assert_eq!(parser.residual.dequantized.nonzero_row_mask, 0);
+        assert!(!parser.residual.dequantized_dirty);
         assert_eq!(parser.decoder.finish(), Ok(()));
     }
 

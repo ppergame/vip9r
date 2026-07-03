@@ -614,35 +614,30 @@ impl IntraPredictionBuffers {
 }
 
 struct ResidualBuffers {
-    coefficients: TransformCoefficients,
     dequantized: DequantizedCoefficients,
     token_cache: [u8; MAX_TX_COEFFS],
-    quantized_dirty: Option<QuantizedDirty>,
+    dequantized_dirty: bool,
 }
 
 impl ResidualBuffers {
     fn new() -> Self {
         Self {
-            coefficients: TransformCoefficients::empty(),
             dequantized: DequantizedCoefficients::empty(),
             token_cache: [0; MAX_TX_COEFFS],
-            quantized_dirty: None,
+            dequantized_dirty: false,
         }
     }
 
-    fn clear_quantized_dirty(&mut self) {
-        if let Some(dirty) = self.quantized_dirty.take() {
-            let scan = scan_table(dirty.tx_size, dirty.tx_type);
-            self.coefficients.clear_scan_prefix(scan, dirty.eob);
+    fn clear_dequantized_dirty(&mut self) {
+        if self.dequantized_dirty {
+            self.dequantized.clear_transform_extent();
+            self.dequantized_dirty = false;
         }
     }
 
-    fn mark_quantized_dirty(&mut self, tx_size: TxSize, tx_type: TxType, eob: usize) {
-        self.quantized_dirty = (eob > 0).then_some(QuantizedDirty {
-            tx_size,
-            tx_type,
-            eob,
-        });
+    fn clear_dequantized_block(&mut self) {
+        self.dequantized.clear_transform_extent();
+        self.dequantized_dirty = false;
     }
 
     fn clear_token_cache_prefix(&mut self, scan: &[u16], eob: usize) {
@@ -650,13 +645,6 @@ impl ResidualBuffers {
             self.token_cache[usize::from(pos)] = 0;
         }
     }
-}
-
-#[derive(Clone, Copy)]
-struct QuantizedDirty {
-    tx_size: TxSize,
-    tx_type: TxType,
-    eob: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2189,31 +2177,11 @@ impl TileParser<'_, '_, '_> {
                                 mi_size,
                                 block,
                             )?;
-                            nonzero = self.residual.coefficients.nonzero_context();
+                            nonzero = self.residual.dequantized.nonzero_context();
                             if nonzero {
-                                let scan = scan_table(
-                                    self.residual.coefficients.block.tx_size,
-                                    self.residual.coefficients.block.tx_type,
-                                );
-                                let dequant = self.dequant;
-                                let segment_id = block.segment_id;
-                                {
-                                    let ResidualBuffers {
-                                        coefficients,
-                                        dequantized,
-                                        ..
-                                    } = &mut self.residual;
-                                    dequant.dequantize_into(
-                                        coefficients,
-                                        segment_id,
-                                        scan,
-                                        dequantized,
-                                    )?;
-                                }
-                                self.residual.clear_quantized_dirty();
                                 self.residual.dequantized.inverse_transform(self.lossless)?;
                                 reconstruct(current_frame, &self.residual.dequantized)?;
-                                self.residual.dequantized.clear_transform_extent();
+                                self.residual.clear_dequantized_block();
                             }
                         }
                     }
@@ -2487,6 +2455,10 @@ impl TileParser<'_, '_, '_> {
         mi_size: BlockSize,
         block: DecodedBlockInfo,
     ) -> Result<(), TileSyntaxError> {
+        if plane >= PLANES {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
         let seg_eob = 16usize << (tx_size.index() << 1);
         let tx_type = self.get_tx_type(plane, tx_size, block_idx, mi_size, block)?;
         let mut check_eob = true;
@@ -2504,50 +2476,69 @@ impl TileParser<'_, '_, '_> {
         let plane_type = usize::from(plane > 0);
         let ref_type = usize::from(block.is_inter);
         let coef_probs = &self.probabilities.coef_probs[tx_index][plane_type][ref_type];
+        let dq_denom = dq_denom(tx_size);
+        let dc_quant = self
+            .dequant
+            .get_dc_quant_for_segment(plane, block.segment_id);
+        let ac_quant = self
+            .dequant
+            .get_ac_quant_for_segment(plane, block.segment_id);
         let counts = &mut *self.counts;
         let counts_more_coefs = &mut counts.counts_more_coefs[tx_index][plane_type][ref_type];
         let counts_token = &mut counts.counts_token[tx_index][plane_type][ref_type];
         let decoder = &mut self.decoder;
         let residual = &mut self.residual;
-        residual.clear_quantized_dirty();
+        residual.clear_dequantized_dirty();
         residual
-            .coefficients
-            .reset(plane, start, tx_size, tx_type)?;
-        let coefficients = &mut residual.coefficients;
-        let token_cache = &mut residual.token_cache;
+            .dequantized
+            .reset(TransformBlock::new(plane, start, tx_size, tx_type), 0);
 
-        while c < seg_eob {
-            let pos = usize::from(*scan.get(c).ok_or(TileSyntaxError::InvalidBitstream)?);
-            let band = usize::from(coef_bands[c]);
-            let ctx = if c == 0 {
-                dc_ctx
-            } else {
-                coefficient_token_context(pos, tx_size, tx_type, token_cache)?
-            };
-            let probability_row = &coef_probs[band][ctx];
+        {
+            let ResidualBuffers {
+                dequantized,
+                token_cache,
+                dequantized_dirty,
+            } = residual;
 
-            if check_eob
-                && !read_more_coefs(decoder, probability_row, &mut counts_more_coefs[band][ctx])?
-            {
-                break;
+            while c < seg_eob {
+                let pos = usize::from(*scan.get(c).ok_or(TileSyntaxError::InvalidBitstream)?);
+                let band = usize::from(coef_bands[c]);
+                let ctx = if c == 0 {
+                    dc_ctx
+                } else {
+                    coefficient_token_context(pos, tx_size, tx_type, token_cache)?
+                };
+                let probability_row = &coef_probs[band][ctx];
+
+                if check_eob
+                    && !read_more_coefs(
+                        decoder,
+                        probability_row,
+                        &mut counts_more_coefs[band][ctx],
+                    )?
+                {
+                    break;
+                }
+
+                let token = read_token(decoder, probability_row, &mut counts_token[band][ctx])?;
+                token_cache[pos] = ENERGY_CLASS[token.index()];
+                if token == CoefToken::Zero {
+                    check_eob = false;
+                } else {
+                    let coef = read_coef(decoder, token)?;
+                    let sign_bit = decoder.read_literal(1)?;
+                    dequantized.set_signed_dequantized(
+                        pos, coef, sign_bit, dc_quant, ac_quant, dq_denom,
+                    )?;
+                    *dequantized_dirty = true;
+                    check_eob = true;
+                }
+
+                c = c.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?;
             }
 
-            let token = read_token(decoder, probability_row, &mut counts_token[band][ctx])?;
-            token_cache[pos] = ENERGY_CLASS[token.index()];
-            if token == CoefToken::Zero {
-                check_eob = false;
-            } else {
-                let coef = read_coef(decoder, token)?;
-                let sign_bit = decoder.read_literal(1)?;
-                coefficients.set_signed(pos, coef, sign_bit)?;
-                check_eob = true;
-            }
-
-            c = c.checked_add(1).ok_or(TileSyntaxError::InvalidBitstream)?;
+            dequantized.set_eob(c)?;
         }
-
-        coefficients.set_eob(c)?;
-        residual.mark_quantized_dirty(tx_size, tx_type, c);
         residual.clear_token_cache_prefix(scan, c);
         Ok(())
     }

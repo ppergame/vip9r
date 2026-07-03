@@ -927,3 +927,24 @@ streamer cpu0:
   data-dependent branch but demonstrably can emit predicated arm32
   moves (`movhi` for the bool itself). Masked-arithmetic Rust would
   make the whole update straight-line.
+## 2026-07-03 — parse→dequant fusion; branchless read_bool measured null
+
+- The two entropy-side items left after the campaign, run as one
+  grinder task with two independently judged commits.
+- Fusion (merged): coefficients are dequantized as their tokens are
+  decoded — `(coef * quant) / dq_denom` written straight into the
+  i32 transform input with the row mask updated in place. The
+  quantized i16 buffer, the second walk over the scan prefix, and
+  its dirty-prefix clear are gone (`TransformCoefficients` deleted,
+  −85 lines net). Buffer cleanliness moved to a dirty flag: cleared
+  before reuse under the block extent it was written with, so error
+  paths can't leak stale coefficients. A55 BBB **−4.5%** (spread
+  0.9%), jellyfish **−1.5%** (0.2%); X4 confirm BBB −1.6% (1.0%,
+  credibility line), jellyfish noise. Compliance 307/307.
+- Branchless read_bool (not merged): the underflow-mask rewrite took
+  four source shapes before LLVM+V8 stopped re-deriving a branch —
+  the final arm32 asm is genuinely straight-line, and it bought
+  nothing: BBB −0.002%, jellyfish +0.3% at 0.7% spread, stacked on
+  the fusion. The safety-check-tax entry above calibrated the
+  ceiling correctly; the bit-decision branch itself was never the
+  cost. Null recorded, branchy source kept for clarity.

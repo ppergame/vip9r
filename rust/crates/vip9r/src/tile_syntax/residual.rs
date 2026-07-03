@@ -1,7 +1,7 @@
 use crate::header::{SEG_LVL_ALT_Q, SegmentationParams, UncompressedFrameHeader};
 
 use super::{
-    CurrentFrameMut, CurrentPlaneMut, MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType, clip1,
+    CurrentFrameMut, CurrentPlaneMut, MAX_TX_COEFFS, TileSyntaxError, TxSize, TxType, clip1,
 };
 
 use core::arch::wasm32::*;
@@ -30,117 +30,12 @@ impl TransformBlock {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct TransformCoefficients {
-    pub(super) block: TransformBlock,
-    pub(super) coefficients: [i16; MAX_TX_COEFFS],
-    pub(super) eob: usize,
-}
-
-impl TransformCoefficients {
-    pub(super) const fn empty() -> Self {
-        Self {
-            block: TransformBlock::new(0, (0, 0), TxSize::Tx4x4, TxType::DctDct),
-            coefficients: [0; MAX_TX_COEFFS],
-            eob: 0,
-        }
-    }
-
-    #[cfg(feature = "wasm-tests")]
-    pub(super) fn new(
-        plane: usize,
-        start: (usize, usize),
-        tx_size: TxSize,
-        tx_type: TxType,
-    ) -> Result<Self, TileSyntaxError> {
-        if plane >= PLANES {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-
-        Ok(Self {
-            block: TransformBlock::new(plane, start, tx_size, tx_type),
-            coefficients: [0; MAX_TX_COEFFS],
-            eob: 0,
-        })
-    }
-
-    pub(super) fn reset(
-        &mut self,
-        plane: usize,
-        start: (usize, usize),
-        tx_size: TxSize,
-        tx_type: TxType,
-    ) -> Result<(), TileSyntaxError> {
-        if plane >= PLANES {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-
-        self.block = TransformBlock::new(plane, start, tx_size, tx_type);
-        self.eob = 0;
-        Ok(())
-    }
-
-    pub(super) fn set_signed(
-        &mut self,
-        pos: usize,
-        magnitude: u32,
-        sign_bit: u32,
-    ) -> Result<(), TileSyntaxError> {
-        let magnitude = i16::try_from(magnitude).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        let coefficient = if sign_bit == 0 {
-            magnitude
-        } else {
-            magnitude
-                .checked_neg()
-                .ok_or(TileSyntaxError::InvalidBitstream)?
-        };
-        self.set_quantized(pos, coefficient)
-    }
-
-    pub(super) fn set_quantized(
-        &mut self,
-        pos: usize,
-        coefficient: i16,
-    ) -> Result<(), TileSyntaxError> {
-        if pos >= coefficient_count(self.block.tx_size) {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-
-        let slot = self
-            .coefficients
-            .get_mut(pos)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        *slot = coefficient;
-        Ok(())
-    }
-
-    pub(super) fn set_eob(&mut self, eob: usize) -> Result<(), TileSyntaxError> {
-        if eob > coefficient_count(self.block.tx_size) {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-
-        self.eob = eob;
-        Ok(())
-    }
-
-    pub(super) const fn nonzero_context(&self) -> bool {
-        self.eob > 0
-    }
-
-    pub(super) fn clear_scan_prefix(&mut self, scan: &[u16], eob: usize) {
-        for &pos in scan.iter().take(eob) {
-            self.coefficients[usize::from(pos)] = 0;
-        }
-        self.eob = 0;
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(super) struct DequantizedCoefficients {
     pub(super) block: TransformBlock,
     pub(super) coefficients: [i32; MAX_TX_COEFFS],
     pub(super) eob: usize,
-    nonzero_row_mask: u32,
+    pub(super) nonzero_row_mask: u32,
     dct_simd_scratch: [v128; MAX_TX_WIDTH],
     dct_scalar_scratch: [i32; MAX_TX_WIDTH],
     adst_copy: [v128; MAX_ADST_WIDTH],
@@ -188,6 +83,50 @@ impl DequantizedCoefficients {
         self.block = block;
         self.eob = eob;
         self.nonzero_row_mask = 0;
+    }
+
+    pub(super) fn set_signed_dequantized(
+        &mut self,
+        pos: usize,
+        magnitude: u32,
+        sign_bit: u32,
+        dc_quant: i32,
+        ac_quant: i32,
+        dq_denom: i32,
+    ) -> Result<(), TileSyntaxError> {
+        if pos >= coefficient_count(self.block.tx_size) {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let magnitude = i16::try_from(magnitude).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let coefficient = if sign_bit == 0 {
+            magnitude
+        } else {
+            magnitude
+                .checked_neg()
+                .ok_or(TileSyntaxError::InvalidBitstream)?
+        };
+        if coefficient == 0 {
+            return Ok(());
+        }
+
+        let quant = if pos == 0 { dc_quant } else { ac_quant };
+        self.coefficients[pos] = (i32::from(coefficient) * quant) / dq_denom;
+        self.nonzero_row_mask |= 1u32 << (pos >> (2 + self.block.tx_size.index()));
+        Ok(())
+    }
+
+    pub(super) fn set_eob(&mut self, eob: usize) -> Result<(), TileSyntaxError> {
+        if eob > coefficient_count(self.block.tx_size) {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        self.eob = eob;
+        Ok(())
+    }
+
+    pub(super) const fn nonzero_context(&self) -> bool {
+        self.eob > 0
     }
 
     pub(super) fn clear_transform_extent(&mut self) {
@@ -824,50 +763,6 @@ impl FrameDequant {
     pub(super) fn get_ac_quant_for_segment(self, plane: usize, segment_id: u8) -> i32 {
         let delta = if plane == 0 { 0 } else { self.delta_q_uv_ac };
         ac_q(self.get_qindex_for_segment(segment_id) + delta)
-    }
-
-    pub(super) fn dequantize_into(
-        self,
-        input: &TransformCoefficients,
-        segment_id: u8,
-        scan: &[u16],
-        output: &mut DequantizedCoefficients,
-    ) -> Result<(), TileSyntaxError> {
-        output.reset(input.block, input.eob);
-        if input.eob == 0 {
-            return Ok(());
-        }
-
-        let count = coefficient_count(input.block.tx_size);
-        if input.eob > count {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-
-        let row_shift = 2 + input.block.tx_size.index();
-        let dq_denom = dq_denom(input.block.tx_size);
-        let dc_quant = self.get_dc_quant_for_segment(input.block.plane, segment_id);
-        let ac_quant = self.get_ac_quant_for_segment(input.block.plane, segment_id);
-
-        for c in 0..input.eob {
-            let pos = usize::from(*scan.get(c).ok_or(TileSyntaxError::InvalidBitstream)?);
-            if pos >= count {
-                return Err(TileSyntaxError::InvalidBitstream);
-            }
-
-            let coefficient = *input
-                .coefficients
-                .get(pos)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            if coefficient == 0 {
-                continue;
-            }
-
-            let quant = if pos == 0 { dc_quant } else { ac_quant };
-            output.coefficients[pos] = (i32::from(coefficient) * quant) / dq_denom;
-            output.nonzero_row_mask |= 1u32 << (pos >> row_shift);
-        }
-
-        Ok(())
     }
 }
 
@@ -1945,7 +1840,7 @@ fn inverse_wht(t: &mut [i32; MAX_TX_WIDTH], shift: usize) -> Result<(), TileSynt
     Ok(())
 }
 
-const fn dq_denom(tx_size: TxSize) -> i32 {
+pub(super) const fn dq_denom(tx_size: TxSize) -> i32 {
     match tx_size {
         TxSize::Tx32x32 => 2,
         TxSize::Tx4x4 | TxSize::Tx8x8 | TxSize::Tx16x16 => 1,
@@ -2653,46 +2548,68 @@ mod tests {
     }
 
     #[test]
-    fn dequantize_uses_dc_ac_quantizers_and_tx32_dq_denom() {
+    fn fused_dequantized_writes_use_dc_ac_quantizers_and_tx32_dq_denom() {
         let dequant = FrameDequant::new(4, 2, 0, 0);
-        let mut tx16 =
-            TransformCoefficients::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct).unwrap();
-        let tx16_ac = usize::from(scan_table(tx16.block.tx_size, tx16.block.tx_type)[1]);
-        tx16.set_quantized(0, 2).unwrap();
-        tx16.set_quantized(tx16_ac, 4).unwrap();
-        tx16.set_eob(2).unwrap();
-
         let mut output16 = DequantizedCoefficients::empty();
-        dequant
-            .dequantize_into(
-                &tx16,
+        let tx16_block = TransformBlock::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct);
+        let tx16_ac = usize::from(scan_table(tx16_block.tx_size, tx16_block.tx_type)[1]);
+        output16.reset(tx16_block, 0);
+        output16
+            .set_signed_dequantized(
                 0,
-                scan_table(tx16.block.tx_size, tx16.block.tx_type),
-                &mut output16,
+                2,
+                0,
+                dequant.get_dc_quant_for_segment(0, 0),
+                dequant.get_ac_quant_for_segment(0, 0),
+                dq_denom(tx16_block.tx_size),
             )
             .unwrap();
-        assert_eq!(output16.block, tx16.block);
+        output16
+            .set_signed_dequantized(
+                tx16_ac,
+                4,
+                0,
+                dequant.get_dc_quant_for_segment(0, 0),
+                dequant.get_ac_quant_for_segment(0, 0),
+                dq_denom(tx16_block.tx_size),
+            )
+            .unwrap();
+        output16.set_eob(2).unwrap();
+        assert_eq!(output16.block, tx16_block);
         assert_eq!(output16.eob, 2);
         assert_eq!(output16.coefficients[0], 24);
         assert_eq!(output16.coefficients[tx16_ac], 44);
-
-        let mut tx32 =
-            TransformCoefficients::new(0, (8, 16), TxSize::Tx32x32, TxType::DctDct).unwrap();
-        let tx32_ac = usize::from(scan_table(tx32.block.tx_size, tx32.block.tx_type)[1]);
-        tx32.set_quantized(0, 2).unwrap();
-        tx32.set_quantized(tx32_ac, 4).unwrap();
-        tx32.set_eob(2).unwrap();
+        assert_eq!(
+            output16.nonzero_row_mask,
+            1u32 | (1u32 << (tx16_ac >> (2 + tx16_block.tx_size.index())))
+        );
 
         let mut output32 = DequantizedCoefficients::empty();
-        dequant
-            .dequantize_into(
-                &tx32,
+        let tx32_block = TransformBlock::new(0, (8, 16), TxSize::Tx32x32, TxType::DctDct);
+        let tx32_ac = usize::from(scan_table(tx32_block.tx_size, tx32_block.tx_type)[1]);
+        output32.reset(tx32_block, 0);
+        output32
+            .set_signed_dequantized(
                 0,
-                scan_table(tx32.block.tx_size, tx32.block.tx_type),
-                &mut output32,
+                2,
+                0,
+                dequant.get_dc_quant_for_segment(0, 0),
+                dequant.get_ac_quant_for_segment(0, 0),
+                dq_denom(tx32_block.tx_size),
             )
             .unwrap();
-        assert_eq!(output32.block, tx32.block);
+        output32
+            .set_signed_dequantized(
+                tx32_ac,
+                4,
+                0,
+                dequant.get_dc_quant_for_segment(0, 0),
+                dequant.get_ac_quant_for_segment(0, 0),
+                dq_denom(tx32_block.tx_size),
+            )
+            .unwrap();
+        output32.set_eob(2).unwrap();
+        assert_eq!(output32.block, tx32_block);
         assert_eq!(output32.eob, 2);
         assert_eq!(output32.coefficients[0], 12);
         assert_eq!(output32.coefficients[tx32_ac], 22);

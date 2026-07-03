@@ -411,20 +411,19 @@ shrank; traversal glue and intra prediction were promoted.
       BBB −22.4% 15.1→11.8 vs campaign start 3e27aa5), `--all`
       corpus green, notes close-out, baselines pruned to
       campaign-start + final
-- [ ] parse→dequant fusion (deferred from P1, never A/B'd in the
-      post-P1 structure): dequantize each coefficient as its token is
-      decoded and write directly into the transform input, dropping
-      the intermediate quantized-buffer pass. The one live
-      entropy-side experiment left after the 2026-07 campaign
-- [ ] branchless bool-decoder bit decision: the per-bit
-      `value < split` update is a br_if diamond in the wasm (LLVM
-      won't selectify across the state stores; V8 lowers it as a
-      data-dependent branch — asm evidence 2026-07-03, dump
-      1d32b952-arm32). Rewrite the state update as masked arithmetic
-      in read_bool so LLVM emits straight-line code. Expect mixed
-      polarity: wins on coin-flip bits, loses on skewed ones;
-      decode_block region is layout-fragile (P1b), so judge strictly
-      by counterbalanced A/B. Candidate rider on the fusion pass
+- [x] parse→dequant fusion (deferred from P1): dequantize each
+      coefficient as its token is decoded, write directly into the
+      transform input; quantized i16 buffer, second scan walk, and
+      dirty-prefix clear deleted. A55 BBB −4.5% (spread 0.9%) /
+      jellyfish −1.5% (0.2%); X4 BBB −1.6% (credibility line),
+      jellyfish noise. Compliance 307/307
+- [x] branchless bool-decoder bit decision — measured null, NOT
+      merged: underflow-mask rewrite achieved straight-line arm32
+      asm (took four source shapes; LLVM/V8 kept re-deriving the
+      branch from compare/select forms) and timed as exact noise on
+      both clips stacked on the fusion (BBB −0.002%, jelly +0.3% at
+      0.7% spread). The bit-decision branch was never the cost;
+      branchy source kept for clarity
 
 ### M5a — demo page: play + race
 
