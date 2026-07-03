@@ -314,9 +314,11 @@ shrank; traversal glue and intra prediction were promoted.
       landed: MaybeUninit buffer replaced with parser-owned persistent
       `[u8]` (zero unsafe, −342 lines, simd/scalar helpers unified under
       const generic), perf-neutral on both clips
-- [ ] P3 (demoted) — small-copy elimination in prediction paths: libc is
-      down to 6%/4% post-P1; only worth a pass if profiles after P4 still
-      show libc/memcpy structure
+- [x] P3 (demoted, closed) — small-copy elimination in prediction
+      paths: the measurable part shipped as P3-lite (persistent intra
+      edges); post-P-intra profile had libc at 6.2%/2.8% (BBB/jelly)
+      with no single remaining site worth a grinder pass. Campaign
+      closed without revisiting
 - [x] P8 — loop filter simd retry (post-P-intra profile: 18.9% jelly /
       8.6% BBB): pass-1 (horizontal edges) Tx4x4 narrow filter in 8 u8
       lanes, transpose-free; pass 0 and wide filters stay scalar.
@@ -372,7 +374,7 @@ shrank; traversal glue and intra prediction were promoted.
       read within each call); memory.fill sites 33 → 24 in the dump.
       A55 timing legs ranged −1.1%..+0.2% across sessions — noise
       floor; merged for the traffic reduction, not the stopwatch
-- [ ] P9 SB-row-fused loop filtering: declined — L2D refill only
+- [x] P9 SB-row-fused loop filtering: declined — L2D refill only
       5.5M/s ≈ 0.9GB/s (PMU-measured), too weak to justify the
       structural cost; icache experiment already showed the phase-
       cycling cost needs batching that intra dependencies entangle
@@ -404,8 +406,11 @@ shrank; traversal glue and intra prediction were promoted.
       arm32) but Tx4 narrow is noise-level and Tx8 wide3 is a real
       loss (+0.96% jelly). Pass 0 stays scalar on in-order arm32;
       finding recorded in log + notes
-- [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
-      close-out
+- [x] end-of-campaign: margin table in log.md (A55 jelly −31.7%
+      211→144 ms/f, BBB −28.8% 153→109; X4 jelly −34.1% 16.4→11.0,
+      BBB −22.4% 15.1→11.8 vs campaign start 3e27aa5), `--all`
+      corpus green, notes close-out, baselines pruned to
+      campaign-start + final
 
 ### M4 — Encode
 

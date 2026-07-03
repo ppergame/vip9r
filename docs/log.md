@@ -853,3 +853,39 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   Merged on mechanism per the neutral-cleanup precedent: strictly
   less work per frame, fill sites verifiably gone. Compliance
   307/307, 95/95 tests host+device.
+
+## 2026-07-03 — A55 campaign wrap: both-device margins
+
+Whole-campaign position-corrected A/B, final tree vs the campaign-start
+baseline (3e27aa5, post-simd128 master), X4 = Pixel 9a cpu7, A55 = TV
+streamer cpu0:
+
+| device | clip                  | before → after ms/frame | delta  | budget    | margin      |
+|--------|-----------------------|-------------------------|--------|-----------|-------------|
+| X4     | jellyfish-720p30 0:15 | 16.4 → 11.0             | −34.1% | 33.3 ms   | 3.0x under  |
+| X4     | big-buck-bunny 0:15   | 15.1 → 11.8             | −22.4% | 40 ms @25 | 3.4x under  |
+| A55    | jellyfish-720p30 0:5  | 211 → 144               | −31.7% | 33.3 ms   | 4.3x over   |
+| A55    | big-buck-bunny 0:5    | 152 → 109               | −28.8% | 40 ms @25 | 2.7x over   |
+
+- Campaign ledger, merged (every merge corpus-gated 307/307): P1
+  residual restructure (−16.1% BBB), P2 add_residual simd, P4
+  convolution v2 + cleanup, P-intra fast paths, P3-lite persistent
+  intra edges, P-idct-scratch, P8 + P8-wide pass-1 loop filter simd,
+  P-adst, P-i16dct (spec-licensed 16-bit DCT domain), fill-traffic
+  micro sweep. Full `--all` corpus green at wrap (337/337).
+- Measured and declined, with durable reasons: P1b traversal glue
+  (decode_block region is layout-fragile), pass-0 loop filter simd
+  (transpose round-trip tax beats good vzip lowering on in-order
+  arm32), icache cold-outlining (L1I cost is per-block phase cycling),
+  P9 SB-row fusion (L2D only 0.9GB/s), P7 wide refill
+  (bitrate-bounded), P6 (already absorbed by P1).
+- V8-portability posture held: every kernel is plain wasm simd128
+  shaped by measured V8 arm32 lowering (extmul MACs, vzip-friendly
+  interleaves, no bitmask in register-heavy kernels — documented
+  arm32 codegen bug — no per-engine branches), so the tweaks carry to
+  future V8 including the browser.
+- A55 residue: jellyfish 144 ms/f is 4.3x over 720p30 single-core;
+  remaining profile mass is the serial-entropy decode_block monolith
+  and its icache phase cycling — structural, not kernel-shaped. Next
+  levers are threads (M6, ~2.9x per ffvp9 scaling) and relaxed-simd,
+  not more simd128 passes. ffvp9 gap narrowed to ~6.2x (144 vs 23.1).
