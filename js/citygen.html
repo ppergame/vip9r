@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>vip9r citygen</title>
+    <style>
+      body {
+        margin: 0;
+        font-family: system-ui, sans-serif;
+        background: #16181c;
+        color: #d6d8dc;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.5rem 1rem;
+        border-bottom: 1px solid #33363c;
+      }
+      header h1 {
+        font-size: 1rem;
+        margin: 0;
+      }
+      header span {
+        color: #9a9da3;
+        font-size: 0.85rem;
+      }
+      main {
+        display: flex;
+        gap: 1rem;
+        padding: 1rem;
+        align-items: flex-start;
+        flex-wrap: wrap;
+      }
+      .stage {
+        flex: 1 1 40rem;
+        min-width: 20rem;
+      }
+      canvas#scene-canvas {
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #000;
+        border: 1px solid #33363c;
+        display: block;
+      }
+      .stage .buttons {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+      }
+      button {
+        font: inherit;
+        background: #22252b;
+        color: inherit;
+        border: 1px solid #44484f;
+        border-radius: 4px;
+        padding: 0.25rem 0.75rem;
+      }
+      button#decant {
+        background: #2e5db3;
+        border-color: #2e5db3;
+        color: #fff;
+      }
+      #status {
+        margin-top: 0.75rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+        min-height: 1.2rem;
+        white-space: pre-wrap;
+      }
+      #status.error {
+        color: #ff7b72;
+      }
+      video#result-video {
+        width: 100%;
+        margin-top: 0.75rem;
+        border: 1px solid #33363c;
+        background: #000;
+      }
+      #controls {
+        flex: 0 0 21rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      #controls .control {
+        display: grid;
+        grid-template-columns: 7rem 1fr 3rem;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.85rem;
+      }
+      #controls .control .value {
+        text-align: right;
+        font-family: ui-monospace, monospace;
+        color: #9a9da3;
+      }
+      #controls .divider {
+        margin-top: 0.75rem;
+        padding-top: 0.5rem;
+        border-top: 1px solid #33363c;
+        color: #9a9da3;
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+      input[type="range"] {
+        width: 100%;
+        accent-color: #2e5db3;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>vip9r citygen</h1>
+      <span>synthetic 720p30 VP9 test media — night city flyover</span>
+    </header>
+    <main>
+      <div class="stage">
+        <canvas id="scene-canvas"></canvas>
+        <div class="buttons">
+          <button id="pause">pause</button>
+          <button id="restart">restart</button>
+          <button id="decant">decant webm</button>
+        </div>
+        <div id="status"></div>
+        <video id="result-video" controls hidden></video>
+      </div>
+      <div id="controls"></div>
+    </main>
+    <script type="module" src="/src/citygen/main.ts"></script>
+  </body>
+</html>

@@ -4,5 +4,5 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "types": ["vite/client"]
   },
-  "include": ["src/web", "src/wasm", "src/wasm-driver/wasm-env.ts", "src/webm"]
+  "include": ["src/web", "src/wasm", "src/wasm-driver/wasm-env.ts", "src/webm", "src/citygen"]
 }

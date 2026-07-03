@@ -68,6 +68,12 @@ export default defineConfig({
   build: {
     target: "es2022",
     outDir: "dist/web",
+    rollupOptions: {
+      input: {
+        index: path.join(repoRoot, "js/index.html"),
+        citygen: path.join(repoRoot, "js/citygen.html"),
+      },
+    },
   },
   test: {
     include: ["src/**/*.test.ts"],
