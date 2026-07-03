@@ -610,7 +610,7 @@ struct ResidualBuffers {
 }
 
 impl ResidualBuffers {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             coefficients: TransformCoefficients::empty(),
             dequantized: DequantizedCoefficients::empty(),

@@ -134,21 +134,29 @@ impl TransformCoefficients {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct DequantizedCoefficients {
     pub(super) block: TransformBlock,
     pub(super) coefficients: [i32; MAX_TX_COEFFS],
     pub(super) eob: usize,
     nonzero_row_mask: u32,
+    #[cfg(target_arch = "wasm32")]
+    dct_simd_scratch: [v128; MAX_TX_WIDTH],
+    #[cfg(target_arch = "wasm32")]
+    dct_scalar_scratch: [i32; MAX_TX_WIDTH],
 }
 
 impl DequantizedCoefficients {
-    pub(super) const fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             block: TransformBlock::new(0, (0, 0), TxSize::Tx4x4, TxType::DctDct),
             coefficients: [0; MAX_TX_COEFFS],
             eob: 0,
             nonzero_row_mask: 0,
+            #[cfg(target_arch = "wasm32")]
+            dct_simd_scratch: [i32x4_splat(0); MAX_TX_WIDTH],
+            #[cfg(target_arch = "wasm32")]
+            dct_scalar_scratch: [0; MAX_TX_WIDTH],
         }
     }
 
@@ -159,6 +167,10 @@ impl DequantizedCoefficients {
             coefficients: [0; MAX_TX_COEFFS],
             eob,
             nonzero_row_mask: 0,
+            #[cfg(target_arch = "wasm32")]
+            dct_simd_scratch: [i32x4_splat(0); MAX_TX_WIDTH],
+            #[cfg(target_arch = "wasm32")]
+            dct_scalar_scratch: [0; MAX_TX_WIDTH],
         }
     }
 
@@ -334,15 +346,17 @@ impl DequantizedCoefficients {
             }
         }
 
-        let mut t = [0i32; MAX_TX_WIDTH];
+        let t = &mut self.dct_scalar_scratch;
+        let coefficients = &mut self.coefficients;
         for &row in rows.iter().take(row_count) {
-            for (col, slot) in t.iter_mut().take(width).enumerate() {
-                *slot = self.coefficients[row * width + col];
+            // Write the gathered row in bit-reversed order, matching
+            // inverse_dct_permutation without a separate scratch copy.
+            for col in 0..width {
+                t[brev(n, col)] = coefficients[row * width + col];
             }
-            inverse_dct_permutation(&mut t, n);
-            inverse_dct(&mut t, n)?;
+            inverse_dct(t, n)?;
             for (col, value) in t.iter().take(width).copied().enumerate() {
-                self.coefficients[row * width + col] = value;
+                coefficients[row * width + col] = value;
             }
         }
 
@@ -356,24 +370,27 @@ impl DequantizedCoefficients {
         width: usize,
         rows: [usize; SIMD_DCT_LANES],
     ) -> Result<(), TileSyntaxError> {
-        let mut t = [i32x4_splat(0); MAX_TX_WIDTH];
-        for (col, slot) in t.iter_mut().take(width).enumerate() {
-            *slot = i32x4_from_lanes(
-                self.coefficients[rows[0] * width + col],
-                self.coefficients[rows[1] * width + col],
-                self.coefficients[rows[2] * width + col],
-                self.coefficients[rows[3] * width + col],
+        let t = &mut self.dct_simd_scratch;
+        let coefficients = &mut self.coefficients;
+        // The DCT reads exactly `width == 1 << n` entries. Fill those entries
+        // in their permuted positions; persistent scratch beyond width may be
+        // stale and must remain unused.
+        for col in 0..width {
+            t[brev(n, col)] = i32x4_from_lanes(
+                coefficients[rows[0] * width + col],
+                coefficients[rows[1] * width + col],
+                coefficients[rows[2] * width + col],
+                coefficients[rows[3] * width + col],
             );
         }
 
-        inverse_dct_permutation_simd(&mut t, n);
-        inverse_dct_simd(&mut t, n)?;
+        inverse_dct_simd(t, n)?;
 
         for (col, &values) in t.iter().take(width).enumerate() {
-            self.coefficients[rows[0] * width + col] = i32x4_extract_lane::<0>(values);
-            self.coefficients[rows[1] * width + col] = i32x4_extract_lane::<1>(values);
-            self.coefficients[rows[2] * width + col] = i32x4_extract_lane::<2>(values);
-            self.coefficients[rows[3] * width + col] = i32x4_extract_lane::<3>(values);
+            coefficients[rows[0] * width + col] = i32x4_extract_lane::<0>(values);
+            coefficients[rows[1] * width + col] = i32x4_extract_lane::<1>(values);
+            coefficients[rows[2] * width + col] = i32x4_extract_lane::<2>(values);
+            coefficients[rows[3] * width + col] = i32x4_extract_lane::<3>(values);
         }
 
         Ok(())
@@ -382,15 +399,17 @@ impl DequantizedCoefficients {
     #[cfg(target_arch = "wasm32")]
     fn inverse_dct_columns_simd(&mut self, n: usize, width: usize) -> Result<(), TileSyntaxError> {
         let final_shift = core::cmp::min(6, n + 2);
-        let mut t = [i32x4_splat(0); MAX_TX_WIDTH];
+        let t = &mut self.dct_simd_scratch;
+        let coefficients = &mut self.coefficients;
 
         for col in (0..width).step_by(SIMD_DCT_LANES) {
-            for (row, slot) in t.iter_mut().take(width).enumerate() {
-                *slot = load_i32x4(self.coefficients.as_ptr().wrapping_add(row * width + col));
+            // Gather this column group directly into bit-reversed DCT input
+            // order. All entries the SIMD DCT reads are overwritten here.
+            for row in 0..width {
+                t[brev(n, row)] = load_i32x4(coefficients.as_ptr().wrapping_add(row * width + col));
             }
 
-            inverse_dct_permutation_simd(&mut t, n);
-            inverse_dct_simd(&mut t, n)?;
+            inverse_dct_simd(t, n)?;
 
             for (row, &values) in t.iter().take(width).enumerate() {
                 // Scalar DCT narrows `round2_i64(i64::from(value), final_shift)`.
@@ -400,9 +419,7 @@ impl DequantizedCoefficients {
                 // an extra pre-shift i32 wrap.
                 let values = round_shift_i32x4(values, final_shift);
                 store_i32x4(
-                    self.coefficients
-                        .as_mut_ptr()
-                        .wrapping_add(row * width + col),
+                    coefficients.as_mut_ptr().wrapping_add(row * width + col),
                     values,
                 );
             }
@@ -421,6 +438,17 @@ impl DequantizedCoefficients {
         Ok(())
     }
 }
+
+impl PartialEq for DequantizedCoefficients {
+    fn eq(&self, other: &Self) -> bool {
+        self.block == other.block
+            && self.coefficients == other.coefficients
+            && self.eob == other.eob
+            && self.nonzero_row_mask == other.nonzero_row_mask
+    }
+}
+
+impl Eq for DequantizedCoefficients {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FrameDequant {
@@ -826,19 +854,11 @@ fn sh(
 
 fn inverse_dct_permutation(t: &mut [i32; MAX_TX_WIDTH], n: usize) {
     let len = 1usize << n;
-    let mut copy_t = [0i32; MAX_TX_WIDTH];
-    copy_t[..len].copy_from_slice(&t[..len]);
-    for (i, slot) in t.iter_mut().take(len).enumerate() {
-        *slot = copy_t[brev(n, i)];
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn inverse_dct_permutation_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) {
-    let len = 1usize << n;
-    let copy_t = *t;
-    for (i, slot) in t.iter_mut().take(len).enumerate() {
-        *slot = copy_t[brev(n, i)];
+    for i in 0..len {
+        let j = brev(n, i);
+        if i < j {
+            t.swap(i, j);
+        }
     }
 }
 
@@ -1371,6 +1391,26 @@ mod tests {
                 "coefficient mismatch for {tx_size:?} {tx_type:?} {pattern} at {index}: simd={} scalar={}",
                 current.coefficients[index], scalar.coefficients[index]
             );
+        }
+    }
+
+    #[test]
+    fn inverse_dct_permutation_matches_copy_reference() {
+        for n in 2..=5 {
+            let len = 1usize << n;
+            let mut input = [0i32; MAX_TX_WIDTH];
+            for (i, value) in input.iter_mut().enumerate() {
+                *value = 0x1000 + i as i32 * 17;
+            }
+
+            let mut expected = input;
+            for i in 0..len {
+                expected[i] = input[brev(n, i)];
+            }
+
+            let mut actual = input;
+            inverse_dct_permutation(&mut actual, n);
+            assert_eq!(actual, expected, "n={n}");
         }
     }
 

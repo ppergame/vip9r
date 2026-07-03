@@ -331,10 +331,7 @@ shrank; traversal glue and intra prediction were promoted.
       microbench + icache-refill PMU (decode_block monolith question);
       P7 bool-decoder wide-window A55 re-measure; P9 SB-row-fused loop
       filtering (needs L2-miss evidence); P10 drop per-frame 1.4MB
-      neutral fill if edge semantics allow; P-idct-scratch: simd
-      inverse-DCT per-block 512B `[v128; MAX_TX_WIDTH]` zero-init +
-      `inverse_dct_permutation_simd` `let copy_t = *t` stack copy
-      (identified in wasm dump by the edges grinder)
+      neutral fill if edge semantics allow
 - [x] P3-lite — persistent IntraPredictionEdges + slice above-row
       gather: in-place fill with explicit missing-edge defaults
       (127/129 spans only), interior above row copied as fixed-width
@@ -342,6 +339,14 @@ shrank; traversal glue and intra prediction were promoted.
       96B struct copy + init fills (verified gone from wasm dump).
       A55 BBB −3.6% (1080p libvpx clip, spread 0.3%) / −1.2% (720p
       wikimedia, spread 0.3%); jellyfish noise-level as expected
+- [x] P-idct-scratch — dead scratch traffic in the simd inverse DCT:
+      gathers write directly into bit-reversed `brev(n, i)` slots
+      (permutation pass deleted; brev is an involution so the scalar
+      path uses in-place disjoint swaps), and the per-group 512B
+      zero-init becomes persistent scratch on DequantizedCoefficients.
+      All four 512B fill/copy sites gone from the wasm dump;
+      decode_residual memory ops 18 → 7. A55 BBB −5.1% grinder /
+      −4.4% confirm (spread 0.3-1.0%), jellyfish −1.1% (spread 0.2%)
 - [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
       close-out
 

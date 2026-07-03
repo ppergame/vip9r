@@ -701,3 +701,27 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   copy+fill sites are simd inverse-DCT scratch — the zero-init of
   `[v128; MAX_TX_WIDTH]` and `inverse_dct_permutation_simd`'s
   `let copy_t = *t`. Queued as a candidate follow-up.
+
+## 2026-07-03 — A55 campaign: inverse-DCT scratch elimination
+
+- Follow-up on the edges pass's side finding: the simd DCT_DCT path
+  paid ~1KB of dead stack traffic per 4-lane group — a 512B
+  `memory.fill` (zero-init of `[i32x4_splat(0); MAX_TX_WIDTH]` in the
+  row-group and column kernels) and a 512B `memory.copy`
+  (`inverse_dct_permutation_simd`'s `let copy_t = *t`). Fix: the
+  gather loops write directly into bit-reversed slots
+  (`t[brev(n, col)] = …`), which is exactly gather-then-permute since
+  `brev(n, ·)` is a bijection on `0..width`, so the permutation pass
+  disappears; the scratch array becomes a persistent field on
+  `DequantizedCoefficients` (zeros were never read — every entry the
+  DCT touches is overwritten each group). The scalar
+  `inverse_dct_permutation` becomes in-place disjoint swaps (brev is
+  an involution), with a unit test against the copy-based reference.
+- All four 512B fill/copy sites verified gone from the release wasm
+  dump; decode_residual memory ops dropped 18 → 7. A55: BBB **−5.1%**
+  grinder / **−4.4%** orchestrator confirm (spreads 0.3-1.0%, no-op
+  anchor null), jellyfish **−1.1%** (spread 0.2%). Largest single win
+  since P1 — on an in-order core with per-access wasm bounds checks,
+  libc round-trips inside the hottest loop were pure tax. Compliance
+  307/307, 94/94 tests host+device, validates incl. quantizer-00 and
+  resize.
