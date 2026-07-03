@@ -448,15 +448,18 @@ gate. Competes with M6 threads for effort.
       bodies (n=2..5), brev/cos64/table work folds to literal
       constants; code shrank 20.8 → 15.5KB. A55 jelly −1.8% (spread
       0.14%), BBB −0.5% (noise)
-- [ ] extend the narrow_i32_butterfly trust model to the remaining
-      checked `narrow_i32(round2_i64(..))?` scalar ADST/shift paths
-      (long adds/adc/cmn chains in transform tails)
-- [ ] speculative, layout-fragile: register-pressure reduction in the
-      inlined subpel convolution (coefficient Q-registers spill to
-      the frame inside inner loops) and the token loop (~369 frame
-      ld/st per 1728 instructions in the hot region). Prior traversal
-      restructures measured negative; only attempt with asm-diff
-      evidence that the spills actually leave
+- [x] extend the narrow_i32_butterfly trust model to remaining checked
+      scalar ADST/shift paths — declined on session calibration: two
+      asm-verified serializing-divide removals in hotter regions
+      bought ≤0.6%; these dual-issue add/adc/cmn chains with
+      never-taken branches in colder regions cannot clear the noise
+      floor, and the change carries malformed-stream behavior risk
+- [x] register-pressure reduction (subpel convolution spills, token
+      loop frame traffic) — closed without work, as scoped: no
+      asm-diff evidence that a source shape removes the spills, and
+      prior traversal restructures measured negative. Retry candidate
+      only if a future V8 or a threads-era code layout changes the
+      register allocation picture
 - Engine-level, recorded not actionable at source: redundant
       [0,255] clamp + GPR constant materialization before `vqmovun`
       (u8x16_narrow lowering), `v128.load64_zero` lowered as two

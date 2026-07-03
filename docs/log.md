@@ -1056,3 +1056,20 @@ streamer cpu0:
   noise — BBB's DCT share is small post-P-idct-scratch). X4 confirm
   jellyfish −0.03% at 1.27% spread: pure noise, consistent with the
   out-of-order core hiding the schedule overhead the A55 pays for.
+
+## 2026-07-03 — A55 asm-audit backlog: session wrap
+
+- Four passes executed, two more declined on evidence (checked-narrow
+  trust extension, register-pressure reduction — see tracker for
+  rationale). Cumulative A55 vs session start, counterbalanced:
+  **jellyfish −5.5%** (142 → ~134 ms/frame, spread 0.3%),
+  **BBB −5.1%** (103 → ~98, spread 0.3%). Best samples 133.5 / 97.3.
+- Margin: jellyfish ~4.0x over the 33.3 ms 720p30 budget (was 4.3x at
+  campaign wrap), BBB ~2.4x over its 40 ms @25fps budget (was 2.7x).
+  Still a threads-scale gap; the audit backlog is closed and M6
+  remains the path.
+- Session lesson, now twice-confirmed: on this in-order core under
+  V8, instruction-level substitutions (even serializing divides)
+  measure null; what moves the number is eliminating memory traffic
+  (StoredModeInfo pass, −4%) and collapsing whole control-flow
+  regions (DCT specialization, −1.8% jelly with *less* code).
