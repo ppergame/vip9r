@@ -301,10 +301,15 @@ shrank; traversal glue and intra prediction were promoted.
 - [ ] P-intra — predict_intra fast path: 10% on BBB; profile-split first
       (predictor kernels vs edge gather), then common-mode (DC/V/H/TM)
       row-slice or simd paths
-- [ ] P4 — convolution kernel v2: i16-domain extmul MAC, shuffle-based tap
-      gather instead of per-tap bounds-checked loads, vertical sliding
-      register window (jellyfish subpel 21.6% post-P1). Fold in the
-      5KB interp-buffer zero-init drop from old P3
+- [x] P4 — convolution kernel v2: merged extmul MACs + interp-buffer
+      zero-fill removal, A55 −1.5% jellyfish / −0.5% BBB (memset removal
+      is the main win). Negatives with asm evidence: V8 arm32 lowers
+      shuffles to VTBL not VEXT (shuffle tap-gather dead), vertical
+      sliding window spills (V8 regalloc), extmul does not fuse to
+      VMLAL, pure-i16 impossible (coeff sum 182×255 > i16). Follow-up
+      landed: MaybeUninit buffer replaced with parser-owned persistent
+      `[u8]` (zero unsafe, −342 lines, simd/scalar helpers unified under
+      const generic), perf-neutral on both clips
 - [ ] P3 (demoted) — small-copy elimination in prediction paths: libc is
       down to 6%/4% post-P1; only worth a pass if profiles after P4 still
       show libc/memcpy structure

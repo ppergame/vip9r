@@ -13,7 +13,6 @@ use crate::probability::{
     CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
 };
 use crate::tile::{TileDescriptor, TileLayout};
-use core::mem::MaybeUninit;
 
 mod residual;
 mod tables;
@@ -66,7 +65,7 @@ const INTERP_TAPS: usize = 8;
 const MAX_INTER_PRED_SIZE: usize = 64;
 const MAX_INTERP_SOURCE_DIM: usize = MAX_INTER_PRED_SIZE + INTERP_TAPS - 1;
 const MAX_INTERP_BUFFER: usize = MAX_INTERP_SOURCE_DIM * MAX_INTERP_SOURCE_DIM;
-type InterpBuffer = [MaybeUninit<u8>; MAX_INTERP_BUFFER];
+type InterpBuffer = [u8; MAX_INTERP_BUFFER];
 const SUBPEL_BITS: u8 = 4;
 const SUBPEL_SHIFTS: i32 = 1 << SUBPEL_BITS;
 const SUBPEL_MASK: i32 = SUBPEL_SHIFTS - 1;
@@ -531,6 +530,7 @@ fn parse_tile(
         current_frame_modes: mode_buffers.current_frame_modes,
         reference_frames,
         residual: ResidualBuffers::new(),
+        interp_buffer: [0; MAX_INTERP_BUFFER],
     };
 
     let mut row = tile_row_start;
@@ -583,6 +583,7 @@ struct TileParser<'a, 'b, 'r> {
     current_frame_modes: Option<ModeInfoViewMut<'b>>,
     reference_frames: Option<ReferenceFrames<'r>>,
     residual: ResidualBuffers,
+    interp_buffer: InterpBuffer,
 }
 
 struct ResidualBuffers {
@@ -2239,7 +2240,7 @@ impl TileParser<'_, '_, '_> {
     }
 
     fn predict_inter(
-        &self,
+        &mut self,
         current_frame: &mut CurrentFrameMut<'_>,
         context: InterPredictionContext,
     ) -> Result<(), TileSyntaxError> {
@@ -2287,6 +2288,7 @@ impl TileParser<'_, '_, '_> {
             .iter()
             .all(|motion| motion.step_x == SUBPEL_SHIFTS && motion.step_y == SUBPEL_SHIFTS);
         if unscaled {
+            let interp_buffer = &mut self.interp_buffer;
             inter_predict_unscaled_block(
                 refs[0].ok_or(TileSyntaxError::InvalidBitstream)?,
                 scaled[0],
@@ -2294,6 +2296,7 @@ impl TileParser<'_, '_, '_> {
                 plane,
                 context,
                 InterPredictionWrite::Store,
+                interp_buffer,
             )?;
             if is_compound {
                 inter_predict_unscaled_block(
@@ -2303,6 +2306,7 @@ impl TileParser<'_, '_, '_> {
                     plane,
                     context,
                     InterPredictionWrite::Average,
+                    interp_buffer,
                 )?;
             }
             return Ok(());
@@ -2622,6 +2626,7 @@ fn inter_predict_unscaled_block(
     plane: &mut CurrentPlaneMut<'_>,
     context: InterPredictionContext,
     write: InterPredictionWrite,
+    buffer: &mut InterpBuffer,
 ) -> Result<(), TileSyntaxError> {
     if context.width == 0
         || context.height == 0
@@ -2643,7 +2648,7 @@ fn inter_predict_unscaled_block(
     };
 
     if request.x_phase == 0 && request.y_phase == 0 {
-        return inter_predict_integer_unscaled_block(reference, plane, request);
+        return inter_predict_integer_unscaled_block(reference, plane, request, buffer);
     }
 
     let x_filter = SUBPEL_FILTERS
@@ -2655,7 +2660,7 @@ fn inter_predict_unscaled_block(
         .and_then(|filters| filters.get(request.y_phase))
         .ok_or(TileSyntaxError::InvalidBitstream)?;
 
-    inter_predict_subpel_unscaled_block(reference, plane, request, x_filter, y_filter)
+    inter_predict_subpel_unscaled_block(reference, plane, request, x_filter, y_filter, buffer)
 }
 
 #[inline(never)]
@@ -2663,6 +2668,7 @@ fn inter_predict_integer_unscaled_block(
     reference: ReferencePlane<'_>,
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
+    buffer: &mut InterpBuffer,
 ) -> Result<(), TileSyntaxError> {
     let context = request.context;
     if reference_rect_inside(
@@ -2698,7 +2704,7 @@ fn inter_predict_integer_unscaled_block(
         return Ok(());
     }
 
-    inter_predict_integer_edge_block(reference, plane, request)
+    inter_predict_integer_edge_block(reference, plane, request, buffer)
 }
 
 #[inline(never)]
@@ -2706,16 +2712,16 @@ fn inter_predict_integer_edge_block(
     reference: ReferencePlane<'_>,
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
+    buffer: &mut InterpBuffer,
 ) -> Result<(), TileSyntaxError> {
     let context = request.context;
-    let mut buffer = [0u8; MAX_INTERP_BUFFER];
     gather_clamped_reference_rect(
         reference,
         request.src_x,
         request.src_y,
         context.width,
         context.height,
-        &mut buffer,
+        buffer,
     )?;
 
     for row in 0..context.height {
@@ -2742,6 +2748,7 @@ fn inter_predict_subpel_unscaled_block(
     request: UnscaledInterPrediction,
     x_filter: &[i16; INTERP_TAPS],
     y_filter: &[i16; INTERP_TAPS],
+    buffer: &mut InterpBuffer,
 ) -> Result<(), TileSyntaxError> {
     let context = request.context;
     let source_left = request
@@ -2760,7 +2767,6 @@ fn inter_predict_subpel_unscaled_block(
         .height
         .checked_add(INTERP_TAPS - 1)
         .ok_or(TileSyntaxError::InvalidBitstream)?;
-    let mut buffer = uninit_interp_buffer();
 
     if reference_rect_inside(
         reference,
@@ -2771,33 +2777,33 @@ fn inter_predict_subpel_unscaled_block(
     )? {
         let left = usize::try_from(source_left).map_err(|_| TileSyntaxError::InvalidBitstream)?;
         let top = usize::try_from(source_top).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_reference_rect_to_uninit(
+        horizontal_filter_reference_rect::<true>(
             reference,
             (left, top),
             (context.width, source_height),
             request.x_phase,
             x_filter,
-            &mut buffer,
+            buffer,
         )?;
     } else {
-        gather_clamped_reference_rect_to_uninit(
+        gather_clamped_reference_rect(
             reference,
             source_left,
             source_top,
             source_width,
             source_height,
-            &mut buffer,
+            buffer,
         )?;
-        horizontal_filter_buffer_in_place_uninit(
+        horizontal_filter_buffer_in_place::<true>(
             context.width,
             source_height,
             request.x_phase,
             x_filter,
-            &mut buffer,
+            buffer,
         )?;
     }
 
-    write_vertical_filtered_block_from_uninit(plane, request, y_filter, &buffer)
+    write_vertical_filtered_block::<true>(plane, request, y_filter, buffer)
 }
 
 #[allow(dead_code)]
@@ -2837,7 +2843,7 @@ fn inter_predict_subpel_unscaled_block_scalar(
     )? {
         let left = usize::try_from(source_left).map_err(|_| TileSyntaxError::InvalidBitstream)?;
         let top = usize::try_from(source_top).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_reference_rect_scalar(
+        horizontal_filter_reference_rect::<false>(
             reference,
             (left, top),
             (context.width, source_height),
@@ -2854,7 +2860,7 @@ fn inter_predict_subpel_unscaled_block_scalar(
             source_height,
             &mut buffer,
         )?;
-        horizontal_filter_buffer_in_place_scalar(
+        horizontal_filter_buffer_in_place::<false>(
             context.width,
             source_height,
             request.x_phase,
@@ -2863,7 +2869,7 @@ fn inter_predict_subpel_unscaled_block_scalar(
         )?;
     }
 
-    write_vertical_filtered_block_scalar(plane, request, y_filter, &buffer)
+    write_vertical_filtered_block::<false>(plane, request, y_filter, &buffer)
 }
 
 fn reference_rect_inside(
@@ -2885,11 +2891,6 @@ fn reference_rect_inside(
         i64::try_from(reference.height).map_err(|_| TileSyntaxError::InvalidBitstream)?;
 
     Ok(left >= 0 && top >= 0 && right <= reference_width && bottom <= reference_height)
-}
-
-#[inline(always)]
-fn uninit_interp_buffer() -> InterpBuffer {
-    [const { MaybeUninit::uninit() }; MAX_INTERP_BUFFER]
 }
 
 fn gather_clamped_reference_rect(
@@ -2942,59 +2943,7 @@ fn gather_clamped_reference_rect(
     Ok(())
 }
 
-fn gather_clamped_reference_rect_to_uninit(
-    reference: ReferencePlane<'_>,
-    left: i32,
-    top: i32,
-    width: usize,
-    height: usize,
-    buffer: &mut InterpBuffer,
-) -> Result<(), TileSyntaxError> {
-    let last_x =
-        i32::try_from(reference.width - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-    let last_y =
-        i32::try_from(reference.height - 1).map_err(|_| TileSyntaxError::InvalidBitstream)?;
-
-    for row in 0..height {
-        let src_y = usize::try_from(clip3(
-            0,
-            last_y,
-            top.checked_add(i32::try_from(row).map_err(|_| TileSyntaxError::InvalidBitstream)?)
-                .ok_or(TileSyntaxError::InvalidBitstream)?,
-        ))
-        .map_err(|_| TileSyntaxError::InvalidBitstream)?;
-        let src_row = src_y
-            .checked_mul(reference.stride)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let dst_row = row
-            .checked_mul(MAX_INTERP_SOURCE_DIM)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        for col in 0..width {
-            let src_x = usize::try_from(clip3(
-                0,
-                last_x,
-                left.checked_add(
-                    i32::try_from(col).map_err(|_| TileSyntaxError::InvalidBitstream)?,
-                )
-                .ok_or(TileSyntaxError::InvalidBitstream)?,
-            ))
-            .map_err(|_| TileSyntaxError::InvalidBitstream)?;
-            let sample_index = src_row
-                .checked_add(src_x)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            buffer[dst_row + col].write(
-                *reference
-                    .data
-                    .get(sample_index)
-                    .ok_or(TileSyntaxError::InvalidBitstream)?,
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn horizontal_filter_reference_rect_to_uninit(
+fn horizontal_filter_reference_rect<const USE_SIMD: bool>(
     reference: ReferencePlane<'_>,
     origin: (usize, usize),
     size: (usize, usize),
@@ -3029,55 +2978,13 @@ fn horizontal_filter_reference_rect_to_uninit(
         let dst = buffer
             .get_mut(dst_start..dst_end)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_row_to_buffer_uninit(src, width, x_phase, filter, dst);
+        horizontal_filter_row_to_buffer::<USE_SIMD>(src, width, x_phase, filter, dst);
     }
 
     Ok(())
 }
 
-#[allow(dead_code)]
-fn horizontal_filter_reference_rect_scalar(
-    reference: ReferencePlane<'_>,
-    origin: (usize, usize),
-    size: (usize, usize),
-    x_phase: usize,
-    filter: &[i16; INTERP_TAPS],
-    buffer: &mut [u8; MAX_INTERP_BUFFER],
-) -> Result<(), TileSyntaxError> {
-    let (left, top) = origin;
-    let (width, height) = size;
-    let source_width = width
-        .checked_add(INTERP_TAPS - 1)
-        .ok_or(TileSyntaxError::InvalidBitstream)?;
-    for row in 0..height {
-        let src_start = top
-            .checked_add(row)
-            .and_then(|y| y.checked_mul(reference.stride))
-            .and_then(|base| base.checked_add(left))
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let src_end = src_start
-            .checked_add(source_width)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let src = reference
-            .data
-            .get(src_start..src_end)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let dst_start = row
-            .checked_mul(MAX_INTERP_SOURCE_DIM)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let dst_end = dst_start
-            .checked_add(width)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let dst = buffer
-            .get_mut(dst_start..dst_end)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_row_to_buffer_scalar(src, width, x_phase, filter, dst);
-    }
-
-    Ok(())
-}
-
-fn horizontal_filter_buffer_in_place_uninit(
+fn horizontal_filter_buffer_in_place<const USE_SIMD: bool>(
     width: usize,
     height: usize,
     x_phase: usize,
@@ -3097,77 +3004,14 @@ fn horizontal_filter_buffer_in_place_uninit(
         let source_row = buffer
             .get_mut(row_start..row_end)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_row_in_place_uninit(source_row, width, x_phase, filter);
-    }
-
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn horizontal_filter_buffer_in_place_scalar(
-    width: usize,
-    height: usize,
-    x_phase: usize,
-    filter: &[i16; INTERP_TAPS],
-    buffer: &mut [u8; MAX_INTERP_BUFFER],
-) -> Result<(), TileSyntaxError> {
-    let source_width = width
-        .checked_add(INTERP_TAPS - 1)
-        .ok_or(TileSyntaxError::InvalidBitstream)?;
-    for row in 0..height {
-        let row_start = row
-            .checked_mul(MAX_INTERP_SOURCE_DIM)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let row_end = row_start
-            .checked_add(source_width)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let source_row = buffer
-            .get_mut(row_start..row_end)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        horizontal_filter_row_in_place_scalar(source_row, width, x_phase, filter);
+        horizontal_filter_row_in_place::<USE_SIMD>(source_row, width, x_phase, filter);
     }
 
     Ok(())
 }
 
 #[inline(always)]
-fn horizontal_filter_row_to_buffer_uninit(
-    src: &[u8],
-    width: usize,
-    x_phase: usize,
-    filter: &[i16; INTERP_TAPS],
-    dst: &mut [MaybeUninit<u8>],
-) {
-    if x_phase == 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr().wrapping_add(3),
-                dst.as_mut_ptr().cast::<u8>(),
-                width,
-            );
-        }
-        return;
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let scalar_start = horizontal_filter_row_to_buffer_simd_uninit(src, width, filter, dst);
-        horizontal_filter_row_to_buffer_scalar_nonzero_uninit(
-            src,
-            filter,
-            dst,
-            scalar_start,
-            width,
-        );
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    horizontal_filter_row_to_buffer_scalar_nonzero_uninit(src, filter, dst, 0, width);
-}
-
-#[inline(always)]
-#[allow(dead_code)]
-fn horizontal_filter_row_to_buffer_scalar(
+fn horizontal_filter_row_to_buffer<const USE_SIMD: bool>(
     src: &[u8],
     width: usize,
     x_phase: usize,
@@ -3175,10 +3019,21 @@ fn horizontal_filter_row_to_buffer_scalar(
     dst: &mut [u8],
 ) {
     if x_phase == 0 {
-        dst.copy_from_slice(&src[3..3 + width]);
+        dst[..width].copy_from_slice(&src[3..3 + width]);
         return;
     }
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let scalar_start = if USE_SIMD {
+            horizontal_filter_row_to_buffer_simd(src, width, filter, dst)
+        } else {
+            0
+        };
+        horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, scalar_start, width);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, 0, width);
 }
 
@@ -3213,62 +3068,7 @@ fn horizontal_filter_row_to_buffer_scalar_nonzero(
 }
 
 #[inline(always)]
-fn horizontal_filter_row_to_buffer_scalar_nonzero_uninit(
-    src: &[u8],
-    filter: &[i16; INTERP_TAPS],
-    dst: &mut [MaybeUninit<u8>],
-    start: usize,
-    end: usize,
-) {
-    let c0 = i32::from(filter[0]);
-    let c1 = i32::from(filter[1]);
-    let c2 = i32::from(filter[2]);
-    let c3 = i32::from(filter[3]);
-    let c4 = i32::from(filter[4]);
-    let c5 = i32::from(filter[5]);
-    let c6 = i32::from(filter[6]);
-    let c7 = i32::from(filter[7]);
-
-    for col in start..end {
-        let sum = c0 * i32::from(src[col])
-            + c1 * i32::from(src[col + 1])
-            + c2 * i32::from(src[col + 2])
-            + c3 * i32::from(src[col + 3])
-            + c4 * i32::from(src[col + 4])
-            + c5 * i32::from(src[col + 5])
-            + c6 * i32::from(src[col + 6])
-            + c7 * i32::from(src[col + 7]);
-        dst[col].write(clip1(round2_i32(sum, 7)));
-    }
-}
-
-#[inline(always)]
-fn horizontal_filter_row_in_place_uninit(
-    row: &mut [MaybeUninit<u8>],
-    width: usize,
-    x_phase: usize,
-    filter: &[i16; INTERP_TAPS],
-) {
-    if x_phase == 0 {
-        unsafe {
-            core::ptr::copy(row.as_ptr().wrapping_add(3), row.as_mut_ptr(), width);
-        }
-        return;
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    {
-        let scalar_start = horizontal_filter_row_in_place_simd_uninit(row, width, filter);
-        horizontal_filter_row_in_place_scalar_nonzero_uninit(row, filter, scalar_start, width);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    horizontal_filter_row_in_place_scalar_nonzero_uninit(row, filter, 0, width);
-}
-
-#[inline(always)]
-#[allow(dead_code)]
-fn horizontal_filter_row_in_place_scalar(
+fn horizontal_filter_row_in_place<const USE_SIMD: bool>(
     row: &mut [u8],
     width: usize,
     x_phase: usize,
@@ -3279,6 +3079,17 @@ fn horizontal_filter_row_in_place_scalar(
         return;
     }
 
+    #[cfg(target_arch = "wasm32")]
+    {
+        let scalar_start = if USE_SIMD {
+            horizontal_filter_row_in_place_simd(row, width, filter)
+        } else {
+            0
+        };
+        horizontal_filter_row_in_place_scalar_nonzero(row, filter, scalar_start, width);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     horizontal_filter_row_in_place_scalar_nonzero(row, filter, 0, width);
 }
 
@@ -3311,36 +3122,7 @@ fn horizontal_filter_row_in_place_scalar_nonzero(
     }
 }
 
-#[inline(always)]
-fn horizontal_filter_row_in_place_scalar_nonzero_uninit(
-    row: &mut [MaybeUninit<u8>],
-    filter: &[i16; INTERP_TAPS],
-    start: usize,
-    end: usize,
-) {
-    let c0 = i32::from(filter[0]);
-    let c1 = i32::from(filter[1]);
-    let c2 = i32::from(filter[2]);
-    let c3 = i32::from(filter[3]);
-    let c4 = i32::from(filter[4]);
-    let c5 = i32::from(filter[5]);
-    let c6 = i32::from(filter[6]);
-    let c7 = i32::from(filter[7]);
-
-    for col in start..end {
-        let sum = c0 * i32::from(unsafe { row[col].assume_init() })
-            + c1 * i32::from(unsafe { row[col + 1].assume_init() })
-            + c2 * i32::from(unsafe { row[col + 2].assume_init() })
-            + c3 * i32::from(unsafe { row[col + 3].assume_init() })
-            + c4 * i32::from(unsafe { row[col + 4].assume_init() })
-            + c5 * i32::from(unsafe { row[col + 5].assume_init() })
-            + c6 * i32::from(unsafe { row[col + 6].assume_init() })
-            + c7 * i32::from(unsafe { row[col + 7].assume_init() });
-        row[col].write(clip1(round2_i32(sum, 7)));
-    }
-}
-
-fn write_vertical_filtered_block_from_uninit(
+fn write_vertical_filtered_block<const USE_SIMD: bool>(
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
     filter: &[i16; INTERP_TAPS],
@@ -3348,14 +3130,15 @@ fn write_vertical_filtered_block_from_uninit(
 ) -> Result<(), TileSyntaxError> {
     #[cfg(target_arch = "wasm32")]
     {
-        write_vertical_filtered_block_simd_from_uninit(plane, request, filter, buffer)
+        if USE_SIMD {
+            return write_vertical_filtered_block_simd(plane, request, filter, buffer);
+        }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    write_vertical_filtered_block_scalar_from_uninit(plane, request, filter, buffer)
+    write_vertical_filtered_block_scalar(plane, request, filter, buffer)
 }
 
-#[allow(dead_code)]
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn write_vertical_filtered_block_scalar(
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
@@ -3419,73 +3202,6 @@ fn write_vertical_filtered_block_scalar(
     Ok(())
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-fn write_vertical_filtered_block_scalar_from_uninit(
-    plane: &mut CurrentPlaneMut<'_>,
-    request: UnscaledInterPrediction,
-    filter: &[i16; INTERP_TAPS],
-    buffer: &InterpBuffer,
-) -> Result<(), TileSyntaxError> {
-    let context = request.context;
-    if request.y_phase == 0 {
-        for row in 0..context.height {
-            let prediction_start = row
-                .checked_add(3)
-                .and_then(|y| y.checked_mul(MAX_INTERP_SOURCE_DIM))
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let prediction_end = prediction_start
-                .checked_add(context.width)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let prediction = buffer
-                .get(prediction_start..prediction_end)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let prediction = unsafe {
-                core::slice::from_raw_parts(prediction.as_ptr().cast::<u8>(), prediction.len())
-            };
-            let dst_y = context
-                .start_y
-                .checked_add(row)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-            write_inter_prediction_row(plane, context.start_x, dst_y, prediction, request.write)?;
-        }
-        return Ok(());
-    }
-
-    let c0 = i32::from(filter[0]);
-    let c1 = i32::from(filter[1]);
-    let c2 = i32::from(filter[2]);
-    let c3 = i32::from(filter[3]);
-    let c4 = i32::from(filter[4]);
-    let c5 = i32::from(filter[5]);
-    let c6 = i32::from(filter[6]);
-    let c7 = i32::from(filter[7]);
-
-    for row in 0..context.height {
-        let dst_y = context
-            .start_y
-            .checked_add(row)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        let Some(dst) = inter_prediction_row_mut(plane, context.start_x, dst_y, context.width)?
-        else {
-            continue;
-        };
-        let row_start = row
-            .checked_mul(MAX_INTERP_SOURCE_DIM)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-
-        vertical_filter_row_scalar_from_uninit(
-            buffer,
-            row_start,
-            (c0, c1, c2, c3, c4, c5, c6, c7),
-            dst,
-            request.write,
-            0,
-        );
-    }
-
-    Ok(())
-}
-
 #[inline(always)]
 fn vertical_filter_row_scalar(
     buffer: &[u8; MAX_INTERP_BUFFER],
@@ -3528,72 +3244,6 @@ fn vertical_filter_row_scalar(
     }
 }
 
-#[inline(always)]
-fn vertical_filter_row_scalar_from_uninit(
-    buffer: &InterpBuffer,
-    row_start: usize,
-    filter: (i32, i32, i32, i32, i32, i32, i32, i32),
-    dst: &mut [u8],
-    write: InterPredictionWrite,
-    start_col: usize,
-) {
-    let (c0, c1, c2, c3, c4, c5, c6, c7) = filter;
-    match write {
-        InterPredictionWrite::Store => {
-            for (col, dst_sample) in dst.iter_mut().enumerate().skip(start_col) {
-                let base = row_start + col;
-                let sum = c0 * i32::from(unsafe { buffer[base].assume_init() })
-                    + c1 * i32::from(unsafe { buffer[base + MAX_INTERP_SOURCE_DIM].assume_init() })
-                    + c2 * i32::from(unsafe {
-                        buffer[base + 2 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c3 * i32::from(unsafe {
-                        buffer[base + 3 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c4 * i32::from(unsafe {
-                        buffer[base + 4 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c5 * i32::from(unsafe {
-                        buffer[base + 5 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c6 * i32::from(unsafe {
-                        buffer[base + 6 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c7 * i32::from(unsafe {
-                        buffer[base + 7 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    });
-                *dst_sample = clip1(round2_i32(sum, 7));
-            }
-        }
-        InterPredictionWrite::Average => {
-            for (col, dst_sample) in dst.iter_mut().enumerate().skip(start_col) {
-                let base = row_start + col;
-                let sum = c0 * i32::from(unsafe { buffer[base].assume_init() })
-                    + c1 * i32::from(unsafe { buffer[base + MAX_INTERP_SOURCE_DIM].assume_init() })
-                    + c2 * i32::from(unsafe {
-                        buffer[base + 2 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c3 * i32::from(unsafe {
-                        buffer[base + 3 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c4 * i32::from(unsafe {
-                        buffer[base + 4 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c5 * i32::from(unsafe {
-                        buffer[base + 5 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c6 * i32::from(unsafe {
-                        buffer[base + 6 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    })
-                    + c7 * i32::from(unsafe {
-                        buffer[base + 7 * MAX_INTERP_SOURCE_DIM].assume_init()
-                    });
-                *dst_sample = avg2(*dst_sample, clip1(round2_i32(sum, 7)));
-            }
-        }
-    }
-}
-
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy)]
 struct WasmInterpCoefficients {
@@ -3626,11 +3276,11 @@ impl WasmInterpCoefficients {
 
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
-fn horizontal_filter_row_to_buffer_simd_uninit(
+fn horizontal_filter_row_to_buffer_simd(
     src: &[u8],
     width: usize,
     filter: &[i16; INTERP_TAPS],
-    dst: &mut [MaybeUninit<u8>],
+    dst: &mut [u8],
 ) -> usize {
     debug_assert!(src.len() >= width + INTERP_TAPS - 1);
     debug_assert!(dst.len() >= width);
@@ -3656,15 +3306,15 @@ fn horizontal_filter_row_to_buffer_simd_uninit(
 
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
-fn horizontal_filter_row_in_place_simd_uninit(
-    row: &mut [MaybeUninit<u8>],
+fn horizontal_filter_row_in_place_simd(
+    row: &mut [u8],
     width: usize,
     filter: &[i16; INTERP_TAPS],
 ) -> usize {
     debug_assert!(row.len() >= width + INTERP_TAPS - 1);
 
     let coeffs = WasmInterpCoefficients::new(filter);
-    let src = row.as_ptr().cast::<u8>();
+    let src = row.as_ptr();
     let dst = row.as_mut_ptr();
     let mut col = 0;
     while col + 8 <= width {
@@ -3686,7 +3336,7 @@ fn horizontal_filter_row_in_place_simd_uninit(
 
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
-fn write_vertical_filtered_block_simd_from_uninit(
+fn write_vertical_filtered_block_simd(
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
     filter: &[i16; INTERP_TAPS],
@@ -3705,9 +3355,6 @@ fn write_vertical_filtered_block_simd_from_uninit(
             let prediction = buffer
                 .get(prediction_start..prediction_end)
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
-            let prediction = unsafe {
-                core::slice::from_raw_parts(prediction.as_ptr().cast::<u8>(), prediction.len())
-            };
             let dst_y = context
                 .start_y
                 .checked_add(row)
@@ -3749,12 +3396,12 @@ fn write_vertical_filtered_block_simd_from_uninit(
             .ok_or(TileSyntaxError::InvalidBitstream)?;
 
         let scalar_start = vertical_filter_row_simd(
-            buffer.as_ptr().wrapping_add(row_start).cast::<u8>(),
+            buffer.as_ptr().wrapping_add(row_start),
             coeffs,
             dst,
             request.write,
         );
-        vertical_filter_row_scalar_from_uninit(
+        vertical_filter_row_scalar(
             buffer,
             row_start,
             scalar_filter,
@@ -8057,11 +7704,11 @@ mod tests {
     use super::{
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
         GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, InterPredictionWrite, IntraMode,
-        IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME, MAX_INTRA_ABOVE, MAX_TX_COEFFS,
-        MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME,
-        NeighborModeInfo, REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane,
-        ResidualBuffers, STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
-        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
+        IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME, MAX_INTERP_BUFFER,
+        MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector,
+        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, ReferenceFrame, ReferenceFrames,
+        ReferencePlane, ResidualBuffers, STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS,
+        SUBPEL_SHIFTS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
         TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
         ZEROMV, add_residual_block, add_residual_block_scalar, inter_predict_sample,
         inter_predict_subpel_unscaled_block, inter_predict_subpel_unscaled_block_scalar,
@@ -8132,6 +7779,7 @@ mod tests {
                                     };
                                     let mut scalar_data = initial_plane;
                                     let mut simd_data = initial_plane;
+                                    let mut simd_buffer = [0; MAX_INTERP_BUFFER];
                                     let mut scalar_plane = CurrentPlaneMut {
                                         data: &mut scalar_data,
                                         width: PLANE_STRIDE,
@@ -8158,6 +7806,7 @@ mod tests {
                                         request,
                                         x_filter,
                                         y_filter,
+                                        &mut simd_buffer,
                                     )?;
 
                                     if scalar_data != simd_data {
@@ -8521,7 +8170,7 @@ mod tests {
 
         {
             let mut current_frame = current_frame_storage.as_current_frame();
-            let parser = TileParser {
+            let mut parser = TileParser {
                 decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
                 probabilities: &probabilities,
                 counts: &mut counts,
@@ -8549,6 +8198,7 @@ mod tests {
                 current_frame_modes: None,
                 reference_frames: Some(ReferenceFrames::new(references)),
                 residual: ResidualBuffers::new(),
+                interp_buffer: [0; MAX_INTERP_BUFFER],
             };
             let mut block = test_block(false);
             block.is_inter = true;
@@ -8647,6 +8297,7 @@ mod tests {
                 current_frame_modes: None,
                 reference_frames: None,
                 residual: ResidualBuffers::new(),
+                interp_buffer: [0; MAX_INTERP_BUFFER],
             };
 
             assert!(
@@ -8702,6 +8353,7 @@ mod tests {
             current_frame_modes: None,
             reference_frames: None,
             residual: ResidualBuffers::new(),
+            interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
         parser
@@ -8758,6 +8410,7 @@ mod tests {
                 current_frame_modes: None,
                 reference_frames: None,
                 residual: ResidualBuffers::new(),
+                interp_buffer: [0; MAX_INTERP_BUFFER],
             };
 
             parser
@@ -8819,6 +8472,7 @@ mod tests {
             current_frame_modes: None,
             reference_frames: None,
             residual: ResidualBuffers::new(),
+            interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
         parser
@@ -8948,6 +8602,7 @@ mod tests {
             current_frame_modes: None,
             reference_frames: None,
             residual: ResidualBuffers::new(),
+            interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
         assert_eq!(
@@ -8987,6 +8642,7 @@ mod tests {
             current_frame_modes: None,
             reference_frames: None,
             residual: ResidualBuffers::new(),
+            interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
         assert_eq!(
@@ -9096,6 +8752,7 @@ mod tests {
                 current_frame_modes: Some(current_frame_modes),
                 reference_frames: None,
                 residual: ResidualBuffers::new(),
+                interp_buffer: [0; MAX_INTERP_BUFFER],
             };
             let mut block = test_block(true);
             block.segment_id = 0;
@@ -9182,6 +8839,7 @@ mod tests {
             current_frame_modes: Some(current_modes),
             reference_frames: None,
             residual: ResidualBuffers::new(),
+            interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
         let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();
