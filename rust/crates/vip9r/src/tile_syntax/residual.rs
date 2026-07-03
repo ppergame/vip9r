@@ -318,6 +318,10 @@ impl DequantizedCoefficients {
         width: usize,
         nonzero_row_mask: u32,
     ) -> Result<(), TileSyntaxError> {
+        if self.block.tx_type == TxType::DctDct {
+            return self.inverse_transform_2d_dct_dct_simd_i16(n, width, nonzero_row_mask);
+        }
+
         let row_transform = if row_transform_is_dct(self.block.tx_type) {
             InverseTransform1d::Dct
         } else {
@@ -331,6 +335,203 @@ impl DequantizedCoefficients {
 
         self.inverse_transform_rows_simd(n, width, nonzero_row_mask, row_transform)?;
         self.inverse_transform_columns_simd(n, width, column_transform)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_2d_dct_dct_simd_i16(
+        &mut self,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        self.inverse_transform_rows_dct_dct_simd_i16(n, width, nonzero_row_mask)?;
+        self.inverse_transform_columns_dct_dct_simd_i16(n, width)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_rows_dct_dct_simd_i16(
+        &mut self,
+        n: usize,
+        width: usize,
+        nonzero_row_mask: u32,
+    ) -> Result<(), TileSyntaxError> {
+        let active_rows = width.min(u32::BITS as usize - nonzero_row_mask.leading_zeros() as usize);
+        let mut rows = [0usize; SIMD_DCT_I16_LANES];
+        let mut row_count = 0usize;
+
+        for row in 0..active_rows {
+            if nonzero_row_mask & (1u32 << row) == 0 {
+                continue;
+            }
+
+            rows[row_count] = row;
+            row_count += 1;
+            if row_count == SIMD_DCT_I16_LANES {
+                self.inverse_transform_row_group_dct_dct_simd_i16(n, width, rows)?;
+                row_count = 0;
+            }
+        }
+
+        if row_count >= SIMD_TRANSFORM_LANES {
+            self.inverse_transform_row_half_group_dct_dct_simd_i16(
+                n,
+                width,
+                [rows[0], rows[1], rows[2], rows[3]],
+            )?;
+            rows.copy_within(SIMD_TRANSFORM_LANES..row_count, 0);
+            row_count -= SIMD_TRANSFORM_LANES;
+        }
+
+        // Rows left over after the eight-lane and optional four-lane i16
+        // groups use the same scalar tail policy as the four-lane SIMD driver.
+        // The DCT reads exactly `width` entries and the brev-fused gather
+        // overwrites every entry it reads.
+        let t = &mut self.dct_scalar_scratch;
+        let coefficients = &mut self.coefficients;
+        for &row in rows.iter().take(row_count) {
+            for col in 0..width {
+                t[brev(n, col)] = coefficients[row * width + col];
+            }
+            inverse_dct(t, n)?;
+            for (col, value) in t.iter().take(width).copied().enumerate() {
+                coefficients[row * width + col] = value;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_row_half_group_dct_dct_simd_i16(
+        &mut self,
+        n: usize,
+        width: usize,
+        rows: [usize; SIMD_TRANSFORM_LANES],
+    ) -> Result<(), TileSyntaxError> {
+        let t = &mut self.dct_simd_scratch;
+        let coefficients = &mut self.coefficients;
+
+        // Same i16 DCT kernel as full groups, with only the low four lanes
+        // populated. This recovers the old four-row SIMD tail for common 4x4
+        // DCT_DCT blocks while keeping the full eight-lane path dominant.
+        for col in 0..width {
+            let lo = i32x4_from_lanes(
+                coefficients[rows[0] * width + col],
+                coefficients[rows[1] * width + col],
+                coefficients[rows[2] * width + col],
+                coefficients[rows[3] * width + col],
+            );
+            t[brev(n, col)] = i16x8_narrow_i32x4(lo, i32x4_splat(0));
+        }
+        inverse_dct_simd_i16(t, n)?;
+
+        for (col, &values) in t.iter().take(width).enumerate() {
+            let lo = i32x4_extend_low_i16x8(values);
+            coefficients[rows[0] * width + col] = i32x4_extract_lane::<0>(lo);
+            coefficients[rows[1] * width + col] = i32x4_extract_lane::<1>(lo);
+            coefficients[rows[2] * width + col] = i32x4_extract_lane::<2>(lo);
+            coefficients[rows[3] * width + col] = i32x4_extract_lane::<3>(lo);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_row_group_dct_dct_simd_i16(
+        &mut self,
+        n: usize,
+        width: usize,
+        rows: [usize; SIMD_DCT_I16_LANES],
+    ) -> Result<(), TileSyntaxError> {
+        let t = &mut self.dct_simd_scratch;
+        let coefficients = &mut self.coefficients;
+
+        // Gather i32 coefficients into signed i16 lanes. For conforming VP9
+        // bitstreams these are the first T-array writes and must fit i16 at
+        // 8-bit depth; saturating narrow keeps malformed streams defined.
+        for col in 0..width {
+            let lo = i32x4_from_lanes(
+                coefficients[rows[0] * width + col],
+                coefficients[rows[1] * width + col],
+                coefficients[rows[2] * width + col],
+                coefficients[rows[3] * width + col],
+            );
+            let hi = i32x4_from_lanes(
+                coefficients[rows[4] * width + col],
+                coefficients[rows[5] * width + col],
+                coefficients[rows[6] * width + col],
+                coefficients[rows[7] * width + col],
+            );
+            t[brev(n, col)] = i16x8_narrow_i32x4(lo, hi);
+        }
+        inverse_dct_simd_i16(t, n)?;
+
+        for (col, &values) in t.iter().take(width).enumerate() {
+            let lo = i32x4_extend_low_i16x8(values);
+            let hi = i32x4_extend_high_i16x8(values);
+            coefficients[rows[0] * width + col] = i32x4_extract_lane::<0>(lo);
+            coefficients[rows[1] * width + col] = i32x4_extract_lane::<1>(lo);
+            coefficients[rows[2] * width + col] = i32x4_extract_lane::<2>(lo);
+            coefficients[rows[3] * width + col] = i32x4_extract_lane::<3>(lo);
+            coefficients[rows[4] * width + col] = i32x4_extract_lane::<0>(hi);
+            coefficients[rows[5] * width + col] = i32x4_extract_lane::<1>(hi);
+            coefficients[rows[6] * width + col] = i32x4_extract_lane::<2>(hi);
+            coefficients[rows[7] * width + col] = i32x4_extract_lane::<3>(hi);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn inverse_transform_columns_dct_dct_simd_i16(
+        &mut self,
+        n: usize,
+        width: usize,
+    ) -> Result<(), TileSyntaxError> {
+        let final_shift = core::cmp::min(6, n + 2);
+        let t = &mut self.dct_simd_scratch;
+        let coefficients = &mut self.coefficients;
+
+        if width == 4 {
+            // 4x4 DCT_DCT has no full eight-column group. Use the low half of
+            // one i16x8 group and keep the high lanes zero/stale-unused.
+            for row in 0..width {
+                t[brev(n, row)] = i16x8_narrow_i32x4(
+                    load_i32x4(coefficients.as_ptr().wrapping_add(row * width)),
+                    i32x4_splat(0),
+                );
+            }
+            inverse_dct_simd_i16(t, n)?;
+
+            for (row, &values) in t.iter().take(width).enumerate() {
+                let values = round_shift_i16x8_low_to_i32x4(values, final_shift);
+                store_i32x4(coefficients.as_mut_ptr().wrapping_add(row * width), values);
+            }
+            return Ok(());
+        }
+
+        for col in (0..width).step_by(SIMD_DCT_I16_LANES) {
+            // Gather this eight-column group directly into bit-reversed DCT
+            // input order. All entries read by the i16 SIMD DCT are
+            // overwritten here.
+            for row in 0..width {
+                let row_base = coefficients.as_ptr().wrapping_add(row * width + col);
+                t[brev(n, row)] = i16x8_narrow_i32x4(
+                    load_i32x4(row_base),
+                    load_i32x4(row_base.wrapping_add(SIMD_TRANSFORM_LANES)),
+                );
+            }
+            inverse_dct_simd_i16(t, n)?;
+
+            for (row, &values) in t.iter().take(width).enumerate() {
+                let (lo, hi) = round_shift_i16x8_to_i32x4(values, final_shift);
+                let row_base = coefficients.as_mut_ptr().wrapping_add(row * width + col);
+                store_i32x4(row_base, lo);
+                store_i32x4(row_base.wrapping_add(SIMD_TRANSFORM_LANES), hi);
+            }
+        }
+
+        Ok(())
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -669,6 +870,8 @@ pub(super) const fn coefficient_count(tx_size: TxSize) -> usize {
 const MAX_TX_WIDTH: usize = 32;
 #[cfg(target_arch = "wasm32")]
 const SIMD_TRANSFORM_LANES: usize = 4;
+#[cfg(target_arch = "wasm32")]
+const SIMD_DCT_I16_LANES: usize = 8;
 
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy)]
@@ -803,6 +1006,28 @@ fn store_i32x4(dst: *mut i32, value: v128) {
 
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
+fn round_shift_i32x4_i16_domain(value: v128, bits: usize) -> v128 {
+    let rounding = i32x4_splat(1i32 << (bits - 1));
+    i32x4_shr(i32x4_add(value, rounding), bits as u32)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_shift_i16x8_to_i32x4(value: v128, bits: usize) -> (v128, v128) {
+    (
+        round_shift_i32x4_i16_domain(i32x4_extend_low_i16x8(value), bits),
+        round_shift_i32x4_i16_domain(i32x4_extend_high_i16x8(value), bits),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_shift_i16x8_low_to_i32x4(value: v128, bits: usize) -> v128 {
+    round_shift_i32x4_i16_domain(i32x4_extend_low_i16x8(value), bits)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
 fn pack_i64x2_low_i32s(lo: v128, hi: v128) -> v128 {
     i32x4_shuffle::<0, 2, 4, 6>(lo, hi)
 }
@@ -885,6 +1110,65 @@ fn h_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     let y = t[y_index];
     t[x_index] = i32x4_add(x, y);
     t[y_index] = i32x4_sub(x, y);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn b_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, flip: bool) {
+    let ta = t[a];
+    let tb = t[b_index];
+    let cos = i16x8_splat(cos64(angle) as i16);
+    let sin = i16x8_splat(sin64(angle) as i16);
+
+    let x_lo = round_shift_i32x4_i16_domain(
+        i32x4_sub(
+            i32x4_extmul_low_i16x8(ta, cos),
+            i32x4_extmul_low_i16x8(tb, sin),
+        ),
+        14,
+    );
+    let x_hi = round_shift_i32x4_i16_domain(
+        i32x4_sub(
+            i32x4_extmul_high_i16x8(ta, cos),
+            i32x4_extmul_high_i16x8(tb, sin),
+        ),
+        14,
+    );
+    let y_lo = round_shift_i32x4_i16_domain(
+        i32x4_add(
+            i32x4_extmul_low_i16x8(ta, sin),
+            i32x4_extmul_low_i16x8(tb, cos),
+        ),
+        14,
+    );
+    let y_hi = round_shift_i32x4_i16_domain(
+        i32x4_add(
+            i32x4_extmul_high_i16x8(ta, sin),
+            i32x4_extmul_high_i16x8(tb, cos),
+        ),
+        14,
+    );
+
+    let x = i16x8_narrow_i32x4(x_lo, x_hi);
+    let y = i16x8_narrow_i32x4(y_lo, y_hi);
+
+    if flip {
+        t[a] = y;
+        t[b_index] = x;
+    } else {
+        t[a] = x;
+        t[b_index] = y;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn h_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
+    let (x_index, y_index) = if flip { (b_index, a) } else { (a, b_index) };
+    let x = t[x_index];
+    let y = t[y_index];
+    t[x_index] = i16x8_add(x, y);
+    t[y_index] = i16x8_sub(x, y);
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1152,6 +1436,88 @@ fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSy
 
     for i in 0..n1 {
         h_simd(t, i, n0 - 1 - i, false);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn inverse_dct_simd_i16(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
+    if !(2..=5).contains(&n) {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let n0 = 1usize << n;
+    let n1 = 1usize << (n - 1);
+    let n2 = 1usize << (n - 2);
+
+    if n == 2 {
+        b_simd_i16(t, 0, 1, 16, true);
+    } else {
+        inverse_dct_simd_i16(t, n - 1)?;
+    }
+
+    for i in 0..n2 {
+        b_simd_i16(t, n1 + i, n0 - 1 - i, 32 - brev(5, n1 + i) as i32, false);
+    }
+
+    if n >= 3 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..n3 {
+            for j in 0..=1 {
+                h_simd_i16(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
+            }
+        }
+    }
+
+    if n == 5 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..=1 {
+            for j in 0..=1 {
+                b_simd_i16(
+                    t,
+                    n0 - n + 3 - n2 * j - 4 * i,
+                    n1 + n - 4 + n2 * j + 4 * i,
+                    28 - 16 * i as i32 + 56 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..=1 {
+            for j in 0..=3 {
+                h_simd_i16(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0);
+            }
+        }
+    }
+
+    if n >= 4 {
+        for i in 0..=usize::from(n == 5) {
+            for j in 0..=1 {
+                b_simd_i16(
+                    t,
+                    n0 - n + 2 - i - n2 * j,
+                    n1 + n - 3 + i + n2 * j,
+                    24 + 48 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..=(2 * n - 7) {
+            for j in 0..=1 {
+                h_simd_i16(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0);
+            }
+        }
+    }
+
+    if n >= 3 {
+        let n3 = 1usize << (n - 3);
+        for i in 0..n3 {
+            b_simd_i16(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
+        }
+    }
+
+    for i in 0..n1 {
+        h_simd_i16(t, i, n0 - 1 - i, false);
     }
 
     Ok(())
@@ -1706,9 +2072,15 @@ mod tests {
         let mut block =
             DequantizedCoefficients::new(TransformBlock::new(0, (0, 0), tx_size, tx_type), count);
         // Exercise realistic dequantized magnitudes without going anywhere near
-        // raw i32 extremes. This spans roughly a medium coefficient multiplied
-        // by the largest 8-bit AC dequantizer.
-        let limit = AC_QLOOKUP_8BIT[255] * 32;
+        // raw i32 extremes. DCT_DCT now uses the spec-licensed i16 T-array
+        // domain, so keep that sweep inside a conforming range; mixed/ADST
+        // paths still use the wider i32 S-array path and retain the historical
+        // stress range.
+        let limit = if tx_type == TxType::DctDct {
+            1024
+        } else {
+            AC_QLOOKUP_8BIT[255] * 32
+        };
 
         match pattern {
             TransformPattern::SingleCoeff => {

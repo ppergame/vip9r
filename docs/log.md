@@ -802,3 +802,29 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   Compliance 307/307, 95/95 tests host+device, validates incl.
   quantizer-00 and quantizer-63. Scalar `inverse_adst` disappeared
   from the device profile (`inverse_adst_simd` now ~1.1-1.4%).
+
+## 2026-07-03 — A55 campaign: i16-domain DCT
+
+- The last big idea in the tank, licensed by the spec rather than by
+  libvpx folklore: the bitstream spec makes it a conformance
+  requirement that every value written into the transform array T —
+  and the H butterfly's unrounded v/w — fits 8 + BitDepth bits
+  (spec md, lines 4362/4391/4426/4442), i.e. signed 16-bit for the
+  8-bit streams vip9r decodes. So DCT_DCT moves from 4-lane i32
+  groups to 8-lane i16 groups. Exactness preserved by construction:
+  rotation butterflies widen i16→i32 with extmul, accumulate and
+  round the *sum* once at 14 bits (q15mulr was rejected up front —
+  it double-rounds per product and diverges ±1 from the scalar
+  reference), H stays wrapping i16 add/sub, saturating narrows can
+  only fire on non-conforming streams. ADST keeps the i32 path — its
+  S array is spec-designated higher precision. Row tails: 4-lane i16
+  half-group for 4..7 leftovers (a scalar-only tail measured as a
+  BBB loss and was fixed), scalar below that.
+- A55 jellyfish **−5.4%** grinder / **−4.0%** confirm (spreads
+  ≤0.8%), BBB neutral (its 4x4-heavy mix lives in tails and token
+  decode, not group throughput). Compliance 307/307 — including
+  quantizer-63, which supplies the real high-magnitude coverage that
+  random sweeps structurally cannot (arbitrary vectors at high
+  magnitude violate the very conformance bound that licenses i16).
+  Sweep test's DctDct input range scoped to conforming magnitudes
+  accordingly; 95/95 tests host+device.

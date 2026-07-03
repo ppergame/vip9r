@@ -346,6 +346,18 @@ shrank; traversal glue and intra prediction were promoted.
       −2.3% (spread 0.4%), anchors null. Scalar adst symbol gone
       from profile. Residue: adst kernels re-introduce small zeroed
       scratch copies (rare path, ≤0.3% total, candidate micro)
+- [x] P-i16dct — i16-domain DCT_DCT inverse transform, 8 lanes per
+      group. Spec-licensed: bitstream conformance requires all
+      T-array values (and H's v/w) to fit 8+BitDepth bits
+      (spec:4362/4391/4426/4442) = i16 at depth 8. Butterflies keep
+      exact single-rounding via i32x4_extmul accumulation (q15mulr
+      double-rounding explicitly rejected); saturating narrows only
+      reachable off-conformance; ADST/mixed/lossless untouched (S
+      array is spec-"higher precision"). 8-lane groups + 4-lane i16
+      half-group tail + scalar 1-3-row tail. A55 jellyfish −5.4%
+      grinder / −4.0% confirm (spreads ≤0.8%), BBB neutral. Sweep
+      DctDct range scoped to conforming magnitudes; corpus
+      (incl. quantizer-63) owns high-range coverage
 - [x] icache layout experiment — measured null, NOT merged: the one
       clean cold-outline shrank decode_residual 140.7→135.0KB arm32,
       bench noise on both clips. L1I cost is per-block phase cycling
