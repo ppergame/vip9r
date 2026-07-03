@@ -8,6 +8,7 @@
     "dev": "vite",
     "build:wasm-driver": "vite build --config vite.wasm-driver.config.ts",
     "build:web": "vite build",
+    "citygen:decant": "python3 ../scripts/citygen-decant.py",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && tsc -p tsconfig.node.json"
   },

@@ -57,27 +57,6 @@
         border-radius: 4px;
         padding: 0.25rem 0.75rem;
       }
-      button#decant {
-        background: #2e5db3;
-        border-color: #2e5db3;
-        color: #fff;
-      }
-      #status {
-        margin-top: 0.75rem;
-        font-family: ui-monospace, monospace;
-        font-size: 0.85rem;
-        min-height: 1.2rem;
-        white-space: pre-wrap;
-      }
-      #status.error {
-        color: #ff7b72;
-      }
-      video#result-video {
-        width: 100%;
-        margin-top: 0.75rem;
-        border: 1px solid #33363c;
-        background: #000;
-      }
       #controls {
         flex: 0 0 21rem;
         display: flex;
@@ -96,15 +75,6 @@
         font-family: ui-monospace, monospace;
         color: #9a9da3;
       }
-      #controls .divider {
-        margin-top: 0.75rem;
-        padding-top: 0.5rem;
-        border-top: 1px solid #33363c;
-        color: #9a9da3;
-        font-size: 0.8rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-      }
       input[type="range"] {
         width: 100%;
         accent-color: #2e5db3;
@@ -122,10 +92,7 @@
         <div class="buttons">
           <button id="pause">pause</button>
           <button id="restart">restart</button>
-          <button id="decant">decant webm</button>
         </div>
-        <div id="status"></div>
-        <video id="result-video" controls hidden></video>
       </div>
       <div id="controls"></div>
     </main>

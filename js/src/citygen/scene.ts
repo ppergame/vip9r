@@ -600,7 +600,17 @@ void main() {
 `;
 
 export type Scene = {
+  info: WebGlInfo;
   render(time: number, params: SceneParams, samples?: number): void;
+};
+
+export type WebGlInfo = {
+  renderer: string;
+  vendor: string;
+  unmaskedRenderer: string | null;
+  unmaskedVendor: string | null;
+  version: string;
+  shadingLanguageVersion: string;
 };
 
 export function createScene(canvas: HTMLCanvasElement): Scene {
@@ -643,8 +653,25 @@ export function createScene(canvas: HTMLCanvasElement): Scene {
   const frameLoc = uniform("u_frame");
   const samplesLoc = uniform("u_samples");
   const paramLocs = PARAM_KEYS.map((key) => uniform(`u_${key}`));
+  const debugInfo = gl.getExtension("WEBGL_debug_renderer_info");
 
   return {
+    info: {
+      renderer: gl.getParameter(gl.RENDERER) as string,
+      vendor: gl.getParameter(gl.VENDOR) as string,
+      unmaskedRenderer:
+        debugInfo === null
+          ? null
+          : (gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) as string),
+      unmaskedVendor:
+        debugInfo === null
+          ? null
+          : (gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) as string),
+      version: gl.getParameter(gl.VERSION) as string,
+      shadingLanguageVersion: gl.getParameter(
+        gl.SHADING_LANGUAGE_VERSION,
+      ) as string,
+    },
     // samples: 2x2 supersampling rays per pixel (1 = fast preview, 4 = decant).
     render(time: number, params: SceneParams, samples = 1): void {
       gl.viewport(0, 0, canvas.width, canvas.height);

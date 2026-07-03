@@ -72,6 +72,7 @@ export default defineConfig({
       input: {
         index: path.join(repoRoot, "js/index.html"),
         citygen: path.join(repoRoot, "js/citygen.html"),
+        citygenDecant: path.join(repoRoot, "js/citygen-decant.html"),
       },
     },
   },
