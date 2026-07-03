@@ -649,3 +649,31 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   no-op anchor. The A/B split shows the buffer + chunked write-out
   carries nearly all of the BBB win; the mode kernels add ~1% more on
   jellyfish. Compliance corpus 307/307, 91/91 tests host+device.
+
+## 2026-07-03 — A55 campaign: loop filter simd + a V8 arm32 codegen bug
+
+- Post-P-intra profiles put `loop_filter_frame` at 18.9% (jellyfish) /
+  8.6% (BBB), the largest discrete target left. The retry avoided the
+  X4 attempt's failure mode by construction: pass-1 (horizontal edges)
+  filters adjacent columns with shared decisions, so the Tx4x4 narrow
+  filter vectorizes over 8 u8 lanes with zero transposes; pass 0 and
+  the wide filters stay scalar. Vector decision prechecks alone
+  measured *positive* (slower) on both clips and were dropped.
+- The grinder's 8-lane kernel passed the sweep test on host but failed
+  on device, and it shipped a half-width 4+4 workaround that gave up
+  most of the win after blaming i16 shifts and high-half extends. An
+  orchestrator repro proved those ops correct on device; a lane-uniform
+  bisect of the full kernel then produced the fingerprint: output lanes
+  4..7 corrupted to 128+{16,32,64,128} — the powers-of-two lane
+  constant that **V8's arm32 `i16x8_bitmask` lowering materializes,
+  leaking into the aliased high D-half of a live Q register under
+  register pressure**. Same wasm is correct on x64. Replacing the
+  early-out with `v128_any_true` (no lane constant, and semantically
+  what the check wants) fixes the kernel at full width; the noted
+  constraint lives next to the code.
+- Merged the corrected 8-lane kernel: A55 jellyfish −2.1% (grinder
+  measurement of the equivalent kernel) with −1.5%/−0.6% confirm runs
+  at ~0.7-1.0% spreads, BBB neutral. Compliance 307/307, 93/93 tests
+  host+device, validates incl. tile-4x1 and 66x66. Portable-simd
+  lesson for the campaign: prefer `v128_any_true`/`v128_all_true` over
+  `*_bitmask` for emptiness checks in register-heavy arm32 kernels.

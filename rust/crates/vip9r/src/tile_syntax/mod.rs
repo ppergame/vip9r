@@ -5269,6 +5269,13 @@ fn loop_filter_segment(
                 .checked_mul(plane.stride)
                 .and_then(|row| row.checked_add(x))
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
+            #[cfg(target_arch = "wasm32")]
+            if len == 8
+                && filter_size == TxSize::Tx4x4
+                && loop_filter_tx4x4_horizontal_8(plane.data, base, plane.stride, strength)
+            {
+                return Ok(());
+            }
             for _ in 0..len {
                 sample_filter_direct(plane.data, base, plane.stride, filter_size, strength);
                 base = base
@@ -5299,6 +5306,170 @@ fn loop_filter_segment(
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn loop_filter_tx4x4_horizontal_8(
+    data: &mut [u8],
+    base: usize,
+    stride: usize,
+    strength: LoopFilterStrength,
+) -> bool {
+    let q0 = load_loop_filter_row_8(data, base);
+    let q1 = load_loop_filter_row_8(data, base + stride);
+    let q2 = load_loop_filter_row_8(data, base + 2 * stride);
+    let q3 = load_loop_filter_row_8(data, base + 3 * stride);
+    let p0 = load_loop_filter_row_8(data, base - stride);
+    let p1 = load_loop_filter_row_8(data, base - 2 * stride);
+    let p2 = load_loop_filter_row_8(data, base - 3 * stride);
+    let p3 = load_loop_filter_row_8(data, base - 4 * stride);
+
+    let q0s = signed_sample_i16x8(q0);
+    let q1s = signed_sample_i16x8(q1);
+    let q2s = signed_sample_i16x8(q2);
+    let q3s = signed_sample_i16x8(q3);
+    let p0s = signed_sample_i16x8(p0);
+    let p1s = signed_sample_i16x8(p1);
+    let p2s = signed_sample_i16x8(p2);
+    let p3s = signed_sample_i16x8(p3);
+
+    let limit = i16x8_splat(i16::from(strength.limit));
+    let p3p2 = abs_diff_i16x8(p3s, p2s);
+    let p2p1 = abs_diff_i16x8(p2s, p1s);
+    let p1p0 = abs_diff_i16x8(p1s, p0s);
+    let q1q0 = abs_diff_i16x8(q1s, q0s);
+    let q2q1 = abs_diff_i16x8(q2s, q1s);
+    let q3q2 = abs_diff_i16x8(q3s, q2s);
+    let p0q0 = abs_diff_i16x8(p0s, q0s);
+    let p1q1 = abs_diff_i16x8(p1s, q1s);
+
+    let mut masked = i16x8_gt(p3p2, limit);
+    masked = v128_or(masked, i16x8_gt(p2p1, limit));
+    masked = v128_or(masked, i16x8_gt(p1p0, limit));
+    masked = v128_or(masked, i16x8_gt(q1q0, limit));
+    masked = v128_or(masked, i16x8_gt(q2q1, limit));
+    masked = v128_or(masked, i16x8_gt(q3q2, limit));
+
+    let edge = i16x8_add(i16x8_shl(p0q0, 1), u16x8_shr(p1q1, 1));
+    masked = v128_or(
+        masked,
+        i16x8_gt(edge, i16x8_splat(i16::from(strength.blimit))),
+    );
+
+    let filter = v128_not(masked);
+    // v128_any_true, not i16x8_bitmask: V8's arm32 bitmask lowering
+    // materializes a powers-of-two lane constant that can clobber the aliased
+    // high D-half of a live Q register under pressure, miscompiling this
+    // kernel (lanes 4..7 corrupted). See docs/log.md 2026-07-03.
+    if !v128_any_true(filter) {
+        return true;
+    }
+
+    let thresh = i16x8_splat(i16::from(strength.thresh));
+    let hev = v128_or(i16x8_gt(p1p0, thresh), i16x8_gt(q1q0, thresh));
+    let signed_offset = i16x8_splat(128);
+    let ps1 = p1s;
+    let ps0 = p0s;
+    let qs0 = q0s;
+    let qs1 = q1s;
+
+    let hev_filter = v128_bitselect(
+        filter4_clamp_i16x8(i16x8_sub(ps1, qs1)),
+        i16x8_splat(0),
+        hev,
+    );
+    let qs0_ps0 = i16x8_sub(qs0, ps0);
+    let filter_value = filter4_clamp_i16x8(i16x8_add(
+        hev_filter,
+        i16x8_add(i16x8_add(qs0_ps0, qs0_ps0), qs0_ps0),
+    ));
+    let filter1 = i16x8_shr(
+        filter4_clamp_i16x8(i16x8_add(filter_value, i16x8_splat(4))),
+        3,
+    );
+    let filter2 = i16x8_shr(
+        filter4_clamp_i16x8(i16x8_add(filter_value, i16x8_splat(3))),
+        3,
+    );
+
+    let oq0 = i16x8_add(filter4_clamp_i16x8(i16x8_sub(qs0, filter1)), signed_offset);
+    let op0 = i16x8_add(filter4_clamp_i16x8(i16x8_add(ps0, filter2)), signed_offset);
+    let zero = i16x8_splat(0);
+    let filter_bytes = i16x8_mask_to_u8x8(filter);
+    store_loop_filter_row_8(
+        data,
+        base,
+        v128_bitselect(u8x16_narrow_i16x8(oq0, zero), q0, filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base - stride,
+        v128_bitselect(u8x16_narrow_i16x8(op0, zero), p0, filter_bytes),
+    );
+
+    let filter1_round = i16x8_shr(i16x8_add(filter1, i16x8_splat(1)), 1);
+    let oq1 = i16x8_add(
+        filter4_clamp_i16x8(i16x8_sub(qs1, filter1_round)),
+        signed_offset,
+    );
+    let op1 = i16x8_add(
+        filter4_clamp_i16x8(i16x8_add(ps1, filter1_round)),
+        signed_offset,
+    );
+    let p1q1_filter_bytes = i16x8_mask_to_u8x8(v128_and(filter, v128_not(hev)));
+    store_loop_filter_row_8(
+        data,
+        base + stride,
+        v128_bitselect(u8x16_narrow_i16x8(oq1, zero), q1, p1q1_filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base - 2 * stride,
+        v128_bitselect(u8x16_narrow_i16x8(op1, zero), p1, p1q1_filter_bytes),
+    );
+
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn load_loop_filter_row_8(data: &[u8], offset: usize) -> v128 {
+    unsafe { v128_load64_zero(data.as_ptr().add(offset).cast::<u64>()) }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn store_loop_filter_row_8(data: &mut [u8], offset: usize, value: v128) {
+    unsafe { v128_store64_lane::<0>(value, data.as_mut_ptr().add(offset).cast::<u64>()) };
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn signed_sample_i16x8(samples: v128) -> v128 {
+    // Convert u8 samples to the signed VP9 loop-filter domain (sample - 128)
+    // without a separate subtract.
+    i16x8_extend_low_i8x16(v128_xor(samples, u8x16_splat(0x80)))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn abs_diff_i16x8(a: v128, b: v128) -> v128 {
+    i16x8_abs(i16x8_sub(a, b))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn filter4_clamp_i16x8(value: v128) -> v128 {
+    i16x8_min(i16x8_max(value, i16x8_splat(-128)), i16x8_splat(127))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn i16x8_mask_to_u8x8(mask: v128) -> v128 {
+    // The blend mask is held as i16 lanes. Pick each lane's low byte so every
+    // stored u8 column gets 0xff for true and 0x00 for false.
+    u8x16_shuffle::<0, 2, 4, 6, 8, 10, 12, 14, 16, 16, 16, 16, 16, 16, 16, 16>(mask, i16x8_splat(0))
 }
 
 #[inline(always)]
@@ -8080,22 +8251,29 @@ mod tests {
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
         GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, InterPredictionWrite, IntraMode,
         IntraPredictionBuffers, IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME,
-        MAX_INTERP_BUFFER, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView,
-        ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS,
-        ReferenceFrame, ReferenceFrames, ReferencePlane, ResidualBuffers, STORED_MODE_INFO_BYTES,
-        SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion,
-        StoredModeInfo, TileModeContexts, TileParseBuffers, TileParser, TileSyntaxError, TxSize,
-        TxType, UnscaledInterPrediction, ZEROMV, add_residual_block, add_residual_block_scalar,
-        inter_predict_sample, inter_predict_subpel_unscaled_block,
-        inter_predict_subpel_unscaled_block_scalar, intra_predict_block,
-        intra_predict_block_scalar, parse_intra_tiles, read_coef, scan_table, select_inter_mv,
-        transform_width, write_common_intra_prediction_direct, write_prediction_block_scalar,
+        LoopFilterStrength, MAX_INTERP_BUFFER, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH,
+        ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
+        REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, ResidualBuffers,
+        STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
+        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
+        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
+        ZEROMV, add_residual_block, add_residual_block_scalar, inter_predict_sample,
+        inter_predict_subpel_unscaled_block, inter_predict_subpel_unscaled_block_scalar,
+        intra_predict_block, intra_predict_block_scalar, loop_filter_segment, parse_intra_tiles,
+        read_coef, sample_filter_direct, scan_table, select_inter_mv, transform_width,
+        write_common_intra_prediction_direct, write_prediction_block_scalar,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
     use crate::header::{FrameType, LoopFilterParams, UncompressedFrameHeader};
     use crate::probability::{FrameContext, SyntaxCounts};
     use crate::tile::parse_tile_layout;
+
+    const LOOP_FILTER_TEST_STRIDE: usize = 32;
+    const LOOP_FILTER_TEST_WIDTH: usize = 24;
+    const LOOP_FILTER_TEST_HEIGHT: usize = 32;
+    const LOOP_FILTER_TEST_X: usize = 8;
+    const LOOP_FILTER_TEST_Y: usize = 16;
 
     #[test]
     fn simd_subpel_convolution_matches_scalar_reference() -> Result<(), TileSyntaxError> {
@@ -8209,6 +8387,91 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn horizontal_loop_filter_segment_matches_scalar_reference() -> Result<(), TileSyntaxError> {
+        const FILTER_SIZES: [TxSize; 4] = [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ];
+        const LENS: [usize; 4] = [1, 4, 7, 8];
+        const STRENGTHS: [LoopFilterStrength; 4] = [
+            LoopFilterStrength {
+                lvl: 1,
+                limit: 1,
+                blimit: 3,
+                thresh: 0,
+            },
+            LoopFilterStrength {
+                lvl: 16,
+                limit: 4,
+                blimit: 40,
+                thresh: 1,
+            },
+            LoopFilterStrength {
+                lvl: 32,
+                limit: 16,
+                blimit: 96,
+                thresh: 2,
+            },
+            LoopFilterStrength {
+                lvl: 63,
+                limit: 63,
+                blimit: 193,
+                thresh: 3,
+            },
+        ];
+
+        let mut seed = 0x53a9_1f2du32;
+        for filter_size in FILTER_SIZES {
+            for strength in STRENGTHS {
+                for len in LENS {
+                    for trial in 0..8 {
+                        let mut initial = [0u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT];
+                        fill_pseudorandom(&mut initial, &mut seed);
+                        check_horizontal_loop_filter_segment(
+                            initial,
+                            len,
+                            filter_size,
+                            strength,
+                            trial,
+                        )?;
+                    }
+
+                    for pattern in 0..4 {
+                        let mut initial = [0u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT];
+                        fill_pseudorandom(&mut initial, &mut seed);
+                        paint_loop_filter_pattern(&mut initial, len, strength, pattern);
+                        check_horizontal_loop_filter_segment(
+                            initial,
+                            len,
+                            filter_size,
+                            strength,
+                            100 + pattern,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn loop_filter_simd_filter4_clamp_preserves_negative_in_range() {
+        let value = super::filter4_clamp_i16x8(core::arch::wasm32::i16x8_splat(-1));
+        let mut lanes = [0i16; 8];
+        unsafe {
+            core::arch::wasm32::v128_store(
+                lanes.as_mut_ptr().cast::<core::arch::wasm32::v128>(),
+                value,
+            )
+        };
+        assert_eq!(lanes, [-1; 8]);
     }
 
     #[test]
@@ -9487,6 +9750,129 @@ mod tests {
             "prediction was {:?}",
             &pred[..request.size * request.size]
         );
+    }
+
+    fn check_horizontal_loop_filter_segment(
+        initial: [u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT],
+        len: usize,
+        filter_size: TxSize,
+        strength: LoopFilterStrength,
+        case_index: usize,
+    ) -> Result<(), TileSyntaxError> {
+        let mut scalar_data = initial;
+        let mut simd_data = initial;
+        let base = LOOP_FILTER_TEST_Y * LOOP_FILTER_TEST_STRIDE + LOOP_FILTER_TEST_X;
+
+        for offset in 0..len {
+            sample_filter_direct(
+                &mut scalar_data,
+                base + offset,
+                LOOP_FILTER_TEST_STRIDE,
+                filter_size,
+                strength,
+            );
+        }
+
+        let mut plane = CurrentPlaneMut {
+            data: &mut simd_data,
+            width: LOOP_FILTER_TEST_WIDTH,
+            height: LOOP_FILTER_TEST_HEIGHT,
+            stride: LOOP_FILTER_TEST_STRIDE,
+        };
+        loop_filter_segment(
+            &mut plane,
+            1,
+            LOOP_FILTER_TEST_X,
+            LOOP_FILTER_TEST_Y,
+            len,
+            filter_size,
+            strength,
+        )?;
+
+        let mut mismatch = None;
+        for index in 0..scalar_data.len() {
+            if scalar_data[index] != simd_data[index] {
+                mismatch = Some(index);
+                break;
+            }
+        }
+        if let Some(mismatch) = mismatch {
+            panic!(
+                "horizontal loop filter segment mismatch: case={case_index} len={len} \
+                 filter_size={filter_size:?} strength={strength:?} index={mismatch} \
+                 scalar={} simd={}",
+                u32::from(scalar_data[mismatch]),
+                u32::from(simd_data[mismatch])
+            );
+        }
+
+        Ok(())
+    }
+
+    fn paint_loop_filter_pattern(
+        data: &mut [u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT],
+        len: usize,
+        strength: LoopFilterStrength,
+        pattern: usize,
+    ) {
+        for col in LOOP_FILTER_TEST_X..LOOP_FILTER_TEST_X + len {
+            let (p, q) = match pattern {
+                0 => {
+                    let base = match col % 3 {
+                        0 => 128,
+                        1 => 129,
+                        _ => 127,
+                    };
+                    ([base; 8], [base; 8])
+                }
+                1 => {
+                    let delta = core::cmp::max(1, strength.thresh.saturating_add(1));
+                    let delta = core::cmp::min(delta, strength.limit);
+                    (
+                        [
+                            128,
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                            128u8.saturating_sub(delta),
+                        ],
+                        [
+                            128,
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                            128u8.saturating_add(delta),
+                        ],
+                    )
+                }
+                2 => {
+                    let high = 64u8.saturating_add(strength.limit.saturating_add(1));
+                    ([64, 64, 64, high, 64, 64, 64, 64], [64; 8])
+                }
+                _ => ([0; 8], [255; 8]),
+            };
+            paint_loop_filter_column(data, col, p, q);
+        }
+    }
+
+    fn paint_loop_filter_column(
+        data: &mut [u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT],
+        col: usize,
+        p: [u8; 8],
+        q: [u8; 8],
+    ) {
+        for (offset, sample) in p.into_iter().enumerate() {
+            data[(LOOP_FILTER_TEST_Y - 1 - offset) * LOOP_FILTER_TEST_STRIDE + col] = sample;
+        }
+        for (offset, sample) in q.into_iter().enumerate() {
+            data[(LOOP_FILTER_TEST_Y + offset) * LOOP_FILTER_TEST_STRIDE + col] = sample;
+        }
     }
 
     fn fill_pseudorandom(data: &mut [u8], seed: &mut u32) {

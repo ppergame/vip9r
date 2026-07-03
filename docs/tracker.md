@@ -317,11 +317,23 @@ shrank; traversal glue and intra prediction were promoted.
 - [ ] P3 (demoted) — small-copy elimination in prediction paths: libc is
       down to 6%/4% post-P1; only worth a pass if profiles after P4 still
       show libc/memcpy structure
+- [x] P8 — loop filter simd retry (post-P-intra profile: 18.9% jelly /
+      8.6% BBB): pass-1 (horizontal edges) Tx4x4 narrow filter in 8 u8
+      lanes, transpose-free; pass 0 and wide filters stay scalar.
+      Grinder's 8-lane kernel failed device-only; orchestrator bisect
+      found a real V8 arm32 codegen bug — i16x8_bitmask lowering leaks
+      its powers-of-two lane constant into the aliased high D-half of a
+      live Q register under pressure (lanes 4..7 corrupted). Fixed by
+      v128_any_true for the early-out. A55 jellyfish −2.1% (grinder,
+      equivalent kernel) / −1.5%, −0.6% confirm runs; BBB neutral.
+      Precheck-only variants measured positive (slower), dropped
 - [ ] conditional tail, gated on refreshed A55 profiles: P5 arm32 op-cost
       microbench + icache-refill PMU (decode_block monolith question);
-      P7 bool-decoder wide-window A55 re-measure; P8 loop filter simd retry
-      A55-only; P9 SB-row-fused loop filtering (needs L2-miss evidence);
-      P10 drop per-frame 1.4MB neutral fill if edge semantics allow
+      P7 bool-decoder wide-window A55 re-measure; P9 SB-row-fused loop
+      filtering (needs L2-miss evidence); P10 drop per-frame 1.4MB
+      neutral fill if edge semantics allow; P3-lite persistent
+      IntraPredictionEdges (libc memcpy ~3.9% BBB, 96B struct copy
+      per block confirmed in wasm dump)
 - [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
       close-out
 
