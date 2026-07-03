@@ -25,6 +25,8 @@ requirements.md — suggest changes rather than editing.
 - Hotspot attribution:
   `vip9r-perf-submit --target device profile --media MEDIA`; artifacts in
   temp/vip9r-profiles/, details in docs/d8.md."
+- The grinder container doesn't have scripts/. If you want the grinder to test a
+  spread of videos, give it the names or pass a one-off script via rust/
 
 ## Grinder runs
 
@@ -34,10 +36,10 @@ requirements.md — suggest changes rather than editing.
   in the background. The command prints progress updates until the implementor
   finishes, then prints the final message and a sandbox location like
   `temp/grinder.XXXXXX`.
-  - Check up on a new job ~2 minutes after starting it to catch the
-    first-turn failure below. After that, block on `TaskOutput` for the
-    grinder job itself rather than polling with sleep timers. No need for
-    line-by-line running commentary.
+  - Check up on a new job ~2 minutes after starting it to catch the first-turn
+    failure below. After that, block on `TaskOutput` for the grinder job itself
+    rather than polling with sleep timers. No need for line-by-line running
+    commentary.
 - Known failure: the grinder codex occasionally hangs or emits a malformed
   tool_search call on the first turn. Kill and retry, up to 3 times.
 - Traces are copied to `temp/traces/` automatically; preserve that directory for
