@@ -431,18 +431,14 @@ From the generated-code audit (docs/analysis/, offsets there). Ordered
 by expected value; each needs the usual asm + counterbalanced bench
 gate. Competes with M6 threads for effort.
 
-- [ ] fused-dequant divide specialization: `(coef * quant) / dq_denom`
-      carries a dynamic denominator into the token loop; V8 emits a
-      per-nonzero-coefficient frame reload + div-by-zero and
-      INT_MIN/−1 trap guards + serializing `sdiv` (verified,
-      023 @ 0x1224c-0x12278). `dq_denom` is const {1,2} by tx_size —
-      specialize (omit / arithmetic shift). Sits inside BBB's
-      dominant region (0x10b00-0x12600 = 41% of decode_residual)
-- [ ] loop_filter_is_block_edge modulo → mask test: divisors are
-      8×num_8x8_{wide,high} — always powers of two — but arrive as
-      table loads, so V8 emits zero-guard + `udiv` + `mls` per edge
-      test (verified, 049 @ 0x2cc8-0x2d28; containing region is
-      24-34% of loop_filter_frame)
+- [x] fused-dequant divide specialization: dynamic `/ dq_denom` →
+      truncating shift; sdiv + trap guards gone from decode_residual
+      (asm-verified). A55 timing null (BBB +0.2%, jelly +0.4%, at
+      spread); merged on mechanism, P10 precedent
+- [x] loop_filter_is_block_edge modulo → mask test: divisors always
+      powers of two; udiv + mls gone from the edge walk
+      (asm-verified). A55 jelly −0.6% (spread 0.5%), BBB −0.2%
+      (spread 0.2%) — credibility line, directionally consistent
 - [ ] StoredModeInfo access specialization: mv candidate scan,
       loop-filter SB setup, and decode_block store path decode/encode
       the full 49-byte record where callers need a few fields (32-byte

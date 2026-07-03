@@ -987,3 +987,27 @@ streamer cpu0:
   1728 instructions; subpel coefficient Q-registers spilled inside
   inner loops) filed as speculative — same territory where traversal
   restructures measured negative.
+
+## 2026-07-03 — A55 asm-audit micro-passes 1-2: divide elimination
+
+- Pass 1, fused dequant: `/ dq_denom` with denominator const {1,2} by
+  tx_size becomes a truncating shift (`dq_shift`); the per-nonzero-
+  coefficient `sdiv` and its div-by-zero / INT_MIN trap guards leave
+  the token loop (asm-verified: zero s/udiv in decode_residual).
+  A55 timing **null** — BBB +0.2% (spread 0.2%), jellyfish +0.4%
+  (spread 0.3%). Merged on mechanism, P10 precedent: real
+  serializing-instruction removal in the hottest region at zero
+  complexity cost, but the region is evidently not divide-latency
+  bound.
+- Pass 2, loop-filter block edges: `is_multiple_of(8 * num_8x8_*)`
+  becomes a mask test (divisors are always powers of two); zero-guard
+  + `udiv` + `mls` leave the per-segment edge walk (asm-verified:
+  zero udiv in loop_filter_frame). A55 jellyfish **−0.6%** (spread
+  0.5%), BBB **−0.2%** (spread 0.2%) — at the credibility line,
+  directionally consistent on both clips.
+- Calibration note for the remaining backlog: the audit's two
+  highest-confidence scalar findings (both verified in asm, both
+  serializing divides in hot regions) bought ≤0.6%. Instruction-level
+  wins are noise-dominated on this in-order core unless they remove
+  memory traffic or whole code regions; rank the remaining items
+  accordingly.
