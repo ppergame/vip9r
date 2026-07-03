@@ -1,6 +1,8 @@
 use crate::header::{SEG_LVL_ALT_Q, SegmentationParams, UncompressedFrameHeader};
 
-use super::{MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType};
+use super::{
+    CurrentFrameMut, CurrentPlaneMut, MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType, clip1,
+};
 
 use core::arch::wasm32::*;
 
@@ -1994,8 +1996,175 @@ const AC_QLOOKUP_8BIT: [i32; 256] = [
     1451, 1479, 1508, 1537, 1567, 1597, 1628, 1660, 1692, 1725, 1759, 1793, 1828,
 ];
 
+pub(super) fn reconstruct(
+    current_frame: &mut CurrentFrameMut<'_>,
+    dequantized: &DequantizedCoefficients,
+) -> Result<(), TileSyntaxError> {
+    let plane = current_frame.plane_mut(dequantized.block.plane)?;
+    add_residual_block(
+        plane,
+        dequantized.block.start,
+        dequantized.block.tx_size,
+        &dequantized.coefficients,
+    )
+}
+
+pub(super) fn add_residual_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    tx_size: TxSize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    let size = transform_width(tx_size);
+    if residual_block_inside(plane, start, size) {
+        return add_residual_block_interior_simd(plane, start, size, residuals);
+    }
+
+    add_residual_block_scalar(plane, start, size, residuals)
+}
+
+#[inline(always)]
+pub(super) fn residual_block_inside(
+    plane: &CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    size: usize,
+) -> bool {
+    start
+        .0
+        .checked_add(size)
+        .is_some_and(|right| right <= plane.width)
+        && start
+            .1
+            .checked_add(size)
+            .is_some_and(|bottom| bottom <= plane.height)
+}
+
+pub(super) fn add_residual_block_scalar(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    size: usize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    for row in 0..size {
+        let y = start
+            .1
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        for col in 0..size {
+            let x = start
+                .0
+                .checked_add(col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?;
+            if x >= plane.width || y >= plane.height {
+                continue;
+            }
+            let predicted = plane.sample_clamped(x, y)?;
+            plane.set_visible(
+                x,
+                y,
+                clip1(i32::from(predicted) + residuals[row * size + col]),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn add_residual_block_interior_simd(
+    plane: &mut CurrentPlaneMut<'_>,
+    start: (usize, usize),
+    size: usize,
+    residuals: &[i32; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    debug_assert!(residual_block_inside(plane, start, size));
+
+    for row in 0..size {
+        let y = start
+            .1
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_start = y
+            .checked_mul(plane.stride)
+            .and_then(|base| base.checked_add(start.0))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst_end = dst_start
+            .checked_add(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst = plane
+            .data
+            .get_mut(dst_start..dst_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_start = row
+            .checked_mul(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_end = residual_start
+            .checked_add(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let residual_row = residuals
+            .get(residual_start..residual_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+
+        add_residual_row_simd(dst, residual_row);
+    }
+
+    Ok(())
+}
+
+#[inline(always)]
+pub(super) fn add_residual_row_simd(dst: &mut [u8], residuals: &[i32]) {
+    debug_assert_eq!(dst.len(), residuals.len());
+
+    let mut col = 0;
+    while col + 8 <= dst.len() {
+        let prediction = unsafe { v128_load64_zero(dst.as_ptr().wrapping_add(col).cast::<u64>()) };
+        let residual_lo = unsafe { v128_load(residuals.as_ptr().wrapping_add(col).cast::<v128>()) };
+        let residual_hi =
+            unsafe { v128_load(residuals.as_ptr().wrapping_add(col + 4).cast::<v128>()) };
+        let reconstruction = add_residual_8(prediction, residual_lo, residual_hi);
+        unsafe {
+            v128_store64_lane::<0>(
+                reconstruction,
+                dst.as_mut_ptr().wrapping_add(col).cast::<u64>(),
+            );
+        }
+        col += 8;
+    }
+    if col + 4 <= dst.len() {
+        let prediction = unsafe { v128_load32_zero(dst.as_ptr().wrapping_add(col).cast::<u32>()) };
+        let residuals = unsafe { v128_load(residuals.as_ptr().wrapping_add(col).cast::<v128>()) };
+        let reconstruction = add_residual_4(prediction, residuals);
+        unsafe {
+            v128_store32_lane::<0>(
+                reconstruction,
+                dst.as_mut_ptr().wrapping_add(col).cast::<u32>(),
+            );
+        }
+        col += 4;
+    }
+
+    debug_assert_eq!(col, dst.len());
+}
+
+#[inline(always)]
+pub(super) fn add_residual_8(prediction: v128, residual_lo: v128, residual_hi: v128) -> v128 {
+    let predicted = i16x8_extend_low_u8x16(prediction);
+    let lo = i32x4_add(i32x4_extend_low_i16x8(predicted), residual_lo);
+    let hi = i32x4_add(i32x4_extend_high_i16x8(predicted), residual_hi);
+    let packed_i16 = i16x8_narrow_i32x4(lo, hi);
+    u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
+}
+
+#[inline(always)]
+pub(super) fn add_residual_4(prediction: v128, residuals: v128) -> v128 {
+    let predicted = i16x8_extend_low_u8x16(prediction);
+    let reconstruction = i32x4_add(i32x4_extend_low_i16x8(predicted), residuals);
+    let packed_i16 = i16x8_narrow_i32x4(reconstruction, i32x4_splat(0));
+    u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
+}
+
 #[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
+    use super::super::scan_table;
+    use super::super::test_support::*;
     use super::*;
 
     #[derive(Clone, Copy)]
@@ -2368,5 +2537,176 @@ mod tests {
             tx32_adst.inverse_transform(false),
             Err(TileSyntaxError::InvalidBitstream)
         );
+    }
+    #[test]
+    fn reconstruction_adds_residuals_and_clips_visible_samples() {
+        let mut data = [100u8; 16];
+        let mut residuals = [0i32; MAX_TX_COEFFS];
+        residuals[0] = 200;
+        residuals[1] = -150;
+        residuals[2] = 20;
+        residuals[15] = -1;
+
+        {
+            let mut plane =
+                CurrentPlaneMut::new(&mut data, crate::PlaneShape::new(4, 4, 4)).unwrap();
+            add_residual_block(&mut plane, (0, 0), TxSize::Tx4x4, &residuals).unwrap();
+        }
+
+        assert_eq!(data[0], 255);
+        assert_eq!(data[1], 0);
+        assert_eq!(data[2], 120);
+        assert_eq!(data[15], 99);
+    }
+
+    #[test]
+    fn reconstruction_simd_fast_path_matches_scalar_reference() -> Result<(), TileSyntaxError> {
+        const MAX_STRIDE: usize = 48;
+        const MAX_HEIGHT: usize = 40;
+        const TX_SIZES: [TxSize; 4] = [
+            TxSize::Tx4x4,
+            TxSize::Tx8x8,
+            TxSize::Tx16x16,
+            TxSize::Tx32x32,
+        ];
+
+        for tx_size in TX_SIZES {
+            let size = transform_width(tx_size);
+            let cases = [
+                (size + 5, size + 6, (3, 4)),
+                (size, size, (0, 0)),
+                (size + 1, size + 3, (size - 2, 1)),
+                (size + 3, size + 1, (1, size - 2)),
+                (size + 1, size + 1, (size - 2, size - 2)),
+            ];
+
+            for (case_index, (width, height, start)) in cases.into_iter().enumerate() {
+                let stride = MAX_STRIDE;
+                let mut initial = [0u8; MAX_STRIDE * MAX_HEIGHT];
+                let mut seed = 0x0102_0304u32 ^ ((size as u32) << 16) ^ ((case_index as u32) << 8);
+                fill_pseudorandom(&mut initial, &mut seed);
+
+                let mut residuals = [0i32; MAX_TX_COEFFS];
+                for (index, residual) in residuals[..size * size].iter_mut().enumerate() {
+                    *residual = match index % 8 {
+                        0 => 300,
+                        1 => -300,
+                        2 => 100_000,
+                        3 => -100_000,
+                        4 => 17,
+                        5 => -19,
+                        6 => 255,
+                        _ => -255,
+                    };
+                }
+
+                let mut scalar_data = initial;
+                let mut simd_data = initial;
+                {
+                    let mut scalar_plane = CurrentPlaneMut::new(
+                        &mut scalar_data,
+                        crate::PlaneShape::new(width as u32, height as u32, stride),
+                    )?;
+                    add_residual_block_scalar(&mut scalar_plane, start, size, &residuals)?;
+                }
+                {
+                    let mut simd_plane = CurrentPlaneMut::new(
+                        &mut simd_data,
+                        crate::PlaneShape::new(width as u32, height as u32, stride),
+                    )?;
+                    add_residual_block(&mut simd_plane, start, tx_size, &residuals)?;
+                }
+
+                if scalar_data != simd_data {
+                    let mismatch = scalar_data
+                        .iter()
+                        .zip(simd_data.iter())
+                        .position(|(scalar, simd)| scalar != simd)
+                        .expect("mismatch exists");
+                    panic!(
+                        "residual reconstruction mismatch: tx_size={tx_size:?} \
+                         case={case_index} width={width} height={height} start={start:?} \
+                         index={mismatch} scalar={} simd={}",
+                        scalar_data[mismatch], simd_data[mismatch]
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn dequant_helpers_clip_q_indexes() {
+        assert_eq!(FrameDequant::new(0, -99, 0, 0).get_dc_quant(0), 4);
+        assert_eq!(FrameDequant::new(255, 0, 0, 99).get_ac_quant(1), 1828);
+    }
+
+    #[test]
+    fn dequant_helpers_apply_y_and_uv_deltas() {
+        let dequant = FrameDequant::new(4, 2, 4, 5);
+
+        assert_eq!(dequant.get_dc_quant(0), 12);
+        assert_eq!(dequant.get_ac_quant(0), 11);
+        assert_eq!(dequant.get_dc_quant(1), 13);
+        assert_eq!(dequant.get_ac_quant(2), 16);
+    }
+
+    #[test]
+    fn dequantize_uses_dc_ac_quantizers_and_tx32_dq_denom() {
+        let dequant = FrameDequant::new(4, 2, 0, 0);
+        let mut tx16 =
+            TransformCoefficients::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct).unwrap();
+        let tx16_ac = usize::from(scan_table(tx16.block.tx_size, tx16.block.tx_type)[1]);
+        tx16.set_quantized(0, 2).unwrap();
+        tx16.set_quantized(tx16_ac, 4).unwrap();
+        tx16.set_eob(2).unwrap();
+
+        let mut output16 = DequantizedCoefficients::empty();
+        dequant
+            .dequantize_into(
+                &tx16,
+                0,
+                scan_table(tx16.block.tx_size, tx16.block.tx_type),
+                &mut output16,
+            )
+            .unwrap();
+        assert_eq!(output16.block, tx16.block);
+        assert_eq!(output16.eob, 2);
+        assert_eq!(output16.coefficients[0], 24);
+        assert_eq!(output16.coefficients[tx16_ac], 44);
+
+        let mut tx32 =
+            TransformCoefficients::new(0, (8, 16), TxSize::Tx32x32, TxType::DctDct).unwrap();
+        let tx32_ac = usize::from(scan_table(tx32.block.tx_size, tx32.block.tx_type)[1]);
+        tx32.set_quantized(0, 2).unwrap();
+        tx32.set_quantized(tx32_ac, 4).unwrap();
+        tx32.set_eob(2).unwrap();
+
+        let mut output32 = DequantizedCoefficients::empty();
+        dequant
+            .dequantize_into(
+                &tx32,
+                0,
+                scan_table(tx32.block.tx_size, tx32.block.tx_type),
+                &mut output32,
+            )
+            .unwrap();
+        assert_eq!(output32.block, tx32.block);
+        assert_eq!(output32.eob, 2);
+        assert_eq!(output32.coefficients[0], 12);
+        assert_eq!(output32.coefficients[tx32_ac], 22);
+    }
+
+    #[test]
+    fn alt_q_segmentation_adjusts_quantizer_index() {
+        let mut segmentation = crate::header::SegmentationParams::disabled();
+        segmentation.enabled = true;
+        segmentation.feature_enabled[1][crate::header::SEG_LVL_ALT_Q] = true;
+        segmentation.feature_data[1][crate::header::SEG_LVL_ALT_Q] = -25;
+        let dequant = FrameDequant::new_with_segmentation(131, 0, 0, 0, segmentation);
+
+        assert_eq!(dequant.get_qindex_for_segment(0), 131);
+        assert_eq!(dequant.get_qindex_for_segment(1), 106);
     }
 }
