@@ -828,3 +828,28 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   magnitude violate the very conformance bound that licenses i16).
   Sweep test's DctDct input range scoped to conforming magnitudes
   accordingly; 95/95 tests host+device.
+
+## 2026-07-03 — A55 campaign: fill-traffic micro sweep
+
+- End-of-campaign bundle of memory-traffic hygiene. Item 1: the
+  ~1.4MB/frame neutral fill of the current frame's Y/U/V planes now
+  runs only on first use of a frame-pool slot (flag set only after a
+  successful tile parse, so an errored decode refills next time).
+  Reader audit for never-written bytes: intra edges are explicit
+  defaults via `IntraPredictionEdges`, inter prediction clamps to
+  the *reference* frame's decoded dimensions, loop filter stays in
+  decoded extent, show-existing shows fully decoded frames, resizes
+  reconstruct their own full dimensions. Validates include resize,
+  18x34, and show-existing vectors. Items 2+3: simd ADST permutation
+  copies and s_lo/s_hi MAC arrays plus the scalar ADST scratch moved
+  to persistent `DequantizedCoefficients` fields sized
+  `MAX_ADST_WIDTH = 16` (staleness-safe: every lane read is written
+  earlier in the same call — audited for adst8 and both adst16
+  waves). memory.fill sites in the release dump: 33 → 24.
+- Timing is an honest null. Grinder legs: item 1 alone BBB −1.13%
+  at 0.04% spread, combined BBB −0.53%/jelly −0.04% (spreads ≤0.9%);
+  orchestrator guard on the merged tree BBB +0.22% at 0.11% spread.
+  Cross-session range −1.1%..+0.2% = noise floor / code layout.
+  Merged on mechanism per the neutral-cleanup precedent: strictly
+  less work per frame, fill sites verifiably gone. Compliance
+  307/307, 95/95 tests host+device.

@@ -363,10 +363,19 @@ shrank; traversal glue and intra prediction were promoted.
       bench noise on both clips. L1I cost is per-block phase cycling
       through hot code, not cold-code pollution; only P9-scale phase
       batching could move it. Evidence in log
-- [ ] conditional tail remainder: P9 SB-row-fused loop filtering
-      (L2D refill only 5.5M/s ≈ 0.9GB/s — weak evidence, likely not
-      worth the structural cost); P10 drop per-frame 1.4MB neutral
-      fill (~0.3%, verify edge/ref semantics first)
+- [x] P10 + micro sweep — merged on mechanism, timing null: per-frame
+      1.4MB neutral fill → per-slot first-use fill (reader audit:
+      intra edges use explicit defaults, inter clamps to reference
+      dims, loop filter stays in decoded extent; validates incl.
+      resize/18x34/show-existing); ADST simd+scalar scratch made
+      persistent (MAX_ADST_WIDTH=16, staleness-safe by write-before-
+      read within each call); memory.fill sites 33 → 24 in the dump.
+      A55 timing legs ranged −1.1%..+0.2% across sessions — noise
+      floor; merged for the traffic reduction, not the stopwatch
+- [ ] P9 SB-row-fused loop filtering: declined — L2D refill only
+      5.5M/s ≈ 0.9GB/s (PMU-measured), too weak to justify the
+      structural cost; icache experiment already showed the phase-
+      cycling cost needs batching that intra dependencies entangle
 - [x] P3-lite — persistent IntraPredictionEdges + slice above-row
       gather: in-place fill with explicit missing-edge defaults
       (127/129 spans only), interior above row copied as fixed-width

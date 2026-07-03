@@ -308,6 +308,7 @@ pub struct DecodeWorkspace<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReconstructionBufferRequest {
     current_frame_slot: FramePoolSlot,
+    initialize_current_frame: bool,
     frame_width: u32,
     frame_height: u32,
     reference_slots: Option<[InterReferenceSlot; 3]>,
@@ -369,9 +370,9 @@ impl<'a> DecodeWorkspace<'a> {
         let (before_current, current_and_after) = frame_pool.split_at_mut(current_range.start);
         let (current_frame_bytes, after_current) =
             current_and_after.split_at_mut(current_range.len);
-        fill_frame_plane(current_frame_bytes, frame_layout.y, 128)?;
-        fill_frame_plane(current_frame_bytes, frame_layout.u, 128)?;
-        fill_frame_plane(current_frame_bytes, frame_layout.v, 128)?;
+        if request.initialize_current_frame {
+            fill_frame(current_frame_bytes, frame_layout, 128)?;
+        }
         let current_frame = current_frame_view(
             current_frame_bytes,
             frame_layout,
@@ -627,12 +628,11 @@ impl FramePoolSlots {
     }
 }
 
-fn fill_frame_plane(frame: &mut [u8], layout: PlaneLayout, value: u8) -> Result<(), DecodeError> {
-    let end = layout.end()?;
-    let plane = frame
-        .get_mut(layout.offset..end)
+fn fill_frame(frame: &mut [u8], layout: FrameLayout, value: u8) -> Result<(), DecodeError> {
+    let frame = frame
+        .get_mut(..layout.bytes())
         .ok_or(DecodeError::InvalidConfig)?;
-    plane.fill(value);
+    frame.fill(value);
     Ok(())
 }
 
@@ -897,6 +897,7 @@ pub struct Decoder {
     probability_state: ProbabilityState,
     syntax_counts: SyntaxCounts,
     frame_pool_slots: FramePoolSlots,
+    initialized_frame_slots: [bool; FRAME_POOL_BUFFERS],
     reference_frames: [Option<ReferenceSlotInfo>; REFERENCE_FRAME_SLOTS],
     next_output_frame_index: u64,
     last_frame_type: header::FrameType,
@@ -956,6 +957,7 @@ impl Decoder {
             probability_state: ProbabilityState::new(),
             syntax_counts: SyntaxCounts::default(),
             frame_pool_slots: FramePoolSlots::new(),
+            initialized_frame_slots: [false; FRAME_POOL_BUFFERS],
             reference_frames: [None; REFERENCE_FRAME_SLOTS],
             next_output_frame_index: 0,
             last_frame_type: header::FrameType::Key,
@@ -1040,10 +1042,16 @@ impl Decoder {
             .unwrap_or(ModeHistorySlot::Slot0);
         let current_frame_slot = self.frame_pool_slots.current_for_reconstruction()?;
         let reference_slots = self.inter_reference_slots(&header)?;
+        let initialize_current_frame = !self
+            .initialized_frame_slots
+            .get(current_frame_slot.index())
+            .copied()
+            .ok_or(DecodeError::InvalidConfig)?;
         {
             let (mut current_frame, reference_frames, mode_buffers) = workspace
                 .reconstruction_buffers(ReconstructionBufferRequest {
                     current_frame_slot,
+                    initialize_current_frame,
                     frame_width: header.frame_width,
                     frame_height: header.frame_height,
                     reference_slots,
@@ -1085,6 +1093,7 @@ impl Decoder {
 
             tile_parse_result.map_err(|err| err.into_decode_error())?;
         }
+        self.initialized_frame_slots[current_frame_slot.index()] = true;
 
         self.refresh_probability_state(&header, &compressed_header)?;
 
