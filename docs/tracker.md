@@ -444,10 +444,10 @@ gate. Competes with M6 threads for effort.
       segment_map_id byte), template-encoded stores, prev-candidate
       decode hoisted. A55 jelly −4.4% / BBB −3.8%, X4 −5.4% / −3.5%
       (asm: sub_mvs copies gone, mv_ref_candidate 53→19KB)
-- [ ] inverse_dct_simd_i16 size specialization: recursive schedule
-      keeps dynamic brev/cos64 quadrant logic and indirect calls in
-      hot code; straight-line per-n schedules trade code size (icache
-      caution: monolith phase cycling is a known constraint)
+- [x] inverse_dct_simd_i16 size specialization: four straight-line
+      bodies (n=2..5), brev/cos64/table work folds to literal
+      constants; code shrank 20.8 → 15.5KB. A55 jelly −1.8% (spread
+      0.14%), BBB −0.5% (noise)
 - [ ] extend the narrow_i32_butterfly trust model to the remaining
       checked `narrow_i32(round2_i64(..))?` scalar ADST/shift paths
       (long adds/adc/cmn chains in transform tails)

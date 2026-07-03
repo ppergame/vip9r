@@ -1328,85 +1328,156 @@ fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSy
     Ok(())
 }
 
+#[inline(never)]
 fn inverse_dct_simd_i16(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
-    if !(2..=5).contains(&n) {
-        return Err(TileSyntaxError::InvalidBitstream);
-    }
-
-    let n0 = 1usize << n;
-    let n1 = 1usize << (n - 1);
-    let n2 = 1usize << (n - 2);
-
-    if n == 2 {
-        b_simd_i16(t, 0, 1, 16, true);
-    } else {
-        inverse_dct_simd_i16(t, n - 1)?;
-    }
-
-    for i in 0..n2 {
-        b_simd_i16(t, n1 + i, n0 - 1 - i, 32 - brev(5, n1 + i) as i32, false);
-    }
-
-    if n >= 3 {
-        let n3 = 1usize << (n - 3);
-        for i in 0..n3 {
-            for j in 0..=1 {
-                h_simd_i16(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
-            }
-        }
-    }
-
-    if n == 5 {
-        let n3 = 1usize << (n - 3);
-        for i in 0..=1 {
-            for j in 0..=1 {
-                b_simd_i16(
-                    t,
-                    n0 - n + 3 - n2 * j - 4 * i,
-                    n1 + n - 4 + n2 * j + 4 * i,
-                    28 - 16 * i as i32 + 56 * j as i32,
-                    true,
-                );
-            }
-        }
-        for i in 0..=1 {
-            for j in 0..=3 {
-                h_simd_i16(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0);
-            }
-        }
-    }
-
-    if n >= 4 {
-        for i in 0..=usize::from(n == 5) {
-            for j in 0..=1 {
-                b_simd_i16(
-                    t,
-                    n0 - n + 2 - i - n2 * j,
-                    n1 + n - 3 + i + n2 * j,
-                    24 + 48 * j as i32,
-                    true,
-                );
-            }
-        }
-        for i in 0..=(2 * n - 7) {
-            for j in 0..=1 {
-                h_simd_i16(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0);
-            }
-        }
-    }
-
-    if n >= 3 {
-        let n3 = 1usize << (n - 3);
-        for i in 0..n3 {
-            b_simd_i16(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
-        }
-    }
-
-    for i in 0..n1 {
-        h_simd_i16(t, i, n0 - 1 - i, false);
+    match n {
+        2 => inverse_dct_simd_i16_n2(t),
+        3 => inverse_dct_simd_i16_n3(t),
+        4 => inverse_dct_simd_i16_n4(t),
+        5 => inverse_dct_simd_i16_n5(t),
+        _ => return Err(TileSyntaxError::InvalidBitstream),
     }
 
     Ok(())
+}
+
+#[inline(never)]
+fn inverse_dct_simd_i16_n2(t: &mut [v128; MAX_TX_WIDTH]) {
+    // Size-specialized expansion of the generic i16 DCT schedule. Keep the
+    // butterfly/half operations in the same order as the recursive form above;
+    // fixed indices make the brev/cos/sin inputs compile-time constants.
+    b_simd_i16(t, 0, 1, 16, true);
+
+    b_simd_i16(t, 2, 3, 32 - brev(5, 2) as i32, false);
+
+    h_simd_i16(t, 0, 3, false);
+    h_simd_i16(t, 1, 2, false);
+}
+
+#[inline(never)]
+fn inverse_dct_simd_i16_n3(t: &mut [v128; MAX_TX_WIDTH]) {
+    inverse_dct_simd_i16_n2(t);
+
+    b_simd_i16(t, 4, 7, 32 - brev(5, 4) as i32, false);
+    b_simd_i16(t, 5, 6, 32 - brev(5, 5) as i32, false);
+
+    h_simd_i16(t, 4, 5, false);
+    h_simd_i16(t, 6, 7, true);
+
+    b_simd_i16(t, 6, 5, 16, true);
+
+    h_simd_i16(t, 0, 7, false);
+    h_simd_i16(t, 1, 6, false);
+    h_simd_i16(t, 2, 5, false);
+    h_simd_i16(t, 3, 4, false);
+}
+
+#[inline(never)]
+fn inverse_dct_simd_i16_n4(t: &mut [v128; MAX_TX_WIDTH]) {
+    inverse_dct_simd_i16_n3(t);
+
+    b_simd_i16(t, 8, 15, 32 - brev(5, 8) as i32, false);
+    b_simd_i16(t, 9, 14, 32 - brev(5, 9) as i32, false);
+    b_simd_i16(t, 10, 13, 32 - brev(5, 10) as i32, false);
+    b_simd_i16(t, 11, 12, 32 - brev(5, 11) as i32, false);
+
+    h_simd_i16(t, 8, 9, false);
+    h_simd_i16(t, 10, 11, true);
+    h_simd_i16(t, 12, 13, false);
+    h_simd_i16(t, 14, 15, true);
+
+    b_simd_i16(t, 14, 9, 24, true);
+    b_simd_i16(t, 10, 13, 72, true);
+
+    h_simd_i16(t, 8, 11, false);
+    h_simd_i16(t, 12, 15, true);
+    h_simd_i16(t, 9, 10, false);
+    h_simd_i16(t, 13, 14, true);
+
+    b_simd_i16(t, 13, 10, 16, true);
+    b_simd_i16(t, 12, 11, 16, true);
+
+    h_simd_i16(t, 0, 15, false);
+    h_simd_i16(t, 1, 14, false);
+    h_simd_i16(t, 2, 13, false);
+    h_simd_i16(t, 3, 12, false);
+    h_simd_i16(t, 4, 11, false);
+    h_simd_i16(t, 5, 10, false);
+    h_simd_i16(t, 6, 9, false);
+    h_simd_i16(t, 7, 8, false);
+}
+
+#[inline(never)]
+fn inverse_dct_simd_i16_n5(t: &mut [v128; MAX_TX_WIDTH]) {
+    inverse_dct_simd_i16_n4(t);
+
+    b_simd_i16(t, 16, 31, 32 - brev(5, 16) as i32, false);
+    b_simd_i16(t, 17, 30, 32 - brev(5, 17) as i32, false);
+    b_simd_i16(t, 18, 29, 32 - brev(5, 18) as i32, false);
+    b_simd_i16(t, 19, 28, 32 - brev(5, 19) as i32, false);
+    b_simd_i16(t, 20, 27, 32 - brev(5, 20) as i32, false);
+    b_simd_i16(t, 21, 26, 32 - brev(5, 21) as i32, false);
+    b_simd_i16(t, 22, 25, 32 - brev(5, 22) as i32, false);
+    b_simd_i16(t, 23, 24, 32 - brev(5, 23) as i32, false);
+
+    h_simd_i16(t, 16, 17, false);
+    h_simd_i16(t, 18, 19, true);
+    h_simd_i16(t, 20, 21, false);
+    h_simd_i16(t, 22, 23, true);
+    h_simd_i16(t, 24, 25, false);
+    h_simd_i16(t, 26, 27, true);
+    h_simd_i16(t, 28, 29, false);
+    h_simd_i16(t, 30, 31, true);
+
+    b_simd_i16(t, 30, 17, 28, true);
+    b_simd_i16(t, 22, 25, 84, true);
+    b_simd_i16(t, 26, 21, 12, true);
+    b_simd_i16(t, 18, 29, 68, true);
+
+    h_simd_i16(t, 16, 19, false);
+    h_simd_i16(t, 20, 23, true);
+    h_simd_i16(t, 24, 27, false);
+    h_simd_i16(t, 28, 31, true);
+    h_simd_i16(t, 17, 18, false);
+    h_simd_i16(t, 21, 22, true);
+    h_simd_i16(t, 25, 26, false);
+    h_simd_i16(t, 29, 30, true);
+
+    b_simd_i16(t, 29, 18, 24, true);
+    b_simd_i16(t, 21, 26, 72, true);
+    b_simd_i16(t, 28, 19, 24, true);
+    b_simd_i16(t, 20, 27, 72, true);
+
+    h_simd_i16(t, 16, 23, false);
+    h_simd_i16(t, 24, 31, true);
+    h_simd_i16(t, 17, 22, false);
+    h_simd_i16(t, 25, 30, true);
+    h_simd_i16(t, 18, 21, false);
+    h_simd_i16(t, 26, 29, true);
+    h_simd_i16(t, 19, 20, false);
+    h_simd_i16(t, 27, 28, true);
+
+    b_simd_i16(t, 27, 20, 16, true);
+    b_simd_i16(t, 26, 21, 16, true);
+    b_simd_i16(t, 25, 22, 16, true);
+    b_simd_i16(t, 24, 23, 16, true);
+
+    h_simd_i16(t, 0, 31, false);
+    h_simd_i16(t, 1, 30, false);
+    h_simd_i16(t, 2, 29, false);
+    h_simd_i16(t, 3, 28, false);
+    h_simd_i16(t, 4, 27, false);
+    h_simd_i16(t, 5, 26, false);
+    h_simd_i16(t, 6, 25, false);
+    h_simd_i16(t, 7, 24, false);
+    h_simd_i16(t, 8, 23, false);
+    h_simd_i16(t, 9, 22, false);
+    h_simd_i16(t, 10, 21, false);
+    h_simd_i16(t, 11, 20, false);
+    h_simd_i16(t, 12, 19, false);
+    h_simd_i16(t, 13, 18, false);
+    h_simd_i16(t, 14, 17, false);
+    h_simd_i16(t, 15, 16, false);
 }
 
 #[inline(always)]

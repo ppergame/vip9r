@@ -1037,3 +1037,22 @@ streamer cpu0:
   **−5.4% / −3.5%** (0.2/1.1%). First clearly-real win of the
   asm-audit backlog — memory-traffic removal, where the session's two
   divide eliminations (instruction-level) were noise.
+
+## 2026-07-03 — A55 asm-audit pass 4: i16 DCT size specialization
+
+- The simd i16 DCT_DCT schedule was runtime-recursive on transform
+  size with dynamic `brev` bit-reversal angles and branchy
+  `cos64`/`sin64` quadrant lookups per butterfly. Replaced with four
+  straight-line bodies (n=2..5, each calling the next smaller; one
+  `match` at the entry) — an exact expansion of the generic schedule,
+  orchestrator-verified stage by stage. `b_simd_i16`/`h_simd_i16`
+  arithmetic untouched; i32 sibling untouched.
+- Asm (arm32): trig-table `vld1.16` splats, brev mask arithmetic, and
+  quadrant compares all zero after; constants are literal movw/vmov.
+  Total code *shrank* — 20.8KB recursive body → 15.5KB across the
+  five specialized functions (the generic-schedule control flow cost
+  more than the unrolled straight-line ops it drove).
+- A55 **jellyfish −1.8%** (spread 0.14%), BBB −0.5% (spread 0.7%,
+  noise — BBB's DCT share is small post-P-idct-scratch). X4 confirm
+  jellyfish −0.03% at 1.27% spread: pure noise, consistent with the
+  out-of-order core hiding the schedule overhead the A55 pays for.
