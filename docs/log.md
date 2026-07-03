@@ -747,3 +747,58 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   simd-vs-scalar wide-kernel sweep with mixed-regime crafted
   patterns), validates incl. lf_deltas and resize. No host/device
   divergence this time.
+
+## 2026-07-03 — A55 campaign: pass-0 loop filter — measured, not merged
+
+- Staged attempt at the vertical-edge (pass-0) kernel, transpose-gated.
+  Stage 0 answered the lowering question: V8 arm32 lowers the 3-stage
+  8x8 byte transpose well — 8/12 shuffles become single `vzip.8`/
+  `vzip.16`, the u32 stage becomes `vdup/vsri/vsli` (no vtbl, no
+  constant-table pressure). Even so: Tx4x4 narrow measured
+  jellyfish −0.50% at 0.45% spread with a −0.14% no-op anchor (BBB
+  −0.10%) — noise-level; the Tx8x8 wide3 variant on the same
+  transpose was a real loss (jellyfish +0.96%, BBB +0.76%) and was
+  reverted. The transpose round-trip tax eats the lane-math win as
+  soon as the kernel widens. Conclusion for the campaign: pass-0
+  stays scalar on the A55; the pass-1 kernels were the recoverable
+  part of the loop filter. Diff not merged (win does not clear
+  spread); evidence preserved here and in the notes.
+
+## 2026-07-03 — A55 campaign: icache layout experiment — null, not merged
+
+- PMU counters (per-process simpleperf stat on the d8 pid) confirmed
+  the monolith hypothesis directionally: stalled-cycles-frontend
+  13.1%, L1I refills 5× L1D refills (68.2M vs 13.8M per 5s), 0.82
+  L1I refills per 100 instructions. But the actionable version of the
+  fix — outlining rarely-executed subtrees with
+  `#[cold]`/`#[inline(never)]` — measured null: the one clean outline
+  (scalar/non-DCT_DCT `inverse_transform_2d_scalar`) shrank
+  decode_residual only 140.7KB → 135.0KB arm32 (V8 verified not to
+  re-inline), jellyfish −0.57% at 0.53% spread, BBB noise below its
+  own anchor. Two further outline batches (simd-DCT scalar tail,
+  scaled-inter branch) were tried and discarded by the grinder.
+- Conclusion: the L1I cost is inherent to per-block phase cycling
+  through ~135KB of hot code, not to cold code polluting the cache.
+  Only structural phase batching (decode an SB's tokens, then batch
+  transforms/reconstruct) could shrink the working set, and that is
+  P9-scale surgery with entangled intra dependencies. Not pursued;
+  diff not merged.
+
+## 2026-07-03 — A55 campaign: simd ADST transforms
+
+- The last sizable non-structural target from the refreshed profile:
+  ADST-involved transform types took the fully scalar 2D path
+  (scalar `inverse_adst` + `inverse_dct` symbols ≈ 6% jellyfish,
+  5.4% BBB). Generalized the 4-lane-group simd driver to per-pass
+  DCT/ADST selection: `inverse_adst4/8/16_simd` are structural 1:1
+  mirrors of the scalar functions (same butterfly order, same
+  round-at-14 points) built on the existing i64x2-extmul primitives,
+  with `sb_simd`/`sh_simd` splitting raw i64 MACs from the rounding
+  exactly as scalar `sb`/`sh` do. DCT gathers keep fused
+  bit-reversal; ADST gathers load naturally and permute in-kernel;
+  scalar tail for leftover rows unchanged; lossless stays scalar.
+- A55 jellyfish **−2.5%** grinder / **−3.1%** orchestrator confirm
+  (spreads ≤0.7%), BBB **−2.3%** (spread 0.4%), no-op anchors null.
+  Compliance 307/307, 95/95 tests host+device, validates incl.
+  quantizer-00 and quantizer-63. Scalar `inverse_adst` disappeared
+  from the device profile (`inverse_adst_simd` now ~1.1-1.4%).

@@ -327,11 +327,34 @@ shrank; traversal glue and intra prediction were promoted.
       v128_any_true for the early-out. A55 jellyfish −2.1% (grinder,
       equivalent kernel) / −1.5%, −0.6% confirm runs; BBB neutral.
       Precheck-only variants measured positive (slower), dropped
-- [ ] conditional tail, gated on refreshed A55 profiles: P5 arm32 op-cost
-      microbench + icache-refill PMU (decode_block monolith question);
-      P7 bool-decoder wide-window A55 re-measure; P9 SB-row-fused loop
-      filtering (needs L2-miss evidence); P10 drop per-frame 1.4MB
-      neutral fill if edge semantics allow
+- [x] P5 (resolved by direct PMU measurement, no microbench needed):
+      A55 jellyfish decode has stalled-cycles-frontend 13.1%, L1I
+      refills 68.2M vs L1D 13.8M over 5s (5:1, 0.82/100 instr) —
+      icache thrash confirmed as the monolith cost; spawned the
+      residual-icache layout task on this evidence. P7 closed
+      without work: entropy payload is bitrate-bounded (~56
+      Kbit/frame jelly), refill cannot account for the monolith —
+      X4-negative stands for A55. P6 closed: coefficient_token_context
+      already shift/mask, token_cache clear already scan-scoped
+      (absorbed by P1)
+- [x] P-adst — simd 2D transform path generalized from DCT_DCT-only
+      to per-pass DCT/ADST selection (DctAdst/AdstDct/AdstAdst):
+      inverse_adst4/8/16 in i32x4 lanes with i64x2-extmul sb/sh
+      mirroring scalar exactly, same 4-lane row/column groups and
+      persistent scratch, scalar leftover-row tail kept. A55
+      jellyfish −2.5% grinder / −3.1% confirm (spreads ≤0.7%), BBB
+      −2.3% (spread 0.4%), anchors null. Scalar adst symbol gone
+      from profile. Residue: adst kernels re-introduce small zeroed
+      scratch copies (rare path, ≤0.3% total, candidate micro)
+- [x] icache layout experiment — measured null, NOT merged: the one
+      clean cold-outline shrank decode_residual 140.7→135.0KB arm32,
+      bench noise on both clips. L1I cost is per-block phase cycling
+      through hot code, not cold-code pollution; only P9-scale phase
+      batching could move it. Evidence in log
+- [ ] conditional tail remainder: P9 SB-row-fused loop filtering
+      (L2D refill only 5.5M/s ≈ 0.9GB/s — weak evidence, likely not
+      worth the structural cost); P10 drop per-frame 1.4MB neutral
+      fill (~0.3%, verify edge/ref semantics first)
 - [x] P3-lite — persistent IntraPredictionEdges + slice above-row
       gather: in-place fill with explicit missing-edge defaults
       (127/129 spans only), interior above row copied as fixed-width
@@ -355,6 +378,11 @@ shrank; traversal glue and intra prediction were promoted.
       interior: 18k Tx4 / 23k Tx8 / 31k Tx16). A55 jellyfish −3.7%
       (grinder and confirm, spreads 0.4-0.8%), BBB −1.2/−1.4%.
       Direct simd-vs-scalar sweep test; device tests green
+- [x] pass-0 loop filter simd — measured, NOT merged: transpose
+      lowering is good (8/12 vzip, no vtbl; probe via asm --arch
+      arm32) but Tx4 narrow is noise-level and Tx8 wide3 is a real
+      loss (+0.96% jelly). Pass 0 stays scalar on in-order arm32;
+      finding recorded in log + notes
 - [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
       close-out
 
