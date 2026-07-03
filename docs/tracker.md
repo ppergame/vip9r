@@ -454,7 +454,6 @@ is out of scope until it exists.
       but "software" still means "asked for software". 2026-07-02
       workstation, jellyfish 300: vip9r 25.0 ms/frame (VideoFrame +0.0),
       wc-software 0.4, wc-hardware 1.1
-- [ ] canned media manifest: curated /bulk/vip9r subset served through vite
 - [ ] spike, time-boxed: Cobalt on the streamer — can an arbitrary page load
       at all, and does it expose `VideoFrame` construction; sideloaded
       Chrome/WebView shell is the fallback device target

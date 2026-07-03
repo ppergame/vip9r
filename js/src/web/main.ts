@@ -11,31 +11,40 @@ type Mode = "play" | "bench";
 type CannedClip = { name: string; path: string; label: string };
 
 const CANNED: CannedClip[] = [
-  { name: "bear", path: "chromium/bear-vp9.ivf", label: "bear — 320p smoke clip" },
+  {
+    name: "citygen",
+    path: "synthetic/citygen-720p30-1-5-mbps.webm",
+    label: "citygen - 720p",
+  },
+  {
+    name: "bear",
+    path: "chromium/bear-vp9.ivf",
+    label: "bear - 320p smoke clip",
+  },
   {
     name: "jellyfish",
     path: "realworld/test-videos/jellyfish-720p30-1_68mbps.webm",
-    label: "jellyfish — 720p30",
+    label: "jellyfish - 720p30",
   },
   {
     name: "bbb",
     path: "realworld/wikimedia/big-buck-bunny-720p25-1_54mbps.webm",
-    label: "big buck bunny — 720p25",
+    label: "big buck bunny - 720p25",
   },
   {
     name: "caminandes",
     path: "realworld/wikimedia/caminandes-gran-dillama-720p24-1_55mbps.webm",
-    label: "caminandes — 720p24",
+    label: "caminandes - 720p24",
   },
   {
     name: "cosmos",
     path: "realworld/wikimedia/cosmos-laundromat-720p24-1_85mbps.webm",
-    label: "cosmos laundromat — 720p24",
+    label: "cosmos laundromat - 720p24",
   },
   {
     name: "tears",
     path: "realworld/wikimedia/tears-of-steel-720p24-1_92mbps.webm",
-    label: "tears of steel — 720p24",
+    label: "tears of steel - 720p24",
   },
 ];
 
@@ -95,7 +104,11 @@ function setParam(key: string, value: string): void {
     params.set(key, value);
   }
   const query = params.toString();
-  history.replaceState(null, "", query === "" ? location.pathname : `?${query}`);
+  history.replaceState(
+    null,
+    "",
+    query === "" ? location.pathname : `?${query}`,
+  );
 }
 
 function getParam(key: string): string {
@@ -112,7 +125,10 @@ function setMode(mode: Mode): void {
 
 function onMediaChanged(): void {
   mediaUrl.hidden = mediaSelect.value !== CUSTOM;
-  setParam("media", mediaSelect.value === CUSTOM ? mediaUrl.value.trim() : mediaSelect.value);
+  setParam(
+    "media",
+    mediaSelect.value === CUSTOM ? mediaUrl.value.trim() : mediaSelect.value,
+  );
   // The page always autostarts; picking media restarts through a clean load.
   if (mediaSelect.value !== CUSTOM || mediaUrl.value.trim() !== "") {
     location.reload();
@@ -133,7 +149,9 @@ function selectedMedia(): MediaChoice | undefined {
   return { label: clip.name, url: `/media/${clip.path}` };
 }
 
-async function fetchMedia(): Promise<{ choice: MediaChoice; bytes: ArrayBuffer } | undefined> {
+async function fetchMedia(): Promise<
+  { choice: MediaChoice; bytes: ArrayBuffer } | undefined
+> {
   const choice = selectedMedia();
   if (choice === undefined) {
     log("no media selected", "error");
@@ -142,7 +160,10 @@ async function fetchMedia(): Promise<{ choice: MediaChoice; bytes: ArrayBuffer }
   log(`fetching ${choice.label}`);
   const response = await fetch(choice.url);
   if (!response.ok) {
-    log(`media fetch failed: ${response.status} ${response.statusText}`, "error");
+    log(
+      `media fetch failed: ${response.status} ${response.statusText}`,
+      "error",
+    );
     return undefined;
   }
   const bytes = await response.arrayBuffer();
@@ -209,7 +230,9 @@ async function startBenchRun(): Promise<void> {
 }
 
 async function bootWasmCheck(): Promise<void> {
-  const { instance } = await instantiateVip9r((message) => log(message, "error"));
+  const { instance } = await instantiateVip9r((message) =>
+    log(message, "error"),
+  );
   new Vp9Decoder(instance, 1280, 720);
   log(`wasm ok: ${wasmUrl.split("/").pop()}`);
 }
@@ -239,13 +262,23 @@ function initControls(): void {
 
   mediaSelect.addEventListener("change", onMediaChanged);
   mediaUrl.addEventListener("change", onMediaChanged);
-  framesInput.addEventListener("change", () => setParam("frames", framesInput.value));
+  framesInput.addEventListener("change", () =>
+    setParam("frames", framesInput.value),
+  );
   tabs.play.addEventListener("click", () => switchMode("play"));
   tabs.bench.addEventListener("click", () => switchMode("bench"));
-  el<HTMLButtonElement>("play-start").addEventListener("click", () => void startPlay());
-  el<HTMLButtonElement>("bench-start").addEventListener("click", () => void startBenchRun());
+  el<HTMLButtonElement>("play-start").addEventListener(
+    "click",
+    () => void startPlay(),
+  );
+  el<HTMLButtonElement>("bench-start").addEventListener(
+    "click",
+    () => void startBenchRun(),
+  );
   copyLink.addEventListener("click", () => {
-    void navigator.clipboard.writeText(location.href).then(() => log(`link: ${location.href}`));
+    void navigator.clipboard
+      .writeText(location.href)
+      .then(() => log(`link: ${location.href}`));
   });
 }
 
