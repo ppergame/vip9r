@@ -889,3 +889,41 @@ streamer cpu0:
   and its icache phase cycling — structural, not kernel-shaped. Next
   levers are threads (M6, ~2.9x per ffvp9 scaling) and relaxed-simd,
   not more simd128 passes. ffvp9 gap narrowed to ~6.2x (144 vs 23.1).
+
+## 2026-07-03 — the arm32 safety-check tax, measured
+
+- Post-campaign question: how much A55 decode time goes to V8's
+  explicit wasm bounds checks? arm32 cannot use the 4GB guard-region
+  trick, so every heap access carries a compare-and-branch — the asm
+  dump of the 40-line standalone `read_bool` alone shows ~8 of them
+  (1d32b952-arm32). d8 ships "performance testing only" switches:
+  `--no-wasm-bounds-checks`, `--no-wasm-stack-checks`.
+- Manual counterbalanced B/C/C/B runs replicating the daemon's pinned
+  bench invocation (streamer cpu0, tree 1d32b952, frames 0:5,
+  measurement msPerFrame, spreads ≤1%):
+
+| flags dropped   | clip      | ms/frame      | delta  |
+|-----------------|-----------|---------------|--------|
+| bounds          | jellyfish | 144.5 → 124.7 | −13.7% |
+| stack           | jellyfish | 144.6 → 141.9 | −1.9%  |
+| bounds + stack  | jellyfish | 145.2 → 119.5 | −17.7% |
+| bounds          | BBB       | 109.1 → 90.3  | −17.3% |
+
+- Reading: safety checks are ~1/6 of A55 decode. Superadditive
+  (−17.7% combined vs −15.6% sum) — dropping the check branches also
+  improves TurboFan's code shape. The entropy-heavy clip pays more,
+  consistent with the tax landing on branchy, load-dense scalar code
+  rather than on simd kernels.
+- Not shippable (unsound; the browser pays these checks too). Value
+  is as a bound: of the ~6.3x single-core ffvp9 gap on the A55,
+  ~1.2x is check overhead that no source-level change can remove on
+  arm32, and that mostly vanishes on arm64 targets via guard-region
+  elision. Calibrates expectations for entropy-side micro-passes
+  (branchless read_bool, parse→dequant fusion — tracker) whose
+  upside sits inside the remaining ~5x.
+- While here, asm evidence for the tracker's branchless item: the
+  `read_bool` bit decision is a br_if diamond already in the wasm
+  (LLVM won't selectify across the state stores); V8 lowers it as a
+  data-dependent branch but demonstrably can emit predicated arm32
+  moves (`movhi` for the bool itself). Masked-arithmetic Rust would
+  make the whole update straight-line.
