@@ -425,12 +425,12 @@ shrank; traversal glue and intra prediction were promoted.
       0.7% spread). The bit-decision branch was never the cost;
       branchy source kept for clarity
 
-### M5a — demo page: play + race
+### M5 — demo page: play + bench
 
-Decode-and-play demo in desktop/device Chrome. No MSE/H.264 — that stays M5.
-Gated on M2 only; independent of M3/M4 and can run in parallel with the simd
-campaign. Vanilla TS + DOM, no web framework. Local dev only; hosting (VPS,
-COOP/COEP headers, CDN media) is out of scope until it exists.
+Decode-and-play demo in desktop/device Chrome. Gated on M2 only; independent
+of M3 and can run in parallel with optimization campaigns. Vanilla TS + DOM,
+no web framework. Local dev only; hosting (VPS, COOP/COEP headers, CDN media)
+is out of scope until it exists.
 
 - [ ] demo shell: tabbed race/play modes; media dropdown (canned manifest) plus
       URL textbox (direct fetch plays the CORS lottery; vite dev-server proxy
@@ -469,19 +469,66 @@ COOP/COEP headers, CDN media) is out of scope until it exists.
   badge vs golden sidecars, X-ray overlay (needs decoder side-data exports —
   weigh against the no-unused-affordances rule)
 
-### M4 — Encode
+### M6 — Threads (tile-parallel decode)
 
-minih264 in, MSE-playable H.264 out. Fitness gains a VMAF/size floor.
+Scoped 2026-07-03; full evidence and mechanics in `docs/design.md` (Threads
+section). Goal: close the A55 720p30 gap. Campaign-wrap numbers: jellyfish
+144 ms/frame (4.3x over 33.3), BBB 109 (2.7x over 40); the post-wrap fusion
+pass trimmed a few percent more, and the single-thread entropy levers are now
+exhausted (fusion merged, branchless bool decision null). ffvp9 frame
+threading measured ~2.9x on the A55 quad — the realistic scaling anchor. At
+~2.7-3x, BBB lands under budget; jellyfish lands ~1.5x over, so a residual
+gap likely survives and feeds the frame-parallel decision at the end.
 
-- [ ] integrate minih264 behind the required wasm/libc boundary
-- [ ] establish the VMAF/size floor
+Content evidence: the entire 720p perf corpus is coded with 4 tile columns
+and `frame_parallel_decoding_mode=1`; youtube 720p tracks are 4 columns
+(`frame_parallel=0`), 480p are 2; bear is single-tile. Tile columns
+parallelize entropy decode — the cost share nothing else touches — and the
+tile loop is already parallel-shaped (per-tile BoolDecoder and scratch,
+tile-scoped availability/MV search, no cross-tile pixel reads).
 
-### M5 — Chrome demo
+- [ ] toolchain + ABI spike: `RUSTC_BOOTSTRAP=1` on the pinned stable
+      toolchain, `-Zbuild-std=core`
+      `-Zbuild-std-features=compiler-builtins-mem`, target features
+      `+atomics,+bulk-memory`, link `--shared-memory --import-memory
+      --max-memory=N`; JS frontends create and import the shared
+      `WebAssembly.Memory`; golden stays green running single-threaded on
+      the threaded build
+- [ ] shadow-stack binding: every instance initializes `__stack_pointer` to
+      the same linker address, so N instances over one shared memory alias
+      one shadow stack. Reserve per-worker stack regions in the arena;
+      export a raw `global.set __stack_pointer` shim (asm, `nostack` — it
+      must not touch the stack it is replacing) called as the worker's
+      first export; coordinator keeps the linker-default stack
+      (`--stack-first` for overflow trapping); only the coordinator
+      instance touches static `SESSION`; verify lld's `__wasm_init_memory`
+      once-guard for passive segments
+- [ ] worker pool runtime: JS spawns N−1 workers (d8 `Worker` / web
+      `Worker`) over the shared memory; job dispatch via atomics +
+      `memory.atomic.wait32`/`notify`; coordinator blocks only in its
+      dedicated worker (blocking waits are illegal on the browser main
+      thread; d8 allows them anywhere)
+- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`);
+      driver detects shared-vs-plain memory per artifact
+      (`WebAssembly.Module.imports`) so threaded candidates A/B against
+      single-thread baselines under the existing counterbalanced protocol;
+      characterize streamer thermals/frequency under sustained 4-core load
+- [ ] tile-parallel tile decode: per-thread `SyntaxCounts` (merge after
+      join; skip accumulation entirely when adaptation is off — the
+      `frame_parallel=1` corpus makes it dead work even single-threaded),
+      per-thread `TileModeContexts`, contained-unsafe disjoint column-band
+      views of the current-frame planes and mode grid. Bit-exact by
+      construction; corpus golden gates the merge as usual
+- [ ] loop filter SB-row wavefront: `loop_filter_frame` is the serial
+      remainder after tile parallelism (~10-19% A55); parallelize as its
+      own measured pass
+- [ ] demo: vite COOP/COEP headers for SAB; verify `VideoFrame`
+      construction from SAB-backed views in Chrome; the Cobalt spike gains
+      a SAB/cross-origin-isolation probe
+- [ ] decision point: frame-parallel decode (per-row reference progress,
+      per-frame state snapshots, +1 frame latency) only if the A55 gap
+      survives tile + loop-filter parallelism
 
-Real browser on the phone, MSE player page, full VP9→H.264 loop.
+## M7 — Stretch
 
-- [ ] demo page: vite/TS, WebM demux + ISO BMFF mux, MSE append
-
-## M6 — Stretch
-
-relaxed-simd · threads · little-core (Cortex-A520) · 1080p
+relaxed-simd · little-core (Cortex-A520)

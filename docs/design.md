@@ -12,13 +12,14 @@ guide the next session without pretending the decoder architecture is settled.
   oracle, not an implementation template.
 - Unsafe Rust is allowed where integration or measured performance requires it;
   safe Rust remains the default.
-- minih264 is used for the showcase path. It is not the current design center.
+- The terminal sinks are d8 frame-md5 validation and browser `VideoFrame`
+  presentation. There is no encode path.
 - SIMD, relaxed SIMD, workers, allocator shape, and internal boundaries are
   choices to earn with evidence, not decisions to pre-bake into the docs.
   - 2026-07: wasm simd128 is in scope for M3. It is baseline in shipped Chrome
     and V8 lowers it to NEON on both device targets (arm64 and the streamer's
-    arm32), so it is portable, not CPU-specific tuning. Relaxed SIMD and
-    workers remain M6 stretch.
+    arm32), so it is portable, not CPU-specific tuning. Relaxed SIMD remains
+    stretch; threads are scoped as M6 (see the Threads section).
 
 ## Correctness
 
@@ -294,6 +295,58 @@ severing the sandbox.
 The devshell pins Google-published V8 canary bundles. Operational details for
 bumping those pins, running Android `d8` under qemu user emulation, and
 extracting ARM Wasm assembly live in [`docs/d8.md`](d8.md).
+
+## Threads (M6 scoping, 2026-07-03)
+
+Content evidence (keyframe-header probe over the corpus): every 720p realworld
+clip is coded with 4 tile columns (`tile_cols_log2=2`, the max at 1280w) and
+`frame_parallel_decoding_mode=1` (no backward probability adaptation). YouTube
+720p tracks are 4 columns with `frame_parallel=0`, 480p tracks are 2 columns;
+`bear-vp9.ivf` is single-tile. Four tile columns match the A55's four cores,
+and tile columns parallelize entropy decode — the cost share nothing else
+touches.
+
+The tile loop is already parallel-shaped: `parse_tile` (tile_syntax/mod.rs)
+builds a self-contained `TileParser` per tile — own `BoolDecoder`,
+stack-resident scratch — and left availability, MV candidate search, and intra
+above-right gathering are all tile-column-scoped, so there are no cross-tile
+reads of in-progress state. Shared mutable state across the tile loop is
+exactly four things: `SyntaxCounts` (per-thread + merge; dead work when
+adaptation is off, as on the whole `frame_parallel=1` perf corpus),
+`TileModeContexts` (tiles touch disjoint column ranges of frame-width arrays),
+the current-frame planes, and the mode grid. The last two are disjoint column
+bands over row-interleaved storage — safe splits can't express that, so
+parallel tiles need contained-unsafe disjoint views. `loop_filter_frame` runs
+frame-wide after the tiles and crosses tile edges by spec; it parallelizes
+separately as an SB-row wavefront.
+
+Platform mechanics: `+atomics,+bulk-memory` requires `core` built with the
+same features. The flake is hermetic, so bootstrap the pinned stable
+toolchain: `RUSTC_BOOTSTRAP=1` plus `-Zbuild-std=core`
+`-Zbuild-std-features=compiler-builtins-mem` (`rust-src` is already a pinned
+component; without the mem feature, build-std drops memcpy/memset). Link with
+`--shared-memory --import-memory --max-memory=N`; JS creates the shared
+`WebAssembly.Memory` and every frontend's instantiation changes. Shadow-stack
+hazard: each instance of the module initializes `__stack_pointer` to the same
+linker-chosen address, so N instances over one shared memory alias one shadow
+stack — each worker must bind a distinct arena-reserved stack region via a raw
+`global.set __stack_pointer` shim (asm, `nostack`; it must not touch the stack
+it is replacing) before any Rust frame runs. Only the coordinator instance may
+touch the static `SESSION`. lld guards passive-segment init
+(`__wasm_init_memory`) with a once-flag; verify rather than assume. Blocking
+waits (`memory.atomic.wait32`) are illegal on the browser main thread — the
+coordinator lives in a dedicated worker (the demo already decodes in one; d8
+`Worker`s allow blocking).
+
+Expectations: ffvp9 frame threading measured ~2.9x on the A55 quad (one
+cpufreq policy, in-order cores) — treat that as the realistic scaling anchor.
+At ~2.7-3x, BBB (109 ms/frame at campaign wrap) lands under its 40 ms budget;
+jellyfish (144 ms/frame) lands ~1.5x over 33.3 ms. The single-thread entropy
+levers are exhausted (2026-07-03: parse→dequant fusion merged, branchless
+bool decision measured null), so the residual jellyfish gap points at
+stacking frame-parallel decode (per-row reference progress, per-frame state
+snapshots, +1 frame latency) — a separate later decision, taken only if the
+gap survives tile + loop-filter parallelism.
 
 ## Work shape
 

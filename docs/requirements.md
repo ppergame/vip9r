@@ -5,12 +5,12 @@ work in progress.
 
 ## Premise
 
-Suppose a Media Source based web app needs to play VP9 content on a device that
-does not support VP9 hardware decode. The app could:
+Suppose a web app needs to play VP9 content on a device that does not support
+VP9 hardware decode. The app could:
 
-- Demux and decode WebM VP9 segments
-- Encode in H264 and mux into ISO BMFF
-- Append segments
+- Demux WebM VP9 segments
+- Decode in wasm
+- Present decoded frames as `VideoFrame`s on a canvas
 
 ### Objectives
 
@@ -23,11 +23,10 @@ does not support VP9 hardware decode. The app could:
 
 - Demo webpage
   - vite, TypeScript, vitest
-- Mux/demux
+- Demux
   - ad-hoc in TypeScript
 - Wasm module
-  - Safe Rust with unsafe blocks for platform integration, performance, minih264
-    integration
+  - Safe Rust with unsafe blocks for platform integration, performance
   - wasm32-unknown-unknown
   - Explore: bumper allocator, reset every GOP
   - Streaming I/O at frame granularity
@@ -42,8 +41,6 @@ does not support VP9 hardware decode. The app could:
       - no peeking at source code
         - this is an engineering, not a legal requirement
         - vip9r is a "derived work" of libvpx
-  - H.264 encoder
-    - minih264
 - Performance baseline
   - ffvp9, direct run through ADB
 - Performance oracle
@@ -65,7 +62,6 @@ does not support VP9 hardware decode. The app could:
 - Integration tests
   - Frame-level correctness: mandatory
   - Clip-level correctness: mandatory
-  - H.264 output quality: nice-to-have
 
 ## Agent roles and scope
 
