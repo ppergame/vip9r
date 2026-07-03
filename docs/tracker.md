@@ -298,9 +298,13 @@ shrank; traversal glue and intra prediction were promoted.
       widen/add/saturating-narrow rows (clip1-exact), scalar edge
       fallback, simd-vs-scalar sweep test. A55 −2.6% BBB / −3.4%
       jellyfish (spreads ~0.4%)
-- [ ] P-intra — predict_intra fast path: 10% on BBB; profile-split first
-      (predictor kernels vs edge gather), then common-mode (DC/V/H/TM)
-      row-slice or simd paths
+- [x] P-intra — predict_intra fast path: persistent pred buffer (1KB
+      zero-fill dropped), interior row-slice write-out with fixed-width
+      stores, DC/V/H/TM row/simd kernels + direct-to-plane for interior
+      blocks, directional modes stay scalar. A55 −2.6% BBB / −3.1%
+      jellyfish (no-op anchor −0.7%); buffer+write-out alone carries
+      most of BBB, mode kernels add on jellyfish. Edge gather untouched
+      (not worth a follow-up at current attribution)
 - [x] P4 — convolution kernel v2: merged extmul MACs + interp-buffer
       zero-fill removal, A55 −1.5% jellyfish / −0.5% BBB (memset removal
       is the main win). Negatives with asm evidence: V8 arm32 lowers

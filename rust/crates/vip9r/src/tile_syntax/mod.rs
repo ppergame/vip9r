@@ -529,6 +529,7 @@ fn parse_tile(
         prev_frame_modes: mode_buffers.prev_frame_modes,
         current_frame_modes: mode_buffers.current_frame_modes,
         reference_frames,
+        intra: IntraPredictionBuffers::new(),
         residual: ResidualBuffers::new(),
         interp_buffer: [0; MAX_INTERP_BUFFER],
     };
@@ -582,8 +583,21 @@ struct TileParser<'a, 'b, 'r> {
     prev_frame_modes: Option<ModeInfoView<'b>>,
     current_frame_modes: Option<ModeInfoViewMut<'b>>,
     reference_frames: Option<ReferenceFrames<'r>>,
+    intra: IntraPredictionBuffers,
     residual: ResidualBuffers,
     interp_buffer: InterpBuffer,
+}
+
+struct IntraPredictionBuffers {
+    pred: [u8; MAX_TX_COEFFS],
+}
+
+impl IntraPredictionBuffers {
+    const fn new() -> Self {
+        Self {
+            pred: [0; MAX_TX_COEFFS],
+        }
+    }
 }
 
 struct ResidualBuffers {
@@ -2207,7 +2221,7 @@ impl TileParser<'_, '_, '_> {
     }
 
     fn predict_intra(
-        &self,
+        &mut self,
         current_frame: &mut CurrentFrameMut<'_>,
         context: IntraPredictionContext,
     ) -> Result<(), TileSyntaxError> {
@@ -2225,18 +2239,25 @@ impl TileParser<'_, '_, '_> {
         let size = transform_width(context.tx_size);
         let plane = current_frame.plane_mut(context.plane)?;
         let edges = intra_prediction_edges(plane, context)?;
-        let mut pred = [0u8; MAX_TX_COEFFS];
-        intra_predict_block(
-            IntraPredictionRequest {
-                mode,
-                have_left: context.have_left,
-                have_above: context.have_above,
-                size,
-            },
+        let request = IntraPredictionRequest {
+            mode,
+            have_left: context.have_left,
+            have_above: context.have_above,
+            size,
+        };
+        if write_common_intra_prediction_direct(
+            plane,
+            context.start_x,
+            context.start_y,
+            request,
             &edges,
-            &mut pred,
-        )?;
-        write_prediction_block(plane, context.start_x, context.start_y, size, &pred)
+        )? {
+            return Ok(());
+        }
+
+        let pred = &mut self.intra.pred;
+        intra_predict_block(request, &edges, pred)?;
+        write_prediction_block(plane, context.start_x, context.start_y, size, pred)
     }
 
     fn predict_inter(
@@ -3836,13 +3857,132 @@ fn intra_predict_block(
     edges: &IntraPredictionEdges,
     pred: &mut [u8; MAX_TX_COEFFS],
 ) -> Result<(), TileSyntaxError> {
+    validate_intra_prediction_size(request.size)?;
+
+    match request.mode {
+        IntraMode::Dc => {
+            let value = dc_prediction_value(request, edges);
+            fill_prediction_block(pred, request.size, value)?;
+        }
+        IntraMode::V => {
+            for row in 0..request.size {
+                let dst = prediction_buffer_row_mut(pred, row, request.size)?;
+                store_prediction_row(dst, &edges.above_row, request.size);
+            }
+        }
+        IntraMode::H => {
+            for row in 0..request.size {
+                let dst = prediction_buffer_row_mut(pred, row, request.size)?;
+                fill_prediction_row(dst, edges.left_col[row], request.size);
+            }
+        }
+        IntraMode::Tm => {
+            for row in 0..request.size {
+                let dst = prediction_buffer_row_mut(pred, row, request.size)?;
+                true_motion_prediction_row(
+                    dst,
+                    &edges.above_row,
+                    edges.left_col[row],
+                    edges.above_left,
+                    request.size,
+                );
+            }
+        }
+        _ => intra_predict_block_scalar(request, edges, pred)?,
+    }
+
+    Ok(())
+}
+
+fn validate_intra_prediction_size(size: usize) -> Result<(), TileSyntaxError> {
+    if matches!(size, 4 | 8 | 16 | 32) {
+        Ok(())
+    } else {
+        Err(TileSyntaxError::InvalidBitstream)
+    }
+}
+
+fn write_common_intra_prediction_direct(
+    plane: &mut CurrentPlaneMut<'_>,
+    start_x: usize,
+    start_y: usize,
+    request: IntraPredictionRequest,
+    edges: &IntraPredictionEdges,
+) -> Result<bool, TileSyntaxError> {
+    if !matches!(
+        request.mode,
+        IntraMode::Dc | IntraMode::V | IntraMode::H | IntraMode::Tm
+    ) {
+        return Ok(false);
+    }
+
     let size = request.size;
-    if !matches!(size, 4 | 8 | 16 | 32) {
-        return Err(TileSyntaxError::InvalidBitstream);
+    validate_intra_prediction_size(size)?;
+    if !residual_block_inside(plane, (start_x, start_y), size) {
+        return Ok(false);
     }
 
     match request.mode {
-        IntraMode::Dc => dc_predict(request, edges, pred),
+        IntraMode::Dc => {
+            let value = dc_prediction_value(request, edges);
+            for row in 0..size {
+                let dst = direct_intra_prediction_row_mut(plane, start_x, start_y, row, size)?;
+                fill_prediction_row(dst, value, size);
+            }
+        }
+        IntraMode::V => {
+            for row in 0..size {
+                let dst = direct_intra_prediction_row_mut(plane, start_x, start_y, row, size)?;
+                store_prediction_row(dst, &edges.above_row, size);
+            }
+        }
+        IntraMode::H => {
+            for row in 0..size {
+                let dst = direct_intra_prediction_row_mut(plane, start_x, start_y, row, size)?;
+                fill_prediction_row(dst, edges.left_col[row], size);
+            }
+        }
+        IntraMode::Tm => {
+            for row in 0..size {
+                let dst = direct_intra_prediction_row_mut(plane, start_x, start_y, row, size)?;
+                true_motion_prediction_row(
+                    dst,
+                    &edges.above_row,
+                    edges.left_col[row],
+                    edges.above_left,
+                    size,
+                );
+            }
+        }
+        _ => unreachable!("mode was filtered above"),
+    }
+
+    Ok(true)
+}
+
+fn direct_intra_prediction_row_mut<'a>(
+    plane: &'a mut CurrentPlaneMut<'_>,
+    start_x: usize,
+    start_y: usize,
+    row: usize,
+    size: usize,
+) -> Result<&'a mut [u8], TileSyntaxError> {
+    let y = start_y
+        .checked_add(row)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    intra_prediction_row_mut(plane, start_x, y, size)?.ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+fn intra_predict_block_scalar(
+    request: IntraPredictionRequest,
+    edges: &IntraPredictionEdges,
+    pred: &mut [u8; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    let size = request.size;
+    validate_intra_prediction_size(size)?;
+
+    match request.mode {
+        IntraMode::Dc => dc_predict_scalar(request, edges, pred),
         IntraMode::V => {
             for row in 0..size {
                 for col in 0..size {
@@ -4015,14 +4155,25 @@ fn intra_predict_block(
     Ok(())
 }
 
-fn dc_predict(
+fn dc_predict_scalar(
     request: IntraPredictionRequest,
     edges: &IntraPredictionEdges,
     pred: &mut [u8; MAX_TX_COEFFS],
 ) {
     let size = request.size;
+    let value = dc_prediction_value(request, edges);
+
+    for row in 0..size {
+        for col in 0..size {
+            pred[row * size + col] = value;
+        }
+    }
+}
+
+fn dc_prediction_value(request: IntraPredictionRequest, edges: &IntraPredictionEdges) -> u8 {
+    let size = request.size;
     let log2_size = tx_width_log2(size);
-    let value = if request.have_left && request.have_above {
+    if request.have_left && request.have_above {
         let mut sum = 0u32;
         for i in 0..size {
             sum += u32::from(edges.left_col[i]) + u32::from(edges.above_row[i]);
@@ -4042,16 +4193,145 @@ fn dc_predict(
         ((sum + (1u32 << (log2_size - 1))) >> log2_size) as u8
     } else {
         128
-    };
+    }
+}
 
+fn fill_prediction_block(
+    pred: &mut [u8; MAX_TX_COEFFS],
+    size: usize,
+    value: u8,
+) -> Result<(), TileSyntaxError> {
     for row in 0..size {
+        let dst = prediction_buffer_row_mut(pred, row, size)?;
+        fill_prediction_row(dst, value, size);
+    }
+    Ok(())
+}
+
+fn prediction_buffer_row_mut(
+    pred: &mut [u8; MAX_TX_COEFFS],
+    row: usize,
+    size: usize,
+) -> Result<&mut [u8], TileSyntaxError> {
+    let start = row
+        .checked_mul(size)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let end = start
+        .checked_add(size)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    pred.get_mut(start..end)
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+#[inline(always)]
+fn fill_prediction_row(dst: &mut [u8], value: u8, size: usize) {
+    debug_assert_eq!(dst.len(), size);
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        let value = u8x16_splat(value);
+        match size {
+            4 => v128_store32_lane::<0>(value, dst.as_mut_ptr().cast::<u32>()),
+            8 => v128_store64_lane::<0>(value, dst.as_mut_ptr().cast::<u64>()),
+            16 => v128_store(dst.as_mut_ptr().cast::<v128>(), value),
+            32 => {
+                v128_store(dst.as_mut_ptr().cast::<v128>(), value);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), value);
+            }
+            _ => unreachable!("invalid intra prediction row width"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    match size {
+        4 => dst[..4].fill(value),
+        8 => dst[..8].fill(value),
+        16 => dst[..16].fill(value),
+        32 => dst[..32].fill(value),
+        _ => unreachable!("invalid intra prediction row width"),
+    }
+}
+
+#[inline(always)]
+fn true_motion_prediction_row(
+    dst: &mut [u8],
+    above: &[u8; MAX_INTRA_ABOVE],
+    left: u8,
+    above_left: u8,
+    size: usize,
+) {
+    debug_assert_eq!(dst.len(), size);
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        let delta = i16x8_splat(i16::from(left) - i16::from(above_left));
+        match size {
+            4 => {
+                let above = v128_load32_zero(above.as_ptr().cast::<u32>());
+                let values = true_motion_prediction_8(above, delta);
+                v128_store32_lane::<0>(values, dst.as_mut_ptr().cast::<u32>());
+            }
+            8 => {
+                let above = v128_load64_zero(above.as_ptr().cast::<u64>());
+                let values = true_motion_prediction_8(above, delta);
+                v128_store64_lane::<0>(values, dst.as_mut_ptr().cast::<u64>());
+            }
+            16 => {
+                let values = true_motion_prediction_16(above.as_ptr(), delta);
+                v128_store(dst.as_mut_ptr().cast::<v128>(), values);
+            }
+            32 => {
+                let lo = true_motion_prediction_16(above.as_ptr(), delta);
+                let hi = true_motion_prediction_16(above.as_ptr().add(16), delta);
+                v128_store(dst.as_mut_ptr().cast::<v128>(), lo);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), hi);
+            }
+            _ => unreachable!("invalid intra prediction row width"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let delta = i32::from(left) - i32::from(above_left);
         for col in 0..size {
-            pred[row * size + col] = value;
+            dst[col] = clip1(i32::from(above[col]) + delta);
         }
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn true_motion_prediction_8(above: v128, delta: v128) -> v128 {
+    let above = i16x8_extend_low_u8x16(above);
+    let values = i16x8_add(above, delta);
+    u8x16_narrow_i16x8(values, i16x8_splat(0))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn true_motion_prediction_16(above: *const u8, delta: v128) -> v128 {
+    let lo = unsafe { v128_load64_zero(above.cast::<u64>()) };
+    let hi = unsafe { v128_load64_zero(above.add(8).cast::<u64>()) };
+    let lo = i16x8_add(i16x8_extend_low_u8x16(lo), delta);
+    let hi = i16x8_add(i16x8_extend_low_u8x16(hi), delta);
+    u8x16_narrow_i16x8(lo, hi)
+}
+
 fn write_prediction_block(
+    plane: &mut CurrentPlaneMut<'_>,
+    start_x: usize,
+    start_y: usize,
+    size: usize,
+    pred: &[u8; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    if matches!(size, 4 | 8 | 16 | 32) && residual_block_inside(plane, (start_x, start_y), size) {
+        return write_prediction_block_interior(plane, start_x, start_y, size, pred);
+    }
+
+    write_prediction_block_scalar(plane, start_x, start_y, size, pred)
+}
+
+fn write_prediction_block_scalar(
     plane: &mut CurrentPlaneMut<'_>,
     start_x: usize,
     start_y: usize,
@@ -4070,6 +4350,101 @@ fn write_prediction_block(
         }
     }
     Ok(())
+}
+
+fn write_prediction_block_interior(
+    plane: &mut CurrentPlaneMut<'_>,
+    start_x: usize,
+    start_y: usize,
+    size: usize,
+    pred: &[u8; MAX_TX_COEFFS],
+) -> Result<(), TileSyntaxError> {
+    debug_assert!(residual_block_inside(plane, (start_x, start_y), size));
+    debug_assert!(matches!(size, 4 | 8 | 16 | 32));
+
+    for row in 0..size {
+        let y = start_y
+            .checked_add(row)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let dst = intra_prediction_row_mut(plane, start_x, y, size)?
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let pred_start = row
+            .checked_mul(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let pred_end = pred_start
+            .checked_add(size)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let pred_row = pred
+            .get(pred_start..pred_end)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        store_prediction_row(dst, pred_row, size);
+    }
+
+    Ok(())
+}
+
+fn intra_prediction_row_mut<'a>(
+    plane: &'a mut CurrentPlaneMut<'_>,
+    x: usize,
+    y: usize,
+    width: usize,
+) -> Result<Option<&'a mut [u8]>, TileSyntaxError> {
+    if x >= plane.width || y >= plane.height {
+        return Ok(None);
+    }
+    let visible_width = core::cmp::min(width, plane.width - x);
+    let start = y
+        .checked_mul(plane.stride)
+        .and_then(|row| row.checked_add(x))
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let end = start
+        .checked_add(visible_width)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    plane
+        .data
+        .get_mut(start..end)
+        .map(Some)
+        .ok_or(TileSyntaxError::InvalidBitstream)
+}
+
+#[inline(always)]
+fn store_prediction_row(dst: &mut [u8], src: &[u8], size: usize) {
+    debug_assert_eq!(dst.len(), size);
+    debug_assert!(src.len() >= size);
+
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        match size {
+            4 => {
+                let value = v128_load32_zero(src.as_ptr().cast::<u32>());
+                v128_store32_lane::<0>(value, dst.as_mut_ptr().cast::<u32>());
+            }
+            8 => {
+                let value = v128_load64_zero(src.as_ptr().cast::<u64>());
+                v128_store64_lane::<0>(value, dst.as_mut_ptr().cast::<u64>());
+            }
+            16 => {
+                let value = v128_load(src.as_ptr().cast::<v128>());
+                v128_store(dst.as_mut_ptr().cast::<v128>(), value);
+            }
+            32 => {
+                let lo = v128_load(src.as_ptr().cast::<v128>());
+                let hi = v128_load(src.as_ptr().add(16).cast::<v128>());
+                v128_store(dst.as_mut_ptr().cast::<v128>(), lo);
+                v128_store(dst.as_mut_ptr().add(16).cast::<v128>(), hi);
+            }
+            _ => unreachable!("invalid intra prediction row width"),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    match size {
+        4 => dst[..4].copy_from_slice(&src[..4]),
+        8 => dst[..8].copy_from_slice(&src[..8]),
+        16 => dst[..16].copy_from_slice(&src[..16]),
+        32 => dst[..32].copy_from_slice(&src[..32]),
+        _ => unreachable!("invalid intra prediction row width"),
+    }
 }
 
 fn reconstruct(
@@ -7704,16 +8079,17 @@ mod tests {
     use super::{
         BlockSize, CoefToken, CurrentFrameMut, CurrentPlaneMut, DecodedBlockInfo, FrameModeBuffers,
         GOLDEN_FRAME, INTRA_FRAME, InterPredictionContext, InterPredictionWrite, IntraMode,
-        IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME, MAX_INTERP_BUFFER,
-        MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView, ModeInfoViewMut, MotionVector,
-        NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS, ReferenceFrame, ReferenceFrames,
-        ReferencePlane, ResidualBuffers, STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS,
-        SUBPEL_SHIFTS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
-        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
-        ZEROMV, add_residual_block, add_residual_block_scalar, inter_predict_sample,
-        inter_predict_subpel_unscaled_block, inter_predict_subpel_unscaled_block_scalar,
-        intra_predict_block, parse_intra_tiles, read_coef, scan_table, select_inter_mv,
-        transform_width,
+        IntraPredictionBuffers, IntraPredictionEdges, IntraPredictionRequest, LAST_FRAME,
+        MAX_INTERP_BUFFER, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH, ModeInfoView,
+        ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo, REF_LISTS,
+        ReferenceFrame, ReferenceFrames, ReferencePlane, ResidualBuffers, STORED_MODE_INFO_BYTES,
+        SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS, SWITCHABLE_FILTER_SENTINEL, ScaledMotion,
+        StoredModeInfo, TileModeContexts, TileParseBuffers, TileParser, TileSyntaxError, TxSize,
+        TxType, UnscaledInterPrediction, ZEROMV, add_residual_block, add_residual_block_scalar,
+        inter_predict_sample, inter_predict_subpel_unscaled_block,
+        inter_predict_subpel_unscaled_block_scalar, intra_predict_block,
+        intra_predict_block_scalar, parse_intra_tiles, read_coef, scan_table, select_inter_mv,
+        transform_width, write_common_intra_prediction_direct, write_prediction_block_scalar,
     };
     use crate::boolcoder::BoolDecoder;
     use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
@@ -7932,6 +8308,122 @@ mod tests {
         assert_eq!(pred[5], 0);
         assert_eq!(pred[10], 100);
         assert_eq!(pred[15], 100);
+    }
+
+    #[test]
+    fn optimized_intra_prediction_matches_scalar_sweep() {
+        const MODES: [IntraMode; 10] = [
+            IntraMode::Dc,
+            IntraMode::V,
+            IntraMode::H,
+            IntraMode::D45,
+            IntraMode::D135,
+            IntraMode::D117,
+            IntraMode::D153,
+            IntraMode::D207,
+            IntraMode::D63,
+            IntraMode::Tm,
+        ];
+
+        let mut seed = 0x1357_2468;
+        for size in [4, 8, 16, 32] {
+            for mode in MODES {
+                for have_left in [false, true] {
+                    for have_above in [false, true] {
+                        let edges = random_prediction_edges(&mut seed);
+                        let request = IntraPredictionRequest {
+                            mode,
+                            have_left,
+                            have_above,
+                            size,
+                        };
+                        let mut scalar = [0x5a; MAX_TX_COEFFS];
+                        let mut optimized = [0xa5; MAX_TX_COEFFS];
+
+                        intra_predict_block_scalar(request, &edges, &mut scalar).unwrap();
+                        intra_predict_block(request, &edges, &mut optimized).unwrap();
+
+                        assert_eq!(
+                            &optimized[..size * size],
+                            &scalar[..size * size],
+                            "mode={mode:?} size={size} have_left={have_left} \
+                             have_above={have_above}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_common_intra_prediction_matches_scalar_write() {
+        const MODES: [IntraMode; 4] = [IntraMode::Dc, IntraMode::V, IntraMode::H, IntraMode::Tm];
+        const STRIDE: usize = 48;
+        const HEIGHT: usize = 40;
+        const START_X: usize = 3;
+        const START_Y: usize = 2;
+
+        let mut seed = 0x89ab_cdef;
+        for size in [4, 8, 16, 32] {
+            for mode in MODES {
+                for have_left in [false, true] {
+                    for have_above in [false, true] {
+                        let edges = random_prediction_edges(&mut seed);
+                        let request = IntraPredictionRequest {
+                            mode,
+                            have_left,
+                            have_above,
+                            size,
+                        };
+                        let mut scalar_data = [0x33; STRIDE * HEIGHT];
+                        let mut direct_data = [0x33; STRIDE * HEIGHT];
+                        let mut pred = [0; MAX_TX_COEFFS];
+
+                        intra_predict_block_scalar(request, &edges, &mut pred).unwrap();
+                        {
+                            let mut scalar_plane = CurrentPlaneMut {
+                                data: &mut scalar_data,
+                                width: 40,
+                                height: HEIGHT,
+                                stride: STRIDE,
+                            };
+                            write_prediction_block_scalar(
+                                &mut scalar_plane,
+                                START_X,
+                                START_Y,
+                                size,
+                                &pred,
+                            )
+                            .unwrap();
+                        }
+                        {
+                            let mut direct_plane = CurrentPlaneMut {
+                                data: &mut direct_data,
+                                width: 40,
+                                height: HEIGHT,
+                                stride: STRIDE,
+                            };
+                            assert!(
+                                write_common_intra_prediction_direct(
+                                    &mut direct_plane,
+                                    START_X,
+                                    START_Y,
+                                    request,
+                                    &edges,
+                                )
+                                .unwrap()
+                            );
+                        }
+
+                        assert_eq!(
+                            direct_data, scalar_data,
+                            "mode={mode:?} size={size} have_left={have_left} \
+                             have_above={have_above}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -8197,6 +8689,7 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: Some(ReferenceFrames::new(references)),
+                intra: IntraPredictionBuffers::new(),
                 residual: ResidualBuffers::new(),
                 interp_buffer: [0; MAX_INTERP_BUFFER],
             };
@@ -8296,6 +8789,7 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: None,
+                intra: IntraPredictionBuffers::new(),
                 residual: ResidualBuffers::new(),
                 interp_buffer: [0; MAX_INTERP_BUFFER],
             };
@@ -8352,6 +8846,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            intra: IntraPredictionBuffers::new(),
             residual: ResidualBuffers::new(),
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
@@ -8409,6 +8904,7 @@ mod tests {
                 prev_frame_modes: None,
                 current_frame_modes: None,
                 reference_frames: None,
+                intra: IntraPredictionBuffers::new(),
                 residual: ResidualBuffers::new(),
                 interp_buffer: [0; MAX_INTERP_BUFFER],
             };
@@ -8471,6 +8967,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            intra: IntraPredictionBuffers::new(),
             residual: ResidualBuffers::new(),
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
@@ -8601,6 +9098,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            intra: IntraPredictionBuffers::new(),
             residual: ResidualBuffers::new(),
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
@@ -8641,6 +9139,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: None,
             reference_frames: None,
+            intra: IntraPredictionBuffers::new(),
             residual: ResidualBuffers::new(),
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
@@ -8751,6 +9250,7 @@ mod tests {
                 prev_frame_modes: Some(prev_frame_modes),
                 current_frame_modes: Some(current_frame_modes),
                 reference_frames: None,
+                intra: IntraPredictionBuffers::new(),
                 residual: ResidualBuffers::new(),
                 interp_buffer: [0; MAX_INTERP_BUFFER],
             };
@@ -8838,6 +9338,7 @@ mod tests {
             prev_frame_modes: None,
             current_frame_modes: Some(current_modes),
             reference_frames: None,
+            intra: IntraPredictionBuffers::new(),
             residual: ResidualBuffers::new(),
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
@@ -8941,6 +9442,18 @@ mod tests {
             above_row,
             left_col,
         }
+    }
+
+    fn random_prediction_edges(seed: &mut u32) -> IntraPredictionEdges {
+        let mut edges = IntraPredictionEdges {
+            above_left: 0,
+            above_row: [0; MAX_INTRA_ABOVE],
+            left_col: [0; MAX_TX_WIDTH],
+        };
+        fill_pseudorandom(core::slice::from_mut(&mut edges.above_left), seed);
+        fill_pseudorandom(&mut edges.above_row, seed);
+        fill_pseudorandom(&mut edges.left_col, seed);
+        edges
     }
 
     fn prediction(

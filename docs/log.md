@@ -610,3 +610,42 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   simd-vs-scalar sweep over tx sizes/overhangs/extreme residuals.
   Measured on the A55: **−2.6% big-buck-bunny, −3.4% jellyfish**
   (spreads ~0.4%). Compliance corpus 307/307.
+
+## 2026-07-03 — A55 campaign: convolution v2, interp buffer de-uninit
+
+- Subpel convolution v2 merged: MAC helpers moved to
+  `i32x4_extmul_low/high_i16x8` and the per-block 5041-byte interp
+  buffer zero-fill removed. **−1.5% jellyfish, −0.5% BBB** on the A55 —
+  the memset removal is most of the win. The grinder produced asm-dump
+  evidence for three negatives worth remembering: V8 arm32 lowers
+  `i8x16_shuffle` to VTBL (not VEXT), so shuffle-based tap gather is
+  dead on arrival; extmul does not fuse with add into VMLAL (lowers as
+  vmovl+vmul+add); a vertical sliding-register window spills under V8's
+  regalloc. Pure-i16 accumulation is impossible for the 8-tap filters
+  (worst-case coefficient sum × 255 exceeds i16).
+- The zero-fill removal initially shipped as a `MaybeUninit` buffer
+  (~30 `assume_init` sites, duplicated `*_to_uninit` helper twins). A
+  follow-up refactor replaced it with a parser-owned persistent
+  `[u8; MAX_INTERP_BUFFER]` — same ResidualBuffers ownership pattern,
+  stale-read violations become deterministic md5 bugs instead of UB.
+  Zero unsafe remains in the interp path; the simd/scalar helper twins
+  were unified under a `const USE_SIMD: bool` generic (net −342 lines).
+  Gate: perf-neutral on both clips (jellyfish −0.27% inside a 0.54%
+  spread, BBB +0.01%), 89/89 tests host+device, compliance 307/307.
+
+## 2026-07-03 — A55 campaign: intra prediction fast paths
+
+- Intra prediction got the residual-path treatment: parser-owned
+  persistent pred buffer (drops a 1KB zero-fill per predicted tx-block),
+  interior write-out as row slices with fixed-width 4/8/16/32-byte
+  stores instead of per-pixel checked `set_visible`, and row-oriented
+  kernels for the common modes — DC/V/H as fills/row stores, TM as
+  widened i16 add + saturating u8 narrow (clip1-exact, same trick as
+  add_residual). Fully-interior DC/V/H/TM blocks predict directly into
+  the plane and skip the pred buffer entirely; directional modes and
+  frame-edge blocks keep the scalar reference path, which the sweep
+  tests pin against.
+- Measured on the A55: **−2.6% BBB, −3.1% jellyfish** against a −0.7%
+  no-op anchor. The A/B split shows the buffer + chunked write-out
+  carries nearly all of the BBB win; the mode kernels add ~1% more on
+  jellyfish. Compliance corpus 307/307, 91/91 tests host+device.
