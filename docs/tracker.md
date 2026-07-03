@@ -347,6 +347,14 @@ shrank; traversal glue and intra prediction were promoted.
       All four 512B fill/copy sites gone from the wasm dump;
       decode_residual memory ops 18 → 7. A55 BBB −5.1% grinder /
       −4.4% confirm (spread 0.3-1.0%), jellyfish −1.1% (spread 0.2%)
+- [x] P8-wide — pass-1 wide loop filter simd (Tx8x8 wide3 kernel,
+      Tx16x16/Tx32x32 wide3/wide4 kernel), same transpose-free 8-lane
+      structure as the narrow kernel, disjoint regime masks blended
+      via bitselect, v128_any_true early-outs (no bitmask ops).
+      Segment-mix histogram justified both kernels (jelly pass-1
+      interior: 18k Tx4 / 23k Tx8 / 31k Tx16). A55 jellyfish −3.7%
+      (grinder and confirm, spreads 0.4-0.8%), BBB −1.2/−1.4%.
+      Direct simd-vs-scalar sweep test; device tests green
 - [ ] end-of-campaign: refreshed A55/X4 margin table in log.md, notes
       close-out
 

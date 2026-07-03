@@ -5416,11 +5416,21 @@ fn loop_filter_segment(
                 .and_then(|row| row.checked_add(x))
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
             #[cfg(target_arch = "wasm32")]
-            if len == 8
-                && filter_size == TxSize::Tx4x4
-                && loop_filter_tx4x4_horizontal_8(plane.data, base, plane.stride, strength)
-            {
-                return Ok(());
+            if len == 8 {
+                let filtered = match filter_size {
+                    TxSize::Tx4x4 => {
+                        loop_filter_tx4x4_horizontal_8(plane.data, base, plane.stride, strength)
+                    }
+                    TxSize::Tx8x8 => {
+                        loop_filter_tx8x8_horizontal_8(plane.data, base, plane.stride, strength)
+                    }
+                    TxSize::Tx16x16 | TxSize::Tx32x32 => {
+                        loop_filter_tx16x16_horizontal_8(plane.data, base, plane.stride, strength)
+                    }
+                };
+                if filtered {
+                    return Ok(());
+                }
             }
             for _ in 0..len {
                 sample_filter_direct(plane.data, base, plane.stride, filter_size, strength);
@@ -5576,6 +5586,803 @@ fn loop_filter_tx4x4_horizontal_8(
     );
 
     true
+}
+
+#[cfg(target_arch = "wasm32")]
+struct LoopFilterMasks8 {
+    filter: v128,
+    hev: v128,
+    flat: v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct LoopFilterNarrowBytes {
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct LoopFilterWide3Bytes {
+    p2: v128,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    q2: v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct LoopFilterWide4Bytes {
+    p6: v128,
+    p5: v128,
+    p4: v128,
+    p3: v128,
+    p2: v128,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    q2: v128,
+    q3: v128,
+    q4: v128,
+    q5: v128,
+    q6: v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn loop_filter_tx8x8_horizontal_8(
+    data: &mut [u8],
+    base: usize,
+    stride: usize,
+    strength: LoopFilterStrength,
+) -> bool {
+    let q0 = load_loop_filter_row_8(data, base);
+    let q1 = load_loop_filter_row_8(data, base + stride);
+    let q2 = load_loop_filter_row_8(data, base + 2 * stride);
+    let q3 = load_loop_filter_row_8(data, base + 3 * stride);
+    let p0 = load_loop_filter_row_8(data, base - stride);
+    let p1 = load_loop_filter_row_8(data, base - 2 * stride);
+    let p2 = load_loop_filter_row_8(data, base - 3 * stride);
+    let p3 = load_loop_filter_row_8(data, base - 4 * stride);
+
+    let q0s = signed_sample_i16x8(q0);
+    let q1s = signed_sample_i16x8(q1);
+    let q2s = signed_sample_i16x8(q2);
+    let q3s = signed_sample_i16x8(q3);
+    let p0s = signed_sample_i16x8(p0);
+    let p1s = signed_sample_i16x8(p1);
+    let p2s = signed_sample_i16x8(p2);
+    let p3s = signed_sample_i16x8(p3);
+
+    let masks = loop_filter_masks_horizontal_8(p3s, p2s, p1s, p0s, q0s, q1s, q2s, q3s, strength);
+    // v128_any_true, not i16x8_bitmask: see the Tx4x4 kernel comment.
+    if !v128_any_true(masks.filter) {
+        return true;
+    }
+
+    let wide3_filter = v128_and(masks.filter, masks.flat);
+    let narrow_filter = v128_and(masks.filter, v128_not(masks.flat));
+    if !v128_any_true(wide3_filter) {
+        store_loop_filter_narrow_horizontal_8(
+            data,
+            base,
+            stride,
+            p1,
+            p0,
+            q0,
+            q1,
+            p1s,
+            p0s,
+            q0s,
+            q1s,
+            narrow_filter,
+            masks.hev,
+        );
+        return true;
+    }
+
+    let wide3 = loop_filter_wide3_outputs_horizontal_8(
+        unsigned_sample_i16x8(p3),
+        unsigned_sample_i16x8(p2),
+        unsigned_sample_i16x8(p1),
+        unsigned_sample_i16x8(p0),
+        unsigned_sample_i16x8(q0),
+        unsigned_sample_i16x8(q1),
+        unsigned_sample_i16x8(q2),
+        unsigned_sample_i16x8(q3),
+    );
+
+    if !v128_any_true(narrow_filter) {
+        store_loop_filter_wide3_horizontal_8(
+            data,
+            base,
+            stride,
+            p2,
+            p1,
+            p0,
+            q0,
+            q1,
+            q2,
+            wide3,
+            wide3_filter,
+        );
+        return true;
+    }
+
+    let narrow = loop_filter_narrow_outputs_horizontal_8(p1s, p0s, q0s, q1s, masks.hev);
+    let wide3_bytes = i16x8_mask_to_u8x8(wide3_filter);
+    let narrow_p0q0_bytes = i16x8_mask_to_u8x8(narrow_filter);
+    let narrow_p1q1_bytes = i16x8_mask_to_u8x8(v128_and(narrow_filter, v128_not(masks.hev)));
+
+    store_loop_filter_row_8(
+        data,
+        base - 3 * stride,
+        v128_bitselect(wide3.p2, p2, wide3_bytes),
+    );
+    let p1_mixed = v128_bitselect(narrow.p1, p1, narrow_p1q1_bytes);
+    store_loop_filter_row_8(
+        data,
+        base - 2 * stride,
+        v128_bitselect(wide3.p1, p1_mixed, wide3_bytes),
+    );
+    let p0_mixed = v128_bitselect(narrow.p0, p0, narrow_p0q0_bytes);
+    store_loop_filter_row_8(
+        data,
+        base - stride,
+        v128_bitselect(wide3.p0, p0_mixed, wide3_bytes),
+    );
+    let q0_mixed = v128_bitselect(narrow.q0, q0, narrow_p0q0_bytes);
+    store_loop_filter_row_8(data, base, v128_bitselect(wide3.q0, q0_mixed, wide3_bytes));
+    let q1_mixed = v128_bitselect(narrow.q1, q1, narrow_p1q1_bytes);
+    store_loop_filter_row_8(
+        data,
+        base + stride,
+        v128_bitselect(wide3.q1, q1_mixed, wide3_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base + 2 * stride,
+        v128_bitselect(wide3.q2, q2, wide3_bytes),
+    );
+
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn loop_filter_tx16x16_horizontal_8(
+    data: &mut [u8],
+    base: usize,
+    stride: usize,
+    strength: LoopFilterStrength,
+) -> bool {
+    let q0 = load_loop_filter_row_8(data, base);
+    let q1 = load_loop_filter_row_8(data, base + stride);
+    let q2 = load_loop_filter_row_8(data, base + 2 * stride);
+    let q3 = load_loop_filter_row_8(data, base + 3 * stride);
+    let p0 = load_loop_filter_row_8(data, base - stride);
+    let p1 = load_loop_filter_row_8(data, base - 2 * stride);
+    let p2 = load_loop_filter_row_8(data, base - 3 * stride);
+    let p3 = load_loop_filter_row_8(data, base - 4 * stride);
+
+    let q0s = signed_sample_i16x8(q0);
+    let q1s = signed_sample_i16x8(q1);
+    let q2s = signed_sample_i16x8(q2);
+    let q3s = signed_sample_i16x8(q3);
+    let p0s = signed_sample_i16x8(p0);
+    let p1s = signed_sample_i16x8(p1);
+    let p2s = signed_sample_i16x8(p2);
+    let p3s = signed_sample_i16x8(p3);
+
+    let masks = loop_filter_masks_horizontal_8(p3s, p2s, p1s, p0s, q0s, q1s, q2s, q3s, strength);
+    // v128_any_true, not i16x8_bitmask: see the Tx4x4 kernel comment.
+    if !v128_any_true(masks.filter) {
+        return true;
+    }
+
+    let flat_filter = v128_and(masks.filter, masks.flat);
+    let narrow_filter = v128_and(masks.filter, v128_not(masks.flat));
+    if !v128_any_true(flat_filter) {
+        store_loop_filter_narrow_horizontal_8(
+            data,
+            base,
+            stride,
+            p1,
+            p0,
+            q0,
+            q1,
+            p1s,
+            p0s,
+            q0s,
+            q1s,
+            narrow_filter,
+            masks.hev,
+        );
+        return true;
+    }
+
+    let q4 = load_loop_filter_row_8(data, base + 4 * stride);
+    let q5 = load_loop_filter_row_8(data, base + 5 * stride);
+    let q6 = load_loop_filter_row_8(data, base + 6 * stride);
+    let q7 = load_loop_filter_row_8(data, base + 7 * stride);
+    let p4 = load_loop_filter_row_8(data, base - 5 * stride);
+    let p5 = load_loop_filter_row_8(data, base - 6 * stride);
+    let p6 = load_loop_filter_row_8(data, base - 7 * stride);
+    let p7 = load_loop_filter_row_8(data, base - 8 * stride);
+
+    let q4s = signed_sample_i16x8(q4);
+    let q5s = signed_sample_i16x8(q5);
+    let q6s = signed_sample_i16x8(q6);
+    let q7s = signed_sample_i16x8(q7);
+    let p4s = signed_sample_i16x8(p4);
+    let p5s = signed_sample_i16x8(p5);
+    let p6s = signed_sample_i16x8(p6);
+    let p7s = signed_sample_i16x8(p7);
+
+    let flat2 = loop_filter_flat2_horizontal_8(p7s, p6s, p5s, p4s, p0s, q0s, q4s, q5s, q6s, q7s);
+    let wide4_filter = v128_and(flat_filter, flat2);
+    let wide3_filter = v128_and(flat_filter, v128_not(flat2));
+    let has_narrow = v128_any_true(narrow_filter);
+    let has_wide3 = v128_any_true(wide3_filter);
+    let has_wide4 = v128_any_true(wide4_filter);
+
+    let narrow = if has_narrow {
+        loop_filter_narrow_outputs_horizontal_8(p1s, p0s, q0s, q1s, masks.hev)
+    } else {
+        LoopFilterNarrowBytes { p1, p0, q0, q1 }
+    };
+
+    let p3u = unsigned_sample_i16x8(p3);
+    let p2u = unsigned_sample_i16x8(p2);
+    let p1u = unsigned_sample_i16x8(p1);
+    let p0u = unsigned_sample_i16x8(p0);
+    let q0u = unsigned_sample_i16x8(q0);
+    let q1u = unsigned_sample_i16x8(q1);
+    let q2u = unsigned_sample_i16x8(q2);
+    let q3u = unsigned_sample_i16x8(q3);
+
+    let wide3 = if has_wide3 {
+        loop_filter_wide3_outputs_horizontal_8(p3u, p2u, p1u, p0u, q0u, q1u, q2u, q3u)
+    } else {
+        LoopFilterWide3Bytes {
+            p2,
+            p1,
+            p0,
+            q0,
+            q1,
+            q2,
+        }
+    };
+
+    let wide4 = if has_wide4 {
+        loop_filter_wide4_outputs_horizontal_8(
+            unsigned_sample_i16x8(p7),
+            unsigned_sample_i16x8(p6),
+            unsigned_sample_i16x8(p5),
+            unsigned_sample_i16x8(p4),
+            p3u,
+            p2u,
+            p1u,
+            p0u,
+            q0u,
+            q1u,
+            q2u,
+            q3u,
+            unsigned_sample_i16x8(q4),
+            unsigned_sample_i16x8(q5),
+            unsigned_sample_i16x8(q6),
+            unsigned_sample_i16x8(q7),
+        )
+    } else {
+        LoopFilterWide4Bytes {
+            p6,
+            p5,
+            p4,
+            p3,
+            p2,
+            p1,
+            p0,
+            q0,
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+        }
+    };
+
+    let narrow_p0q0_bytes = i16x8_mask_to_u8x8(narrow_filter);
+    let narrow_p1q1_bytes = i16x8_mask_to_u8x8(v128_and(narrow_filter, v128_not(masks.hev)));
+    let wide3_bytes = i16x8_mask_to_u8x8(wide3_filter);
+    let wide4_bytes = i16x8_mask_to_u8x8(wide4_filter);
+
+    if has_wide4 {
+        store_loop_filter_row_8(
+            data,
+            base - 7 * stride,
+            v128_bitselect(wide4.p6, p6, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base - 6 * stride,
+            v128_bitselect(wide4.p5, p5, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base - 5 * stride,
+            v128_bitselect(wide4.p4, p4, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base - 4 * stride,
+            v128_bitselect(wide4.p3, p3, wide4_bytes),
+        );
+    }
+
+    let mut p2_mixed = p2;
+    if has_wide3 {
+        p2_mixed = v128_bitselect(wide3.p2, p2_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        p2_mixed = v128_bitselect(wide4.p2, p2_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base - 3 * stride, p2_mixed);
+
+    let mut p1_mixed = p1;
+    if has_narrow {
+        p1_mixed = v128_bitselect(narrow.p1, p1_mixed, narrow_p1q1_bytes);
+    }
+    if has_wide3 {
+        p1_mixed = v128_bitselect(wide3.p1, p1_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        p1_mixed = v128_bitselect(wide4.p1, p1_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base - 2 * stride, p1_mixed);
+
+    let mut p0_mixed = p0;
+    if has_narrow {
+        p0_mixed = v128_bitselect(narrow.p0, p0_mixed, narrow_p0q0_bytes);
+    }
+    if has_wide3 {
+        p0_mixed = v128_bitselect(wide3.p0, p0_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        p0_mixed = v128_bitselect(wide4.p0, p0_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base - stride, p0_mixed);
+
+    let mut q0_mixed = q0;
+    if has_narrow {
+        q0_mixed = v128_bitselect(narrow.q0, q0_mixed, narrow_p0q0_bytes);
+    }
+    if has_wide3 {
+        q0_mixed = v128_bitselect(wide3.q0, q0_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        q0_mixed = v128_bitselect(wide4.q0, q0_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base, q0_mixed);
+
+    let mut q1_mixed = q1;
+    if has_narrow {
+        q1_mixed = v128_bitselect(narrow.q1, q1_mixed, narrow_p1q1_bytes);
+    }
+    if has_wide3 {
+        q1_mixed = v128_bitselect(wide3.q1, q1_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        q1_mixed = v128_bitselect(wide4.q1, q1_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base + stride, q1_mixed);
+
+    let mut q2_mixed = q2;
+    if has_wide3 {
+        q2_mixed = v128_bitselect(wide3.q2, q2_mixed, wide3_bytes);
+    }
+    if has_wide4 {
+        q2_mixed = v128_bitselect(wide4.q2, q2_mixed, wide4_bytes);
+    }
+    store_loop_filter_row_8(data, base + 2 * stride, q2_mixed);
+
+    if has_wide4 {
+        store_loop_filter_row_8(
+            data,
+            base + 3 * stride,
+            v128_bitselect(wide4.q3, q3, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base + 4 * stride,
+            v128_bitselect(wide4.q4, q4, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base + 5 * stride,
+            v128_bitselect(wide4.q5, q5, wide4_bytes),
+        );
+        store_loop_filter_row_8(
+            data,
+            base + 6 * stride,
+            v128_bitselect(wide4.q6, q6, wide4_bytes),
+        );
+    }
+
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_masks_horizontal_8(
+    p3s: v128,
+    p2s: v128,
+    p1s: v128,
+    p0s: v128,
+    q0s: v128,
+    q1s: v128,
+    q2s: v128,
+    q3s: v128,
+    strength: LoopFilterStrength,
+) -> LoopFilterMasks8 {
+    let limit = i16x8_splat(i16::from(strength.limit));
+    let p3p2 = abs_diff_i16x8(p3s, p2s);
+    let p2p1 = abs_diff_i16x8(p2s, p1s);
+    let p1p0 = abs_diff_i16x8(p1s, p0s);
+    let q1q0 = abs_diff_i16x8(q1s, q0s);
+    let q2q1 = abs_diff_i16x8(q2s, q1s);
+    let q3q2 = abs_diff_i16x8(q3s, q2s);
+    let p0q0 = abs_diff_i16x8(p0s, q0s);
+    let p1q1 = abs_diff_i16x8(p1s, q1s);
+
+    let mut masked = i16x8_gt(p3p2, limit);
+    masked = v128_or(masked, i16x8_gt(p2p1, limit));
+    masked = v128_or(masked, i16x8_gt(p1p0, limit));
+    masked = v128_or(masked, i16x8_gt(q1q0, limit));
+    masked = v128_or(masked, i16x8_gt(q2q1, limit));
+    masked = v128_or(masked, i16x8_gt(q3q2, limit));
+
+    let edge = i16x8_add(i16x8_shl(p0q0, 1), u16x8_shr(p1q1, 1));
+    masked = v128_or(
+        masked,
+        i16x8_gt(edge, i16x8_splat(i16::from(strength.blimit))),
+    );
+    let filter = v128_not(masked);
+
+    let thresh = i16x8_splat(i16::from(strength.thresh));
+    let hev = v128_or(i16x8_gt(p1p0, thresh), i16x8_gt(q1q0, thresh));
+
+    let one = i16x8_splat(1);
+    let mut not_flat = i16x8_gt(p1p0, one);
+    not_flat = v128_or(not_flat, i16x8_gt(q1q0, one));
+    not_flat = v128_or(not_flat, i16x8_gt(abs_diff_i16x8(p2s, p0s), one));
+    not_flat = v128_or(not_flat, i16x8_gt(abs_diff_i16x8(q2s, q0s), one));
+    not_flat = v128_or(not_flat, i16x8_gt(abs_diff_i16x8(p3s, p0s), one));
+    not_flat = v128_or(not_flat, i16x8_gt(abs_diff_i16x8(q3s, q0s), one));
+    let flat = v128_not(not_flat);
+
+    LoopFilterMasks8 { filter, hev, flat }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_flat2_horizontal_8(
+    p7s: v128,
+    p6s: v128,
+    p5s: v128,
+    p4s: v128,
+    p0s: v128,
+    q0s: v128,
+    q4s: v128,
+    q5s: v128,
+    q6s: v128,
+    q7s: v128,
+) -> v128 {
+    let one = i16x8_splat(1);
+    let mut not_flat2 = i16x8_gt(abs_diff_i16x8(p7s, p0s), one);
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(q7s, q0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(p6s, p0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(q6s, q0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(p5s, p0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(q5s, q0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(p4s, p0s), one));
+    not_flat2 = v128_or(not_flat2, i16x8_gt(abs_diff_i16x8(q4s, q0s), one));
+    v128_not(not_flat2)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn loop_filter_narrow_outputs_horizontal_8(
+    p1s: v128,
+    p0s: v128,
+    q0s: v128,
+    q1s: v128,
+    hev: v128,
+) -> LoopFilterNarrowBytes {
+    let signed_offset = i16x8_splat(128);
+    let hev_filter = v128_bitselect(
+        filter4_clamp_i16x8(i16x8_sub(p1s, q1s)),
+        i16x8_splat(0),
+        hev,
+    );
+    let q0s_p0s = i16x8_sub(q0s, p0s);
+    let filter_value = filter4_clamp_i16x8(i16x8_add(
+        hev_filter,
+        i16x8_add(i16x8_add(q0s_p0s, q0s_p0s), q0s_p0s),
+    ));
+    let filter1 = i16x8_shr(
+        filter4_clamp_i16x8(i16x8_add(filter_value, i16x8_splat(4))),
+        3,
+    );
+    let filter2 = i16x8_shr(
+        filter4_clamp_i16x8(i16x8_add(filter_value, i16x8_splat(3))),
+        3,
+    );
+
+    let oq0 = i16x8_add(filter4_clamp_i16x8(i16x8_sub(q0s, filter1)), signed_offset);
+    let op0 = i16x8_add(filter4_clamp_i16x8(i16x8_add(p0s, filter2)), signed_offset);
+
+    let filter1_round = i16x8_shr(i16x8_add(filter1, i16x8_splat(1)), 1);
+    let oq1 = i16x8_add(
+        filter4_clamp_i16x8(i16x8_sub(q1s, filter1_round)),
+        signed_offset,
+    );
+    let op1 = i16x8_add(
+        filter4_clamp_i16x8(i16x8_add(p1s, filter1_round)),
+        signed_offset,
+    );
+    let zero = i16x8_splat(0);
+    LoopFilterNarrowBytes {
+        p1: u8x16_narrow_i16x8(op1, zero),
+        p0: u8x16_narrow_i16x8(op0, zero),
+        q0: u8x16_narrow_i16x8(oq0, zero),
+        q1: u8x16_narrow_i16x8(oq1, zero),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn store_loop_filter_narrow_horizontal_8(
+    data: &mut [u8],
+    base: usize,
+    stride: usize,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    p1s: v128,
+    p0s: v128,
+    q0s: v128,
+    q1s: v128,
+    filter: v128,
+    hev: v128,
+) {
+    if !v128_any_true(filter) {
+        return;
+    }
+    let narrow = loop_filter_narrow_outputs_horizontal_8(p1s, p0s, q0s, q1s, hev);
+    let filter_bytes = i16x8_mask_to_u8x8(filter);
+    store_loop_filter_row_8(data, base, v128_bitselect(narrow.q0, q0, filter_bytes));
+    store_loop_filter_row_8(
+        data,
+        base - stride,
+        v128_bitselect(narrow.p0, p0, filter_bytes),
+    );
+
+    let p1q1_filter_bytes = i16x8_mask_to_u8x8(v128_and(filter, v128_not(hev)));
+    store_loop_filter_row_8(
+        data,
+        base + stride,
+        v128_bitselect(narrow.q1, q1, p1q1_filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base - 2 * stride,
+        v128_bitselect(narrow.p1, p1, p1q1_filter_bytes),
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn store_loop_filter_wide3_horizontal_8(
+    data: &mut [u8],
+    base: usize,
+    stride: usize,
+    p2: v128,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    q2: v128,
+    wide3: LoopFilterWide3Bytes,
+    filter: v128,
+) {
+    let filter_bytes = i16x8_mask_to_u8x8(filter);
+    store_loop_filter_row_8(
+        data,
+        base - 3 * stride,
+        v128_bitselect(wide3.p2, p2, filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base - 2 * stride,
+        v128_bitselect(wide3.p1, p1, filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base - stride,
+        v128_bitselect(wide3.p0, p0, filter_bytes),
+    );
+    store_loop_filter_row_8(data, base, v128_bitselect(wide3.q0, q0, filter_bytes));
+    store_loop_filter_row_8(
+        data,
+        base + stride,
+        v128_bitselect(wide3.q1, q1, filter_bytes),
+    );
+    store_loop_filter_row_8(
+        data,
+        base + 2 * stride,
+        v128_bitselect(wide3.q2, q2, filter_bytes),
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn unsigned_sample_i16x8(samples: v128) -> v128 {
+    u16x8_extend_low_u8x16(samples)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn add3_i16x8(a: v128, b: v128, c: v128) -> v128 {
+    i16x8_add(i16x8_add(a, b), c)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn slide_loop_filter_sum_i16x8(
+    sum: v128,
+    add_a: v128,
+    add_b: v128,
+    sub_a: v128,
+    sub_b: v128,
+) -> v128 {
+    i16x8_add(
+        i16x8_sub(sum, i16x8_add(sub_a, sub_b)),
+        i16x8_add(add_a, add_b),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+fn round_loop_filter_sum_u8x8(sum: v128, bits: u32) -> v128 {
+    let rounded = i16x8_shr(
+        i16x8_add(sum, i16x8_splat((1i32 << (bits - 1)) as i16)),
+        bits,
+    );
+    u8x16_narrow_i16x8(rounded, i16x8_splat(0))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_wide3_outputs_horizontal_8(
+    p3: v128,
+    p2: v128,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    q2: v128,
+    q3: v128,
+) -> LoopFilterWide3Bytes {
+    let p3x3 = i16x8_add(i16x8_add(p3, p3), p3);
+    let mut sum = i16x8_add(i16x8_add(p3x3, i16x8_add(p2, p2)), add3_i16x8(p1, p0, q0));
+    let out_p2 = round_loop_filter_sum_u8x8(sum, 3);
+    sum = slide_loop_filter_sum_i16x8(sum, q1, p1, p3, p2);
+    let out_p1 = round_loop_filter_sum_u8x8(sum, 3);
+    sum = slide_loop_filter_sum_i16x8(sum, q2, p0, p3, p1);
+    let out_p0 = round_loop_filter_sum_u8x8(sum, 3);
+    sum = slide_loop_filter_sum_i16x8(sum, q3, q0, p3, p0);
+    let out_q0 = round_loop_filter_sum_u8x8(sum, 3);
+    sum = slide_loop_filter_sum_i16x8(sum, q3, q1, p2, q0);
+    let out_q1 = round_loop_filter_sum_u8x8(sum, 3);
+    sum = slide_loop_filter_sum_i16x8(sum, q3, q2, p1, q1);
+    let out_q2 = round_loop_filter_sum_u8x8(sum, 3);
+
+    LoopFilterWide3Bytes {
+        p2: out_p2,
+        p1: out_p1,
+        p0: out_p0,
+        q0: out_q0,
+        q1: out_q1,
+        q2: out_q2,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn loop_filter_wide4_outputs_horizontal_8(
+    p7: v128,
+    p6: v128,
+    p5: v128,
+    p4: v128,
+    p3: v128,
+    p2: v128,
+    p1: v128,
+    p0: v128,
+    q0: v128,
+    q1: v128,
+    q2: v128,
+    q3: v128,
+    q4: v128,
+    q5: v128,
+    q6: v128,
+    q7: v128,
+) -> LoopFilterWide4Bytes {
+    let p7x2 = i16x8_add(p7, p7);
+    let p7x4 = i16x8_add(p7x2, p7x2);
+    let p7x7 = i16x8_add(i16x8_add(p7x4, p7x2), p7);
+    let mut sum = i16x8_add(
+        i16x8_add(p7x7, i16x8_add(p6, p6)),
+        i16x8_add(
+            i16x8_add(add3_i16x8(p5, p4, p3), add3_i16x8(p2, p1, p0)),
+            q0,
+        ),
+    );
+
+    let out_p6 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q1, p5, p7, p6);
+    let out_p5 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q2, p4, p7, p5);
+    let out_p4 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q3, p3, p7, p4);
+    let out_p3 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q4, p2, p7, p3);
+    let out_p2 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q5, p1, p7, p2);
+    let out_p1 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q6, p0, p7, p1);
+    let out_p0 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q0, p7, p0);
+    let out_q0 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q1, p6, q0);
+    let out_q1 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q2, p5, q1);
+    let out_q2 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q3, p4, q2);
+    let out_q3 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q4, p3, q3);
+    let out_q4 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q5, p2, q4);
+    let out_q5 = round_loop_filter_sum_u8x8(sum, 4);
+    sum = slide_loop_filter_sum_i16x8(sum, q7, q6, p1, q5);
+    let out_q6 = round_loop_filter_sum_u8x8(sum, 4);
+
+    LoopFilterWide4Bytes {
+        p6: out_p6,
+        p5: out_p5,
+        p4: out_p4,
+        p3: out_p3,
+        p2: out_p2,
+        p1: out_p1,
+        p0: out_p0,
+        q0: out_q0,
+        q1: out_q1,
+        q2: out_q2,
+        q3: out_q3,
+        q4: out_q4,
+        q5: out_q5,
+        q6: out_q6,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -8587,7 +9394,7 @@ mod tests {
                         )?;
                     }
 
-                    for pattern in 0..4 {
+                    for pattern in 0..5 {
                         let mut initial = [0u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT];
                         fill_pseudorandom(&mut initial, &mut seed);
                         paint_loop_filter_pattern(&mut initial, len, strength, pattern);
@@ -8598,6 +9405,98 @@ mod tests {
                             strength,
                             100 + pattern,
                         )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn horizontal_wide_loop_filter_kernels_match_scalar_reference_direct()
+    -> Result<(), TileSyntaxError> {
+        const FILTER_SIZES: [TxSize; 3] = [TxSize::Tx8x8, TxSize::Tx16x16, TxSize::Tx32x32];
+        const STRENGTHS: [LoopFilterStrength; 4] = [
+            LoopFilterStrength {
+                lvl: 1,
+                limit: 1,
+                blimit: 3,
+                thresh: 0,
+            },
+            LoopFilterStrength {
+                lvl: 16,
+                limit: 4,
+                blimit: 40,
+                thresh: 1,
+            },
+            LoopFilterStrength {
+                lvl: 32,
+                limit: 16,
+                blimit: 96,
+                thresh: 2,
+            },
+            LoopFilterStrength {
+                lvl: 63,
+                limit: 63,
+                blimit: 193,
+                thresh: 3,
+            },
+        ];
+
+        let mut seed = 0x2f37_9badu32;
+        for filter_size in FILTER_SIZES {
+            for strength in STRENGTHS {
+                for pattern in 0..5 {
+                    let mut initial = [0u8; LOOP_FILTER_TEST_STRIDE * LOOP_FILTER_TEST_HEIGHT];
+                    fill_pseudorandom(&mut initial, &mut seed);
+                    paint_loop_filter_pattern(&mut initial, 8, strength, pattern);
+
+                    let mut scalar_data = initial;
+                    let mut simd_data = initial;
+                    let base = LOOP_FILTER_TEST_Y * LOOP_FILTER_TEST_STRIDE + LOOP_FILTER_TEST_X;
+                    for offset in 0..8 {
+                        sample_filter_direct(
+                            &mut scalar_data,
+                            base + offset,
+                            LOOP_FILTER_TEST_STRIDE,
+                            filter_size,
+                            strength,
+                        );
+                    }
+
+                    let ok = match filter_size {
+                        TxSize::Tx8x8 => super::loop_filter_tx8x8_horizontal_8(
+                            &mut simd_data,
+                            base,
+                            LOOP_FILTER_TEST_STRIDE,
+                            strength,
+                        ),
+                        TxSize::Tx16x16 | TxSize::Tx32x32 => {
+                            super::loop_filter_tx16x16_horizontal_8(
+                                &mut simd_data,
+                                base,
+                                LOOP_FILTER_TEST_STRIDE,
+                                strength,
+                            )
+                        }
+                        TxSize::Tx4x4 => unreachable!(),
+                    };
+                    assert!(ok);
+
+                    if scalar_data != simd_data {
+                        let mismatch = scalar_data
+                            .iter()
+                            .zip(simd_data.iter())
+                            .position(|(scalar, simd)| scalar != simd)
+                            .expect("mismatch exists");
+                        panic!(
+                            "direct wide horizontal loop filter mismatch: pattern={pattern} \
+                             filter_size={filter_size:?} strength={strength:?} index={mismatch} \
+                             scalar={} simd={}",
+                            scalar_data[mismatch], simd_data[mismatch]
+                        );
                     }
                 }
             }
@@ -10001,6 +10900,49 @@ mod tests {
                     let high = 64u8.saturating_add(strength.limit.saturating_add(1));
                     ([64, 64, 64, high, 64, 64, 64, 64], [64; 8])
                 }
+                4 => match (col - LOOP_FILTER_TEST_X) & 7 {
+                    // Fully flat through p7/q7: Tx8 wide3 and Tx16 wide4.
+                    0 => ([128; 8], [128; 8]),
+                    // Flat across p3/q3 but not p7/q7: Tx16 falls back to wide3.
+                    1 => (
+                        [128, 128, 128, 128, 131, 131, 131, 131],
+                        [128, 128, 128, 128, 125, 125, 125, 125],
+                    ),
+                    // Non-flat with low p1/q1 deltas: narrow, usually !hev.
+                    2 => {
+                        if strength.limit >= 2 {
+                            (
+                                [128, 128, 130, 130, 130, 130, 130, 130],
+                                [128, 128, 126, 126, 126, 126, 126, 126],
+                            )
+                        } else {
+                            ([128; 8], [128; 8])
+                        }
+                    }
+                    // Non-flat and above the hev threshold, while staying inside limit.
+                    3 => {
+                        let delta = core::cmp::max(1, strength.thresh.saturating_add(1));
+                        let delta = core::cmp::min(delta, strength.limit);
+                        let p1 = 128u8.saturating_add(delta);
+                        let p2 = if delta == 1 { p1.saturating_add(1) } else { p1 };
+                        (
+                            [128, p1, p2, p2, p2, p2, p2, p2],
+                            [128, p1, p2, p2, p2, p2, p2, p2],
+                        )
+                    }
+                    // Mask-fail lane interleaved with filtered lanes.
+                    4 => {
+                        let high = 64u8.saturating_add(strength.limit.saturating_add(1));
+                        ([64, 64, 64, high, 64, 64, 64, 64], [64; 8])
+                    }
+                    // More wide3 lanes with q-side flat2 failure.
+                    5 => (
+                        [127, 128, 128, 128, 128, 128, 128, 128],
+                        [128, 128, 129, 128, 130, 130, 130, 130],
+                    ),
+                    // Additional wide4 lanes with a different base to catch lane blends.
+                    _ => ([90; 8], [91; 8]),
+                },
                 _ => ([0; 8], [255; 8]),
             };
             paint_loop_filter_column(data, col, p, q);

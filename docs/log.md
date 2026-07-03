@@ -725,3 +725,25 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   libc round-trips inside the hottest loop were pure tax. Compliance
   307/307, 94/94 tests host+device, validates incl. quantizer-00 and
   resize.
+
+## 2026-07-03 — A55 campaign: wide loop filter simd
+
+- Refreshed profiles showed `loop_filter_frame` still at 18.4% of
+  jellyfish after the narrow kernel — the P8 pass only covered
+  pass-1 Tx4x4, and a segment-mix histogram showed Tx8x8/Tx16x16
+  edges outnumber Tx4x4 nearly 3:1 on jellyfish. Extended the pass-1
+  len==8 dispatch with a Tx8x8 kernel (narrow + wide3 regimes) and a
+  Tx16x16/Tx32x32 kernel (narrow + wide3 + wide4), same transpose-free
+  8-column structure: masks/hev/flat/flat2 in i16 lanes, wide
+  smoothing as sliding-window sums (peak 4088 < i16::MAX, no widening
+  needed), disjoint per-lane regime masks blended with bitselect so
+  untouched lanes stay byte-exact. `v128_any_true` for all early-outs
+  and regime skips — no bitmask ops, per the V8 arm32 clobber lesson;
+  p3..p6/q3..q6 rows only stored when a wide4 lane exists, mirroring
+  the scalar write set.
+- A55 jellyfish **−3.7%** (grinder and orchestrator confirm,
+  spreads 0.4-0.8%), BBB **−1.2/−1.4%**; no-op anchors null.
+  Compliance 307/307, 95/95 tests host+device (incl. a direct
+  simd-vs-scalar wide-kernel sweep with mixed-regime crafted
+  patterns), validates incl. lf_deltas and resize. No host/device
+  divergence this time.
