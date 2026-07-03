@@ -2476,7 +2476,7 @@ impl TileParser<'_, '_, '_> {
         let plane_type = usize::from(plane > 0);
         let ref_type = usize::from(block.is_inter);
         let coef_probs = &self.probabilities.coef_probs[tx_index][plane_type][ref_type];
-        let dq_denom = dq_denom(tx_size);
+        let dq_shift = dq_shift(tx_size);
         let dc_quant = self
             .dequant
             .get_dc_quant_for_segment(plane, block.segment_id);
@@ -2528,7 +2528,7 @@ impl TileParser<'_, '_, '_> {
                     let coef = read_coef(decoder, token)?;
                     let sign_bit = decoder.read_literal(1)?;
                     dequantized.set_signed_dequantized(
-                        pos, coef, sign_bit, dc_quant, ac_quant, dq_denom,
+                        pos, coef, sign_bit, dc_quant, ac_quant, dq_shift,
                     )?;
                     *dequantized_dirty = true;
                     check_eob = true;

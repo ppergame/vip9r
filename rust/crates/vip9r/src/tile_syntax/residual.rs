@@ -92,7 +92,7 @@ impl DequantizedCoefficients {
         sign_bit: u32,
         dc_quant: i32,
         ac_quant: i32,
-        dq_denom: i32,
+        dq_shift: i32,
     ) -> Result<(), TileSyntaxError> {
         if pos >= coefficient_count(self.block.tx_size) {
             return Err(TileSyntaxError::InvalidBitstream);
@@ -111,7 +111,10 @@ impl DequantizedCoefficients {
         }
 
         let quant = if pos == 0 { dc_quant } else { ac_quant };
-        self.coefficients[pos] = (i32::from(coefficient) * quant) / dq_denom;
+        // Truncating-toward-zero division by 1 << dq_shift, without a divide
+        // instruction in the per-coefficient path.
+        let product = i32::from(coefficient) * quant;
+        self.coefficients[pos] = (product + ((product >> 31) & ((1 << dq_shift) - 1))) >> dq_shift;
         self.nonzero_row_mask |= 1u32 << (pos >> (2 + self.block.tx_size.index()));
         Ok(())
     }
@@ -1840,10 +1843,10 @@ fn inverse_wht(t: &mut [i32; MAX_TX_WIDTH], shift: usize) -> Result<(), TileSynt
     Ok(())
 }
 
-pub(super) const fn dq_denom(tx_size: TxSize) -> i32 {
+pub(super) const fn dq_shift(tx_size: TxSize) -> i32 {
     match tx_size {
-        TxSize::Tx32x32 => 2,
-        TxSize::Tx4x4 | TxSize::Tx8x8 | TxSize::Tx16x16 => 1,
+        TxSize::Tx32x32 => 1,
+        TxSize::Tx4x4 | TxSize::Tx8x8 | TxSize::Tx16x16 => 0,
     }
 }
 
@@ -2548,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn fused_dequantized_writes_use_dc_ac_quantizers_and_tx32_dq_denom() {
+    fn fused_dequantized_writes_use_dc_ac_quantizers_and_tx32_dq_shift() {
         let dequant = FrameDequant::new(4, 2, 0, 0);
         let mut output16 = DequantizedCoefficients::empty();
         let tx16_block = TransformBlock::new(0, (8, 16), TxSize::Tx16x16, TxType::DctDct);
@@ -2561,7 +2564,7 @@ mod tests {
                 0,
                 dequant.get_dc_quant_for_segment(0, 0),
                 dequant.get_ac_quant_for_segment(0, 0),
-                dq_denom(tx16_block.tx_size),
+                dq_shift(tx16_block.tx_size),
             )
             .unwrap();
         output16
@@ -2571,7 +2574,7 @@ mod tests {
                 0,
                 dequant.get_dc_quant_for_segment(0, 0),
                 dequant.get_ac_quant_for_segment(0, 0),
-                dq_denom(tx16_block.tx_size),
+                dq_shift(tx16_block.tx_size),
             )
             .unwrap();
         output16.set_eob(2).unwrap();
@@ -2595,7 +2598,7 @@ mod tests {
                 0,
                 dequant.get_dc_quant_for_segment(0, 0),
                 dequant.get_ac_quant_for_segment(0, 0),
-                dq_denom(tx32_block.tx_size),
+                dq_shift(tx32_block.tx_size),
             )
             .unwrap();
         output32
@@ -2605,7 +2608,7 @@ mod tests {
                 0,
                 dequant.get_dc_quant_for_segment(0, 0),
                 dequant.get_ac_quant_for_segment(0, 0),
-                dq_denom(tx32_block.tx_size),
+                dq_shift(tx32_block.tx_size),
             )
             .unwrap();
         output32.set_eob(2).unwrap();
