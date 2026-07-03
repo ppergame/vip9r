@@ -948,3 +948,42 @@ streamer cpu0:
   the fusion. The safety-check-tax entry above calibrated the
   ceiling correctly; the bit-decision branch itself was never the
   cost. Null recorded, branchy source kept for clarity.
+
+## 2026-07-03 — A55 generated-code audit (asm reconnaissance)
+
+- Post-campaign audit pass: fresh cpu0 profiles on both clips, then
+  offset-level sample attribution inside the hot functions (perf.data
+  IPs bucketed against the arm32 asm dump — function sizes match
+  byte-for-byte, so device offsets index the dump directly), then two
+  parallel analysis grinders auditing the hot regions against the A55
+  optimization guide. No code changes; reports in docs/analysis/,
+  backlog distilled into the tracker.
+- Attribution shift worth recording: TurboFan inlines the entire
+  per-block pipeline (predict_inter, predict_intra, tokens+dequant,
+  reconstruct) into wasm[23] decode_residual — 51.5% of jellyfish /
+  56.8% of BBB decode as one 164KB function, while the standalone
+  predict_inter/subpel copies compile but take zero samples. Profile
+  reads that stop at function granularity are misleading here; the
+  offset histograms are the real map.
+- Verified findings (orchestrator re-checked source + asm):
+  - Fused dequant keeps `/ dq_denom` dynamic in the token loop; per
+    nonzero coefficient V8 emits a frame reload, div-by-zero and
+    INT_MIN/−1 trap guards, and a serializing `sdiv` — for a
+    denominator that is 1 or 2 by tx_size. Inside BBB's dominant
+    region (41% of decode_residual). Clearest source-level item.
+  - loop_filter_is_block_edge modulo: divisors are always powers of
+    two but arrive as table loads, so each edge test pays zero-guard
+    + `udiv` + `mls`; a mask test removes all of it.
+  - StoredModeInfo round-trips: mv candidate scan, loop-filter SB
+    setup, and decode_block store path decode/encode the full 49-byte
+    record (including a 32-byte sub_mvs copy) where callers consume a
+    few fields.
+- Engine-level warts recorded (not source-fixable, worth knowing when
+  reading dumps): u8x16_narrow lowering emits a redundant [0,255]
+  clamp with GPR-materialized constants before the already-saturating
+  `vqmovun`; `v128.load64_zero` lowers to two `ldr` + lane `vmov`s;
+  loop-filter kernels rematerialize vector constants per iteration.
+- Register-pressure observations (token loop ~369 frame ld/st per
+  1728 instructions; subpel coefficient Q-registers spilled inside
+  inner loops) filed as speculative — same territory where traversal
+  restructures measured negative.

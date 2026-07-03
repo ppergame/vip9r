@@ -425,6 +425,49 @@ shrank; traversal glue and intra prediction were promoted.
       0.7% spread). The bit-decision branch was never the cost;
       branchy source kept for clarity
 
+### A55 asm-audit backlog — candidate micro-passes (2026-07-03)
+
+From the generated-code audit (docs/analysis/, offsets there). Ordered
+by expected value; each needs the usual asm + counterbalanced bench
+gate. Competes with M6 threads for effort.
+
+- [ ] fused-dequant divide specialization: `(coef * quant) / dq_denom`
+      carries a dynamic denominator into the token loop; V8 emits a
+      per-nonzero-coefficient frame reload + div-by-zero and
+      INT_MIN/−1 trap guards + serializing `sdiv` (verified,
+      023 @ 0x1224c-0x12278). `dq_denom` is const {1,2} by tx_size —
+      specialize (omit / arithmetic shift). Sits inside BBB's
+      dominant region (0x10b00-0x12600 = 41% of decode_residual)
+- [ ] loop_filter_is_block_edge modulo → mask test: divisors are
+      8×num_8x8_{wide,high} — always powers of two — but arrive as
+      table loads, so V8 emits zero-guard + `udiv` + `mls` per edge
+      test (verified, 049 @ 0x2cc8-0x2d28; containing region is
+      24-34% of loop_filter_frame)
+- [ ] StoredModeInfo access specialization: mv candidate scan,
+      loop-filter SB setup, and decode_block store path decode/encode
+      the full 49-byte record where callers need a few fields (32-byte
+      sub_mvs copied and dropped); specialized getters or field-split
+      layout. Spread across mv_ref_candidate (81% of fn in one
+      region), inter_block_mode_info, loop_filter setup, decode_block
+- [ ] inverse_dct_simd_i16 size specialization: recursive schedule
+      keeps dynamic brev/cos64 quadrant logic and indirect calls in
+      hot code; straight-line per-n schedules trade code size (icache
+      caution: monolith phase cycling is a known constraint)
+- [ ] extend the narrow_i32_butterfly trust model to the remaining
+      checked `narrow_i32(round2_i64(..))?` scalar ADST/shift paths
+      (long adds/adc/cmn chains in transform tails)
+- [ ] speculative, layout-fragile: register-pressure reduction in the
+      inlined subpel convolution (coefficient Q-registers spill to
+      the frame inside inner loops) and the token loop (~369 frame
+      ld/st per 1728 instructions in the hot region). Prior traversal
+      restructures measured negative; only attempt with asm-diff
+      evidence that the spills actually leave
+- Engine-level, recorded not actionable at source: redundant
+      [0,255] clamp + GPR constant materialization before `vqmovun`
+      (u8x16_narrow lowering), `v128.load64_zero` lowered as two
+      `ldr` + lane `vmov`s, vector constant rematerialization in
+      loop-filter kernels
+
 ### M5 — demo page: play + bench
 
 Decode-and-play demo in desktop/device Chrome. Gated on M2 only; independent
