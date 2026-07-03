@@ -473,10 +473,12 @@ pub(super) fn loop_filter_is_block_edge(
     y: usize,
     sb_size: BlockSize,
 ) -> bool {
+    // num_8x8_wide/high are powers of two, so the multiple-of test is a mask
+    // test; is_multiple_of would lower to a serializing udiv per edge.
     if pass == 0 {
-        x.is_multiple_of(8 * usize::from(sb_size.num_8x8_wide()))
+        (x & (8 * usize::from(sb_size.num_8x8_wide()) - 1)) == 0
     } else {
-        y.is_multiple_of(8 * usize::from(sb_size.num_8x8_high()))
+        (y & (8 * usize::from(sb_size.num_8x8_high()) - 1)) == 0
     }
 }
 
