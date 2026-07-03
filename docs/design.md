@@ -275,7 +275,8 @@ A55 ~1489.
 The daemon binds one fixed socket (`temp/perf/vip9r-perf.sock`) and serves a
 host queue plus one queue per `--serial` device, each with its own worker:
 runs on different devices proceed in parallel while access to any one device
-stays serialized. Submissions address a device by index (`--device N`, or
+stays serialized. `serve` sorts device serials, so indices are stable for a
+given set of connected devices. Submissions address a device by index (`--device N`, or
 `VIP9R_PERF_DEVICE` inside grinder sandboxes) and state the CPU pin per
 request; timed kinds (bench, microbench, profile) require an explicit pin,
 validate/tests default to `any`. Bench submissions carry their own baseline

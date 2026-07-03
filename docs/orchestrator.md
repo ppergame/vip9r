@@ -34,12 +34,10 @@ requirements.md — suggest changes rather than editing.
   in the background. The command prints progress updates until the implementor
   finishes, then prints the final message and a sandbox location like
   `temp/grinder.XXXXXX`.
-  - Check up on a new job 2 minutes after starting it, then every 10 minutes.
-    No need for line-by-line running commentary.
-  - Claude Code: background jobs notify on exit, and background `sleep` jobs
-    make good check-up timers (foreground sleep is blocked). Idle between
-    timers; when the job's completion notification arrives, TaskStop the
-    pending timer instead of waiting it out.
+  - Check up on a new job ~2 minutes after starting it to catch the
+    first-turn failure below. After that, block on `TaskOutput` for the
+    grinder job itself rather than polling with sleep timers. No need for
+    line-by-line running commentary.
 - Known failure: the grinder codex occasionally hangs or emits a malformed
   tool_search call on the first turn. Kill and retry, up to 3 times.
 - Traces are copied to `temp/traces/` automatically; preserve that directory for
