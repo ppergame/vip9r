@@ -3,6 +3,8 @@
 
 Default destination is /bulk/vip9r. The manifest is intentionally hardcoded:
 network metadata is not trusted at runtime, only the bytes named below.
+Non-manifest .webm files already under the root are local media and get
+generated .md5/.md5.sha256 sidecars keyed by the WebM SHA-256.
 """
 
 from __future__ import annotations
@@ -799,6 +801,31 @@ def generated_md5_refs(entries: Iterable[Entry]) -> list[GeneratedMd5]:
     return refs
 
 
+def loose_webm_md5_refs(root: Path, entries: Iterable[Entry]) -> list[GeneratedMd5]:
+    """Return generated-md5 refs for local WebMs outside the download manifest."""
+
+    if not root.exists():
+        return []
+
+    manifest_paths = {entry.path for entry in entries}
+    refs: list[GeneratedMd5] = []
+    for media_path in sorted(root.rglob("*.webm")):
+        if not media_path.is_file():
+            continue
+        relative_path = media_path.relative_to(root)
+        if relative_path in manifest_paths:
+            continue
+        refs.append(
+            GeneratedMd5(
+                media_path=relative_path,
+                md5_path=md5_sidecar_path(relative_path),
+                media_algorithm="sha256",
+                media_digest=file_digest(media_path, "sha256"),
+            )
+        )
+    return refs
+
+
 def file_digest(path: Path, algorithm: str) -> str:
     digest = hashlib.new(algorithm)
     with path.open("rb") as f:
@@ -855,7 +882,7 @@ def read_sha256_record(
         return None
     source = None
     for line in lines[1:]:
-        fields = line.split()
+        fields = line.split(maxsplit=3)
         if len(fields) == 4 and fields[0] == "source":
             source = (fields[1], fields[2], fields[3])
     return digest, source
@@ -1122,7 +1149,10 @@ def main() -> int:
     parser.add_argument(
         "--list",
         action="store_true",
-        help="print download manifest and generated md5 refs, then exit",
+        help=(
+            "print download manifest and generated md5 refs, including local "
+            "loose WebMs, then exit"
+        ),
     )
     parser.add_argument(
         "-j",
@@ -1141,12 +1171,14 @@ def main() -> int:
         parser.error("--jobs must be >= 1")
 
     entries = corpus_entries()
-    generated_refs = generated_md5_refs(entries)
+    root = args.root
+    manifest_generated_refs = generated_md5_refs(entries)
+    loose_refs = loose_webm_md5_refs(root, entries)
+    generated_refs = [*manifest_generated_refs, *loose_refs]
     if args.list:
         print_list(entries, generated_refs)
         return 0
 
-    root = args.root
     bad: list[tuple[Entry, str]] = []
     ok_count = 0
     for entry in entries:

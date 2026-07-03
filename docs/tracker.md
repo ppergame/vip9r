@@ -432,12 +432,6 @@ of M3 and can run in parallel with optimization campaigns. Vanilla TS + DOM,
 no web framework. Local dev only; hosting (VPS, COOP/COEP headers, CDN media)
 is out of scope until it exists.
 
-- [ ] demo shell: tabbed race/play modes; media dropdown (canned manifest) plus
-      URL textbox (direct fetch plays the CORS lottery; vite dev-server proxy
-      route as the local escape hatch); config via URL params (`mode`, `media`,
-      `wc`, `lanes`) with a copy-link button; every load autostarts the active
-      mode, media selection restarts via reload, tab switch resets playback —
-      F5 is the rerun
 - [x] worker decode pipeline: vip9r in a dedicated worker (postMessage, no
       SAB/COOP/COEP needed); worker demuxes via `parseVp9Input`, constructs
       I420 `VideoFrame`s directly over wasm memory, and transfers them to
