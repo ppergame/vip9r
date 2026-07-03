@@ -92,7 +92,7 @@ impl CodedFrameRanges {
 }
 
 pub fn split_packet(packet: &[u8]) -> Result<CodedFrameRanges, DecodeError> {
-    superframe::split_packet(packet).map_err(|err| err.into_decode_error())
+    Ok(superframe::split_packet(packet)?)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -604,16 +604,12 @@ impl FramePoolSlots {
         Ok(())
     }
 
-    fn refresh_references_from_current(
-        &mut self,
-        refresh_frame_flags: u8,
-    ) -> Result<(), DecodeError> {
+    fn refresh_references_from_current(&mut self, refresh_frame_flags: u8) {
         for (index, reference) in self.references.iter_mut().enumerate() {
             if refresh_frame_flags & (1u8 << index) != 0 {
                 *reference = self.current;
             }
         }
-        Ok(())
     }
 
     fn reference(self, index: usize) -> Result<FramePoolSlot, DecodeError> {
@@ -972,8 +968,7 @@ impl Decoder {
     ) -> Result<DecodeOutcome<'w>, DecodeError> {
         workspace.require_layout(self.layout)?;
         let mut parsed_header_state = self.header_state;
-        let header = parse_uncompressed_frame_header(coded_frame, &mut parsed_header_state)
-            .map_err(|err| err.into_decode_error())?;
+        let header = parse_uncompressed_frame_header(coded_frame, &mut parsed_header_state)?;
         self.validate_frame_limits(&header)?;
         self.setup_frame_probability_state(&header)?;
 
@@ -1005,29 +1000,24 @@ impl Decoder {
             .get(header.compressed_header_offset..header.tile_data_offset)
             .ok_or(DecodeError::InvalidBitstream)?;
         self.probability_state
-            .load_probs(header.frame_context_idx)
-            .map_err(|err| err.into_decode_error())?;
+            .load_probs(header.frame_context_idx)?;
         self.probability_state
-            .load_probs2(header.frame_context_idx)
-            .map_err(|err| err.into_decode_error())?;
+            .load_probs2(header.frame_context_idx)?;
 
         let compressed_header = if header.frame_is_intra {
             parse_intra_compressed_header(
                 compressed_header_data,
                 &header,
                 self.probability_state.current_mut(),
-            )
-            .map_err(|err| err.into_decode_error())?
+            )?
         } else {
             parse_inter_compressed_header(
                 compressed_header_data,
                 &header,
                 self.probability_state.current_mut(),
-            )
-            .map_err(|err| err.into_decode_error())?
+            )?
         };
-        let tile_layout =
-            parse_tile_layout(coded_frame, &header).map_err(|err| err.into_decode_error())?;
+        let tile_layout = parse_tile_layout(coded_frame, &header)?;
         self.syntax_counts.clear();
         let mi_count = frame_mi_count(header.frame_width, header.frame_height)?;
         let previous_slot_for_mvs = self.use_prev_frame_mvs(&header);
@@ -1091,7 +1081,7 @@ impl Decoder {
                 )
             };
 
-            tile_parse_result.map_err(|err| err.into_decode_error())?;
+            tile_parse_result?;
         }
         self.initialized_frame_slots[current_frame_slot.index()] = true;
 
@@ -1101,7 +1091,7 @@ impl Decoder {
         self.frame_pool_slots
             .set_current_for_reconstruction(current_frame_slot)?;
         self.frame_pool_slots
-            .refresh_references_from_current(header.refresh_frame_flags)?;
+            .refresh_references_from_current(header.refresh_frame_flags);
         self.refresh_reference_info(header.refresh_frame_flags, current_reference);
         self.header_state = parsed_header_state;
         self.header_state.update_references(&header);
@@ -1256,8 +1246,7 @@ impl Decoder {
             self.probability_state.reset_all_contexts();
         } else if header.reset_frame_context == 2 {
             self.probability_state
-                .save_probs(header.raw_frame_context_idx)
-                .map_err(|err| err.into_decode_error())?;
+                .save_probs(header.raw_frame_context_idx)?;
         }
         Ok(())
     }
@@ -1269,8 +1258,7 @@ impl Decoder {
     ) -> Result<(), DecodeError> {
         if !header.error_resilient_mode && !header.frame_parallel_decoding_mode {
             self.probability_state
-                .load_probs(header.frame_context_idx)
-                .map_err(|err| err.into_decode_error())?;
+                .load_probs(header.frame_context_idx)?;
             let coef_update_factor = if header.frame_is_intra {
                 112
             } else if self.last_frame_type == header::FrameType::Key {
@@ -1282,8 +1270,7 @@ impl Decoder {
                 .adapt_coef_probs(&self.syntax_counts, coef_update_factor);
             if !header.frame_is_intra {
                 self.probability_state
-                    .load_probs2(header.frame_context_idx)
-                    .map_err(|err| err.into_decode_error())?;
+                    .load_probs2(header.frame_context_idx)?;
                 self.probability_state.adapt_noncoef_probs(
                     &self.syntax_counts,
                     NonCoefAdaptationConfig {
@@ -1300,8 +1287,7 @@ impl Decoder {
 
         if header.refresh_frame_context {
             self.probability_state
-                .save_probs(header.frame_context_idx)
-                .map_err(|err| err.into_decode_error())?;
+                .save_probs(header.frame_context_idx)?;
         }
         Ok(())
     }
@@ -1436,7 +1422,7 @@ mod tests {
     fn frame_pool_slots_refresh_by_aliasing_and_choose_free_current() {
         let mut slots = super::FramePoolSlots::new();
 
-        slots.refresh_references_from_current(1 << 3).unwrap();
+        slots.refresh_references_from_current(1 << 3);
         assert_eq!(slots.references[3], super::FramePoolSlot::new(0));
         assert_eq!(
             slots.current_for_reconstruction().unwrap(),
@@ -1446,7 +1432,7 @@ mod tests {
         slots
             .set_current_for_reconstruction(super::FramePoolSlot::new(4))
             .unwrap();
-        slots.refresh_references_from_current(0xff).unwrap();
+        slots.refresh_references_from_current(0xff);
         assert!(
             slots
                 .references
@@ -1744,7 +1730,7 @@ mod tests {
         builder.byte_align_zero();
         builder.byte(0x00); // compressed header initial BoolValue
         builder.byte(0x00); // compressed header zero padding
-        builder.byte(0x00); // one tile payload byte; tile decode is still unimplemented
+        builder.byte(0x00); // one-byte tile payload
         builder.finish()
     }
 

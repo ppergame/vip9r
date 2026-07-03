@@ -212,7 +212,6 @@ impl LoopFilterParams {
 }
 
 /// Fields parsed from the uncompressed header and retained for upcoming decode stages.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UncompressedFrameHeader {
     pub(crate) profile: u8,

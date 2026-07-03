@@ -61,14 +61,12 @@ pub(crate) enum InterReferenceFrame {
     Altref,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CompoundReferenceSetup {
     pub(crate) comp_fixed_ref: InterReferenceFrame,
     pub(crate) comp_var_ref: [InterReferenceFrame; 2],
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CompressedHeader {
     pub(crate) tx_mode: TxMode,

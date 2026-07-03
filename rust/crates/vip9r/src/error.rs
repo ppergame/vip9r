@@ -7,12 +7,12 @@ pub(crate) enum ParserError {
     UnsupportedBitDepth(u8),
 }
 
-impl ParserError {
-    pub(crate) const fn into_decode_error(self) -> DecodeError {
-        match self {
-            Self::InvalidBitstream => DecodeError::InvalidBitstream,
-            Self::UnsupportedProfile(profile) => DecodeError::UnsupportedProfile(profile),
-            Self::UnsupportedBitDepth(bit_depth) => DecodeError::UnsupportedBitDepth(bit_depth),
+impl From<ParserError> for DecodeError {
+    fn from(error: ParserError) -> Self {
+        match error {
+            ParserError::InvalidBitstream => Self::InvalidBitstream,
+            ParserError::UnsupportedProfile(profile) => Self::UnsupportedProfile(profile),
+            ParserError::UnsupportedBitDepth(bit_depth) => Self::UnsupportedBitDepth(bit_depth),
         }
     }
 }

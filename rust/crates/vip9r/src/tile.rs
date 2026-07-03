@@ -7,7 +7,6 @@ pub(crate) const MAX_TILE_COLS_LOG2: u8 = 6;
 pub(crate) const MAX_TILE_ROWS_LOG2: u8 = 2;
 pub(crate) const MAX_TILES: usize = (1usize << MAX_TILE_COLS_LOG2) * (1usize << MAX_TILE_ROWS_LOG2);
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct TileDescriptor {
     pub(crate) payload_start: usize,

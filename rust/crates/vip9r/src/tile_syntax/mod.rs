@@ -19,7 +19,6 @@ mod tables;
 use residual::{DequantizedCoefficients, FrameDequant, TransformCoefficients};
 use tables::*;
 
-#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32::*;
 
 // Above contexts are column-indexed, not frame-MI indexed. This fixed storage
@@ -79,12 +78,12 @@ pub(crate) enum TileSyntaxError {
     Unimplemented,
 }
 
-impl TileSyntaxError {
-    pub(crate) const fn into_decode_error(self) -> DecodeError {
-        match self {
-            Self::InvalidBitstream => DecodeError::InvalidBitstream,
-            Self::ResourceLimit => DecodeError::ResourceLimit,
-            Self::Unimplemented => DecodeError::Unimplemented,
+impl From<TileSyntaxError> for DecodeError {
+    fn from(error: TileSyntaxError) -> Self {
+        match error {
+            TileSyntaxError::InvalidBitstream => Self::InvalidBitstream,
+            TileSyntaxError::ResourceLimit => Self::ResourceLimit,
+            TileSyntaxError::Unimplemented => Self::Unimplemented,
         }
     }
 }
@@ -1753,7 +1752,7 @@ impl TileParser<'_, '_, '_> {
         let mut context_counter = 0usize;
         let search = &MV_REF_BLOCKS[block_size.index()];
 
-        for candidate in search.iter().take(2) {
+        for &candidate in search.iter().take(2) {
             if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
                 different_ref_found = true;
                 context_counter = context_counter
@@ -1769,7 +1768,7 @@ impl TileParser<'_, '_, '_> {
             }
         }
 
-        for candidate in search.iter().skip(2) {
+        for &candidate in search.iter().skip(2) {
             if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
                 different_ref_found = true;
                 if_same_ref_frame_add_mv(&mut state, info, ref_frame);
@@ -1780,7 +1779,7 @@ impl TileParser<'_, '_, '_> {
             if_same_prev_frame_add_mv(&mut state, self.prev_mv_ref_candidate(row, col)?, ref_frame);
         }
         if different_ref_found {
-            for candidate in search {
+            for &candidate in search {
                 if let Some(info) = self.mv_ref_candidate(row, col, candidate)? {
                     if_diff_ref_frame_add_mv(&mut state, info, ref_frame, self.ref_sign_biases())?;
                 }
@@ -1887,7 +1886,7 @@ impl TileParser<'_, '_, '_> {
         &self,
         row: usize,
         col: usize,
-        candidate: &[i8; 2],
+        candidate: [i8; 2],
     ) -> Result<Option<CandidateModeInfo>, TileSyntaxError> {
         let candidate_r = isize::try_from(row)
             .map_err(|_| TileSyntaxError::InvalidBitstream)?
@@ -2840,7 +2839,7 @@ fn inter_predict_subpel_unscaled_block(
     write_vertical_filtered_block::<true>(plane, request, y_filter, buffer)
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "wasm-tests")]
 #[inline(never)]
 fn inter_predict_subpel_unscaled_block_scalar(
     reference: ReferencePlane<'_>,
@@ -3057,18 +3056,12 @@ fn horizontal_filter_row_to_buffer<const USE_SIMD: bool>(
         return;
     }
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        let scalar_start = if USE_SIMD {
-            horizontal_filter_row_to_buffer_simd(src, width, filter, dst)
-        } else {
-            0
-        };
-        horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, scalar_start, width);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, 0, width);
+    let scalar_start = if USE_SIMD {
+        horizontal_filter_row_to_buffer_simd(src, width, filter, dst)
+    } else {
+        0
+    };
+    horizontal_filter_row_to_buffer_scalar_nonzero(src, filter, dst, scalar_start, width);
 }
 
 #[inline(always)]
@@ -3113,18 +3106,12 @@ fn horizontal_filter_row_in_place<const USE_SIMD: bool>(
         return;
     }
 
-    #[cfg(target_arch = "wasm32")]
-    {
-        let scalar_start = if USE_SIMD {
-            horizontal_filter_row_in_place_simd(row, width, filter)
-        } else {
-            0
-        };
-        horizontal_filter_row_in_place_scalar_nonzero(row, filter, scalar_start, width);
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    horizontal_filter_row_in_place_scalar_nonzero(row, filter, 0, width);
+    let scalar_start = if USE_SIMD {
+        horizontal_filter_row_in_place_simd(row, width, filter)
+    } else {
+        0
+    };
+    horizontal_filter_row_in_place_scalar_nonzero(row, filter, scalar_start, width);
 }
 
 #[inline(always)]
@@ -3162,17 +3149,13 @@ fn write_vertical_filtered_block<const USE_SIMD: bool>(
     filter: &[i16; INTERP_TAPS],
     buffer: &InterpBuffer,
 ) -> Result<(), TileSyntaxError> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        if USE_SIMD {
-            return write_vertical_filtered_block_simd(plane, request, filter, buffer);
-        }
+    if USE_SIMD {
+        return write_vertical_filtered_block_simd(plane, request, filter, buffer);
     }
 
     write_vertical_filtered_block_scalar(plane, request, filter, buffer)
 }
 
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn write_vertical_filtered_block_scalar(
     plane: &mut CurrentPlaneMut<'_>,
     request: UnscaledInterPrediction,
@@ -3278,7 +3261,6 @@ fn vertical_filter_row_scalar(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy)]
 struct WasmInterpCoefficients {
     c0: v128,
@@ -3291,7 +3273,6 @@ struct WasmInterpCoefficients {
     c7: v128,
 }
 
-#[cfg(target_arch = "wasm32")]
 impl WasmInterpCoefficients {
     #[inline(always)]
     fn new(filter: &[i16; INTERP_TAPS]) -> Self {
@@ -3308,7 +3289,6 @@ impl WasmInterpCoefficients {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn horizontal_filter_row_to_buffer_simd(
     src: &[u8],
@@ -3338,7 +3318,6 @@ fn horizontal_filter_row_to_buffer_simd(
     col
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn horizontal_filter_row_in_place_simd(
     row: &mut [u8],
@@ -3368,7 +3347,6 @@ fn horizontal_filter_row_in_place_simd(
     col
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn write_vertical_filtered_block_simd(
     plane: &mut CurrentPlaneMut<'_>,
@@ -3448,7 +3426,6 @@ fn write_vertical_filtered_block_simd(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn vertical_filter_row_simd(
     src: *const u8,
@@ -3482,7 +3459,6 @@ fn vertical_filter_row_simd(
     col
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn write_inter_prediction_row_simd(
     plane: &mut CurrentPlaneMut<'_>,
@@ -3503,7 +3479,6 @@ fn write_inter_prediction_row_simd(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn average_prediction_row_simd(dst: &mut [u8], prediction: &[u8]) {
     debug_assert!(prediction.len() >= dst.len());
@@ -3536,7 +3511,6 @@ fn average_prediction_row_simd(dst: &mut [u8], prediction: &[u8]) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn average_prediction_8(dst: *mut u8, prediction: v128) {
     unsafe {
@@ -3546,7 +3520,6 @@ fn average_prediction_8(dst: *mut u8, prediction: v128) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn average_prediction_4(dst: *mut u8, prediction: v128) {
     unsafe {
@@ -3556,7 +3529,6 @@ fn average_prediction_4(dst: *mut u8, prediction: v128) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn horizontal_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     let mut lo = i32x4_splat(0);
@@ -3574,7 +3546,6 @@ fn horizontal_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     round_shift_pack_u8(lo, hi)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn horizontal_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     let mut sum = i32x4_splat(0);
@@ -3591,7 +3562,6 @@ fn horizontal_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     round_shift_pack_u8(sum, i32x4_splat(0))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn vertical_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     let mut lo = i32x4_splat(0);
@@ -3609,7 +3579,6 @@ fn vertical_filter_8(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     round_shift_pack_u8(lo, hi)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn vertical_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     let mut sum = i32x4_splat(0);
@@ -3626,31 +3595,26 @@ fn vertical_filter_4(src: *const u8, coeffs: WasmInterpCoefficients) -> v128 {
     round_shift_pack_u8(sum, i32x4_splat(0))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_u8x8(src: *const u8, offset: usize) -> v128 {
     unsafe { v128_load64_zero(src.wrapping_add(offset).cast::<u64>()) }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_u8x4(src: *const u8, offset: usize) -> v128 {
     unsafe { v128_load32_zero(src.wrapping_add(offset).cast::<u32>()) }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_vertical_u8x8(src: *const u8, tap: usize) -> v128 {
     load_u8x8(src, tap * MAX_INTERP_SOURCE_DIM)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_vertical_u8x4(src: *const u8, tap: usize) -> v128 {
     load_u8x4(src, tap * MAX_INTERP_SOURCE_DIM)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn accumulate_u8x8(lo: &mut v128, hi: &mut v128, samples: v128, coeff: v128) {
     let samples = i16x8_extend_low_u8x16(samples);
@@ -3658,14 +3622,12 @@ fn accumulate_u8x8(lo: &mut v128, hi: &mut v128, samples: v128, coeff: v128) {
     *hi = i32x4_add(*hi, i32x4_extmul_high_i16x8(samples, coeff));
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn accumulate_u8x4(sum: &mut v128, samples: v128, coeff: v128) {
     let samples = i16x8_extend_low_u8x16(samples);
     *sum = i32x4_add(*sum, i32x4_extmul_low_i16x8(samples, coeff));
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_pack_u8(lo: v128, hi: v128) -> v128 {
     let rounding = i32x4_splat(1 << 6);
@@ -3915,7 +3877,6 @@ fn store_intra_edge_plane_row(
 fn fill_intra_edge_span(dst: &mut [u8], value: u8, len: usize) {
     debug_assert_eq!(dst.len(), len);
 
-    #[cfg(target_arch = "wasm32")]
     unsafe {
         let value = u8x16_splat(value);
         match len {
@@ -3935,16 +3896,6 @@ fn fill_intra_edge_span(dst: &mut [u8], value: u8, len: usize) {
             _ => unreachable!("invalid intra edge span width"),
         }
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    match len {
-        4 => dst[..4].fill(value),
-        8 => dst[..8].fill(value),
-        16 => dst[..16].fill(value),
-        32 => dst[..32].fill(value),
-        64 => dst[..64].fill(value),
-        _ => unreachable!("invalid intra edge span width"),
-    }
 }
 
 #[inline(always)]
@@ -3952,7 +3903,6 @@ fn store_intra_edge_span(dst: &mut [u8], src: &[u8], len: usize) {
     debug_assert_eq!(dst.len(), len);
     debug_assert!(src.len() >= len);
 
-    #[cfg(target_arch = "wasm32")]
     unsafe {
         match len {
             4 => {
@@ -3985,16 +3935,6 @@ fn store_intra_edge_span(dst: &mut [u8], src: &[u8], len: usize) {
             }
             _ => unreachable!("invalid intra edge span width"),
         }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    match len {
-        4 => dst[..4].copy_from_slice(&src[..4]),
-        8 => dst[..8].copy_from_slice(&src[..8]),
-        16 => dst[..16].copy_from_slice(&src[..16]),
-        32 => dst[..32].copy_from_slice(&src[..32]),
-        64 => dst[..64].copy_from_slice(&src[..64]),
-        _ => unreachable!("invalid intra edge span width"),
     }
 }
 
@@ -4373,7 +4313,6 @@ fn prediction_buffer_row_mut(
 fn fill_prediction_row(dst: &mut [u8], value: u8, size: usize) {
     debug_assert_eq!(dst.len(), size);
 
-    #[cfg(target_arch = "wasm32")]
     unsafe {
         let value = u8x16_splat(value);
         match size {
@@ -4387,15 +4326,6 @@ fn fill_prediction_row(dst: &mut [u8], value: u8, size: usize) {
             _ => unreachable!("invalid intra prediction row width"),
         }
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    match size {
-        4 => dst[..4].fill(value),
-        8 => dst[..8].fill(value),
-        16 => dst[..16].fill(value),
-        32 => dst[..32].fill(value),
-        _ => unreachable!("invalid intra prediction row width"),
-    }
 }
 
 #[inline(always)]
@@ -4408,7 +4338,6 @@ fn true_motion_prediction_row(
 ) {
     debug_assert_eq!(dst.len(), size);
 
-    #[cfg(target_arch = "wasm32")]
     unsafe {
         let delta = i16x8_splat(i16::from(left) - i16::from(above_left));
         match size {
@@ -4435,17 +4364,8 @@ fn true_motion_prediction_row(
             _ => unreachable!("invalid intra prediction row width"),
         }
     }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let delta = i32::from(left) - i32::from(above_left);
-        for col in 0..size {
-            dst[col] = clip1(i32::from(above[col]) + delta);
-        }
-    }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn true_motion_prediction_8(above: v128, delta: v128) -> v128 {
     let above = i16x8_extend_low_u8x16(above);
@@ -4453,7 +4373,6 @@ fn true_motion_prediction_8(above: v128, delta: v128) -> v128 {
     u8x16_narrow_i16x8(values, i16x8_splat(0))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn true_motion_prediction_16(above: *const u8, delta: v128) -> v128 {
     let lo = unsafe { v128_load64_zero(above.cast::<u64>()) };
@@ -4558,7 +4477,6 @@ fn store_prediction_row(dst: &mut [u8], src: &[u8], size: usize) {
     debug_assert_eq!(dst.len(), size);
     debug_assert!(src.len() >= size);
 
-    #[cfg(target_arch = "wasm32")]
     unsafe {
         match size {
             4 => {
@@ -4581,15 +4499,6 @@ fn store_prediction_row(dst: &mut [u8], src: &[u8], size: usize) {
             }
             _ => unreachable!("invalid intra prediction row width"),
         }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    match size {
-        4 => dst[..4].copy_from_slice(&src[..4]),
-        8 => dst[..8].copy_from_slice(&src[..8]),
-        16 => dst[..16].copy_from_slice(&src[..16]),
-        32 => dst[..32].copy_from_slice(&src[..32]),
-        _ => unreachable!("invalid intra prediction row width"),
     }
 }
 
@@ -4614,10 +4523,7 @@ fn add_residual_block(
 ) -> Result<(), TileSyntaxError> {
     let size = transform_width(tx_size);
     if residual_block_inside(plane, start, size) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            return add_residual_block_interior_simd(plane, start, size, residuals);
-        }
+        return add_residual_block_interior_simd(plane, start, size, residuals);
     }
 
     add_residual_block_scalar(plane, start, size, residuals)
@@ -4665,7 +4571,6 @@ fn add_residual_block_scalar(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn add_residual_block_interior_simd(
     plane: &mut CurrentPlaneMut<'_>,
     start: (usize, usize),
@@ -4706,7 +4611,6 @@ fn add_residual_block_interior_simd(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn add_residual_row_simd(dst: &mut [u8], residuals: &[i32]) {
     debug_assert_eq!(dst.len(), residuals.len());
@@ -4742,7 +4646,6 @@ fn add_residual_row_simd(dst: &mut [u8], residuals: &[i32]) {
     debug_assert_eq!(col, dst.len());
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn add_residual_8(prediction: v128, residual_lo: v128, residual_hi: v128) -> v128 {
     let predicted = i16x8_extend_low_u8x16(prediction);
@@ -4752,7 +4655,6 @@ fn add_residual_8(prediction: v128, residual_lo: v128, residual_hi: v128) -> v12
     u8x16_narrow_i16x8(packed_i16, i16x8_splat(0))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn add_residual_4(prediction: v128, residuals: v128) -> v128 {
     let predicted = i16x8_extend_low_u8x16(prediction);
@@ -5415,7 +5317,6 @@ fn loop_filter_segment(
                 .checked_mul(plane.stride)
                 .and_then(|row| row.checked_add(x))
                 .ok_or(TileSyntaxError::InvalidBitstream)?;
-            #[cfg(target_arch = "wasm32")]
             if len == 8 {
                 let filtered = match filter_size {
                     TxSize::Tx4x4 => {
@@ -5464,7 +5365,6 @@ fn loop_filter_segment(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn loop_filter_tx4x4_horizontal_8(
     data: &mut [u8],
@@ -5588,14 +5488,12 @@ fn loop_filter_tx4x4_horizontal_8(
     true
 }
 
-#[cfg(target_arch = "wasm32")]
 struct LoopFilterMasks8 {
     filter: v128,
     hev: v128,
     flat: v128,
 }
 
-#[cfg(target_arch = "wasm32")]
 struct LoopFilterNarrowBytes {
     p1: v128,
     p0: v128,
@@ -5603,7 +5501,6 @@ struct LoopFilterNarrowBytes {
     q1: v128,
 }
 
-#[cfg(target_arch = "wasm32")]
 struct LoopFilterWide3Bytes {
     p2: v128,
     p1: v128,
@@ -5613,7 +5510,6 @@ struct LoopFilterWide3Bytes {
     q2: v128,
 }
 
-#[cfg(target_arch = "wasm32")]
 struct LoopFilterWide4Bytes {
     p6: v128,
     p5: v128,
@@ -5631,7 +5527,6 @@ struct LoopFilterWide4Bytes {
     q6: v128,
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn loop_filter_tx8x8_horizontal_8(
     data: &mut [u8],
@@ -5751,7 +5646,6 @@ fn loop_filter_tx8x8_horizontal_8(
     true
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn loop_filter_tx16x16_horizontal_8(
     data: &mut [u8],
@@ -6015,7 +5909,6 @@ fn loop_filter_tx16x16_horizontal_8(
     true
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn loop_filter_masks_horizontal_8(
@@ -6068,7 +5961,6 @@ fn loop_filter_masks_horizontal_8(
     LoopFilterMasks8 { filter, hev, flat }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn loop_filter_flat2_horizontal_8(
@@ -6095,7 +5987,6 @@ fn loop_filter_flat2_horizontal_8(
     v128_not(not_flat2)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn loop_filter_narrow_outputs_horizontal_8(
     p1s: v128,
@@ -6145,7 +6036,6 @@ fn loop_filter_narrow_outputs_horizontal_8(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn store_loop_filter_narrow_horizontal_8(
@@ -6188,7 +6078,6 @@ fn store_loop_filter_narrow_horizontal_8(
     );
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn store_loop_filter_wide3_horizontal_8(
@@ -6233,19 +6122,16 @@ fn store_loop_filter_wide3_horizontal_8(
     );
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn unsigned_sample_i16x8(samples: v128) -> v128 {
     u16x8_extend_low_u8x16(samples)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn add3_i16x8(a: v128, b: v128, c: v128) -> v128 {
     i16x8_add(i16x8_add(a, b), c)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn slide_loop_filter_sum_i16x8(
     sum: v128,
@@ -6260,7 +6146,6 @@ fn slide_loop_filter_sum_i16x8(
     )
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_loop_filter_sum_u8x8(sum: v128, bits: u32) -> v128 {
     let rounded = i16x8_shr(
@@ -6270,7 +6155,6 @@ fn round_loop_filter_sum_u8x8(sum: v128, bits: u32) -> v128 {
     u8x16_narrow_i16x8(rounded, i16x8_splat(0))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn loop_filter_wide3_outputs_horizontal_8(
@@ -6307,7 +6191,6 @@ fn loop_filter_wide3_outputs_horizontal_8(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn loop_filter_wide4_outputs_horizontal_8(
@@ -6385,19 +6268,16 @@ fn loop_filter_wide4_outputs_horizontal_8(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_loop_filter_row_8(data: &[u8], offset: usize) -> v128 {
     unsafe { v128_load64_zero(data.as_ptr().add(offset).cast::<u64>()) }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn store_loop_filter_row_8(data: &mut [u8], offset: usize, value: v128) {
     unsafe { v128_store64_lane::<0>(value, data.as_mut_ptr().add(offset).cast::<u64>()) };
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn signed_sample_i16x8(samples: v128) -> v128 {
     // Convert u8 samples to the signed VP9 loop-filter domain (sample - 128)
@@ -6405,19 +6285,16 @@ fn signed_sample_i16x8(samples: v128) -> v128 {
     i16x8_extend_low_i8x16(v128_xor(samples, u8x16_splat(0x80)))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn abs_diff_i16x8(a: v128, b: v128) -> v128 {
     i16x8_abs(i16x8_sub(a, b))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn filter4_clamp_i16x8(value: v128) -> v128 {
     i16x8_min(i16x8_max(value, i16x8_splat(-128)), i16x8_splat(127))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn i16x8_mask_to_u8x8(mask: v128) -> v128 {
     // The blend mask is held as i16 lanes. Pick each lane's low byte so every
@@ -9207,13 +9084,13 @@ mod tests {
         LoopFilterStrength, MAX_INTERP_BUFFER, MAX_INTRA_ABOVE, MAX_TX_COEFFS, MAX_TX_WIDTH,
         ModeInfoView, ModeInfoViewMut, MotionVector, NEARESTMV, NONE_FRAME, NeighborModeInfo,
         REF_LISTS, ReferenceFrame, ReferenceFrames, ReferencePlane, ResidualBuffers,
-        STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SUBPEL_SHIFTS,
-        SWITCHABLE_FILTER_SENTINEL, ScaledMotion, StoredModeInfo, TileModeContexts,
-        TileParseBuffers, TileParser, TileSyntaxError, TxSize, TxType, UnscaledInterPrediction,
-        ZEROMV, add_residual_block, add_residual_block_scalar, inter_predict_sample,
-        inter_predict_subpel_unscaled_block, inter_predict_subpel_unscaled_block_scalar,
-        intra_predict_block, intra_predict_block_scalar, loop_filter_segment, parse_intra_tiles,
-        read_coef, sample_filter_direct, scan_table, select_inter_mv, transform_width,
+        STORED_MODE_INFO_BYTES, SUB_BLOCKS, SUBPEL_FILTERS, SWITCHABLE_FILTER_SENTINEL,
+        ScaledMotion, StoredModeInfo, TileModeContexts, TileParseBuffers, TileParser,
+        TileSyntaxError, TxSize, TxType, UnscaledInterPrediction, ZEROMV, add_residual_block,
+        add_residual_block_scalar, inter_predict_sample, inter_predict_subpel_unscaled_block,
+        inter_predict_subpel_unscaled_block_scalar, intra_predict_block,
+        intra_predict_block_scalar, loop_filter_segment, parse_intra_tiles, read_coef,
+        sample_filter_direct, scan_table, select_inter_mv, transform_width,
         write_common_intra_prediction_direct, write_prediction_block_scalar,
     };
     use crate::boolcoder::BoolDecoder;
@@ -9254,10 +9131,9 @@ mod tests {
         let block = test_block(false);
 
         for filter_index in FILTER_BANKS {
-            for x_phase in 0..SUBPEL_SHIFTS as usize {
-                for y_phase in 0..SUBPEL_SHIFTS as usize {
-                    let x_filter = &SUBPEL_FILTERS[filter_index][x_phase];
-                    let y_filter = &SUBPEL_FILTERS[filter_index][y_phase];
+            let bank = &SUBPEL_FILTERS[filter_index];
+            for (x_phase, x_filter) in bank.iter().enumerate() {
+                for (y_phase, y_filter) in bank.iter().enumerate() {
                     for (origin_index, (src_x, src_y)) in SOURCE_ORIGINS.into_iter().enumerate() {
                         for width in WIDTHS {
                             for height in HEIGHTS {
@@ -9413,7 +9289,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     #[test]
     fn horizontal_wide_loop_filter_kernels_match_scalar_reference_direct()
     -> Result<(), TileSyntaxError> {
@@ -9505,7 +9380,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     #[test]
     fn loop_filter_simd_filter4_clamp_preserves_negative_in_range() {
         let value = super::filter4_clamp_i16x8(core::arch::wasm32::i16x8_splat(-1));
@@ -10651,7 +10525,7 @@ mod tests {
             interp_buffer: [0; MAX_INTERP_BUFFER],
         };
 
-        let candidate = parser.mv_ref_candidate(3, 4, &[-2, 0]).unwrap().unwrap();
+        let candidate = parser.mv_ref_candidate(3, 4, [-2, 0]).unwrap().unwrap();
 
         assert_eq!(candidate.y_mode, NEARESTMV);
         assert_eq!(candidate.mvs[0], exact_mv);

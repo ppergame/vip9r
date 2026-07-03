@@ -2,7 +2,6 @@ use crate::header::{SEG_LVL_ALT_Q, SegmentationParams, UncompressedFrameHeader};
 
 use super::{MAX_TX_COEFFS, PLANES, TileSyntaxError, TxSize, TxType};
 
-#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,19 +139,12 @@ pub(super) struct DequantizedCoefficients {
     pub(super) coefficients: [i32; MAX_TX_COEFFS],
     pub(super) eob: usize,
     nonzero_row_mask: u32,
-    #[cfg(target_arch = "wasm32")]
     dct_simd_scratch: [v128; MAX_TX_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     dct_scalar_scratch: [i32; MAX_TX_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     adst_copy: [v128; MAX_ADST_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     adst_s_lo: [v128; MAX_ADST_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     adst_s_hi: [v128; MAX_ADST_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     adst_scalar_copy: [i32; MAX_ADST_WIDTH],
-    #[cfg(target_arch = "wasm32")]
     adst_scalar_s: [i64; MAX_ADST_WIDTH],
 }
 
@@ -163,19 +155,12 @@ impl DequantizedCoefficients {
             coefficients: [0; MAX_TX_COEFFS],
             eob: 0,
             nonzero_row_mask: 0,
-            #[cfg(target_arch = "wasm32")]
             dct_simd_scratch: [i32x4_splat(0); MAX_TX_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             dct_scalar_scratch: [0; MAX_TX_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_copy: [i32x4_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_s_lo: [i64x2_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_s_hi: [i64x2_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_scalar_copy: [0; MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_scalar_s: [0; MAX_ADST_WIDTH],
         }
     }
@@ -187,19 +172,12 @@ impl DequantizedCoefficients {
             coefficients: [0; MAX_TX_COEFFS],
             eob,
             nonzero_row_mask: 0,
-            #[cfg(target_arch = "wasm32")]
             dct_simd_scratch: [i32x4_splat(0); MAX_TX_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             dct_scalar_scratch: [0; MAX_TX_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_copy: [i32x4_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_s_lo: [i64x2_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_s_hi: [i64x2_splat(0); MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_scalar_copy: [0; MAX_ADST_WIDTH],
-            #[cfg(target_arch = "wasm32")]
             adst_scalar_s: [0; MAX_ADST_WIDTH],
         }
     }
@@ -271,11 +249,8 @@ impl DequantizedCoefficients {
         width: usize,
         nonzero_row_mask: u32,
     ) -> Result<(), TileSyntaxError> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            if !lossless {
-                return self.inverse_transform_2d_simd(n, width, nonzero_row_mask);
-            }
+        if !lossless {
+            return self.inverse_transform_2d_simd(n, width, nonzero_row_mask);
         }
 
         self.inverse_transform_2d_scalar(lossless, n, width, nonzero_row_mask)
@@ -288,16 +263,9 @@ impl DequantizedCoefficients {
         width: usize,
         nonzero_row_mask: u32,
     ) -> Result<(), TileSyntaxError> {
-        #[cfg(target_arch = "wasm32")]
         let t = &mut self.dct_scalar_scratch;
-        #[cfg(target_arch = "wasm32")]
         let adst_copy = &mut self.adst_scalar_copy;
-        #[cfg(target_arch = "wasm32")]
         let adst_s = &mut self.adst_scalar_s;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut t_storage = [0i32; MAX_TX_WIDTH];
-        #[cfg(not(target_arch = "wasm32"))]
-        let t = &mut t_storage;
         let active_rows = width.min(u32::BITS as usize - nonzero_row_mask.leading_zeros() as usize);
 
         for row in 0..active_rows {
@@ -315,10 +283,7 @@ impl DequantizedCoefficients {
                 inverse_dct_permutation(t, n);
                 inverse_dct(t, n)?;
             } else {
-                #[cfg(target_arch = "wasm32")]
                 inverse_adst_with_scratch(t, n, adst_s, adst_copy)?;
-                #[cfg(not(target_arch = "wasm32"))]
-                inverse_adst(t, n)?;
             }
 
             for (col, value) in t.iter().take(width).copied().enumerate() {
@@ -338,10 +303,7 @@ impl DequantizedCoefficients {
                 inverse_dct_permutation(t, n);
                 inverse_dct(t, n)?;
             } else {
-                #[cfg(target_arch = "wasm32")]
                 inverse_adst_with_scratch(t, n, adst_s, adst_copy)?;
-                #[cfg(not(target_arch = "wasm32"))]
-                inverse_adst(t, n)?;
             }
 
             for (row, value) in t.iter().take(width).copied().enumerate() {
@@ -356,7 +318,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_2d_simd(
         &mut self,
         n: usize,
@@ -382,7 +343,6 @@ impl DequantizedCoefficients {
         self.inverse_transform_columns_simd(n, width, column_transform)
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_2d_dct_dct_simd_i16(
         &mut self,
         n: usize,
@@ -393,7 +353,6 @@ impl DequantizedCoefficients {
         self.inverse_transform_columns_dct_dct_simd_i16(n, width)
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_rows_dct_dct_simd_i16(
         &mut self,
         n: usize,
@@ -446,7 +405,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_row_half_group_dct_dct_simd_i16(
         &mut self,
         n: usize,
@@ -481,7 +439,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_row_group_dct_dct_simd_i16(
         &mut self,
         n: usize,
@@ -527,7 +484,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_columns_dct_dct_simd_i16(
         &mut self,
         n: usize,
@@ -579,7 +535,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_rows_simd(
         &mut self,
         n: usize,
@@ -633,7 +588,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_row_group_simd(
         &mut self,
         n: usize,
@@ -688,7 +642,6 @@ impl DequantizedCoefficients {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
     fn inverse_transform_columns_simd(
         &mut self,
         n: usize,
@@ -922,12 +875,9 @@ pub(super) const fn coefficient_count(tx_size: TxSize) -> usize {
 
 const MAX_TX_WIDTH: usize = 32;
 const MAX_ADST_WIDTH: usize = 16;
-#[cfg(target_arch = "wasm32")]
 const SIMD_TRANSFORM_LANES: usize = 4;
-#[cfg(target_arch = "wasm32")]
 const SIMD_DCT_I16_LANES: usize = 8;
 
-#[cfg(target_arch = "wasm32")]
 #[derive(Clone, Copy)]
 enum InverseTransform1d {
     Dct,
@@ -1033,7 +983,6 @@ fn h(t: &mut [i32; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     t[y_index] = narrow_i32_butterfly(x - y);
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn i32x4_from_lanes(a: i32, b: i32, c: i32, d: i32) -> v128 {
     let value = i32x4_replace_lane::<0>(i32x4_splat(0), a);
@@ -1042,7 +991,6 @@ fn i32x4_from_lanes(a: i32, b: i32, c: i32, d: i32) -> v128 {
     i32x4_replace_lane::<3>(value, d)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn load_i32x4(src: *const i32) -> v128 {
     // Wasm vector loads are byte-addressed and permit unaligned addresses. The
@@ -1050,7 +998,6 @@ fn load_i32x4(src: *const i32) -> v128 {
     unsafe { v128_load(src.cast::<v128>()) }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn store_i32x4(dst: *mut i32, value: v128) {
     // Wasm vector stores are byte-addressed and permit unaligned addresses. The
@@ -1058,14 +1005,12 @@ fn store_i32x4(dst: *mut i32, value: v128) {
     unsafe { v128_store(dst.cast::<v128>(), value) }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_i32x4_i16_domain(value: v128, bits: usize) -> v128 {
     let rounding = i32x4_splat(1i32 << (bits - 1));
     i32x4_shr(i32x4_add(value, rounding), bits as u32)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_i16x8_to_i32x4(value: v128, bits: usize) -> (v128, v128) {
     (
@@ -1074,26 +1019,22 @@ fn round_shift_i16x8_to_i32x4(value: v128, bits: usize) -> (v128, v128) {
     )
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_i16x8_low_to_i32x4(value: v128, bits: usize) -> v128 {
     round_shift_i32x4_i16_domain(i32x4_extend_low_i16x8(value), bits)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn pack_i64x2_low_i32s(lo: v128, hi: v128) -> v128 {
     i32x4_shuffle::<0, 2, 4, 6>(lo, hi)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_i64x2(value: v128, bits: usize) -> v128 {
     let rounding = i64x2_splat(1i64 << (bits - 1));
     i64x2_shr(i64x2_add(value, rounding), bits as u32)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_shift_i32x4(value: v128, bits: usize) -> v128 {
     let lo = round_shift_i64x2(i64x2_extend_low_i32x4(value), bits);
@@ -1101,13 +1042,11 @@ fn round_shift_i32x4(value: v128, bits: usize) -> v128 {
     pack_i64x2_low_i32s(lo, hi)
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn round_pack_i64x2_low_i32s(lo: v128, hi: v128, bits: usize) -> v128 {
     pack_i64x2_low_i32s(round_shift_i64x2(lo, bits), round_shift_i64x2(hi, bits))
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn b_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, flip: bool) {
     let ta = t[a];
@@ -1156,7 +1095,6 @@ fn b_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, fl
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn h_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     let (x_index, y_index) = if flip { (b_index, a) } else { (a, b_index) };
@@ -1166,7 +1104,6 @@ fn h_simd(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     t[y_index] = i32x4_sub(x, y);
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn b_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32, flip: bool) {
     let ta = t[a];
@@ -1215,7 +1152,6 @@ fn b_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, angle: i32
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn h_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool) {
     let (x_index, y_index) = if flip { (b_index, a) } else { (a, b_index) };
@@ -1225,7 +1161,6 @@ fn h_simd_i16(t: &mut [v128; MAX_TX_WIDTH], a: usize, b_index: usize, flip: bool
     t[y_index] = i16x8_sub(x, y);
 }
 
-#[cfg(target_arch = "wasm32")]
 fn sb_simd(
     t: &[v128; MAX_TX_WIDTH],
     s_lo: &mut [v128; MAX_ADST_WIDTH],
@@ -1270,7 +1205,6 @@ fn sb_simd(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn sh_simd(
     t: &mut [v128; MAX_TX_WIDTH],
     s_lo: &[v128; MAX_ADST_WIDTH],
@@ -1413,7 +1347,6 @@ fn inverse_dct(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxEr
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
     if !(2..=5).contains(&n) {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -1495,7 +1428,6 @@ fn inverse_dct_simd(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSy
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_dct_simd_i16(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
     if !(2..=5).contains(&n) {
         return Err(TileSyntaxError::InvalidBitstream);
@@ -1577,7 +1509,6 @@ fn inverse_dct_simd_i16(t: &mut [v128; MAX_TX_WIDTH], n: usize) -> Result<(), Ti
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn inverse_adst_input_permutation_simd(
     t: &mut [v128; MAX_TX_WIDTH],
@@ -1593,7 +1524,6 @@ fn inverse_adst_input_permutation_simd(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 #[inline(always)]
 fn inverse_adst_output_permutation_simd(
     t: &mut [v128; MAX_TX_WIDTH],
@@ -1625,7 +1555,6 @@ fn inverse_adst_output_permutation_simd(
     }
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_adst4_simd(t: &mut [v128; MAX_TX_WIDTH]) -> Result<(), TileSyntaxError> {
     let t0_lo = i64x2_extend_low_i32x4(t[0]);
     let t0_hi = i64x2_extend_high_i32x4(t[0]);
@@ -1684,7 +1613,6 @@ fn inverse_adst4_simd(t: &mut [v128; MAX_TX_WIDTH]) -> Result<(), TileSyntaxErro
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_adst8_simd(
     t: &mut [v128; MAX_TX_WIDTH],
     s_lo: &mut [v128; MAX_ADST_WIDTH],
@@ -1693,29 +1621,13 @@ fn inverse_adst8_simd(
 ) -> Result<(), TileSyntaxError> {
     inverse_adst_input_permutation_simd(t, 3, copy_t);
     for i in 0..=3 {
-        sb_simd(
-            t,
-            s_lo,
-            s_hi,
-            2 * i,
-            1 + 2 * i,
-            30 - 8 * i as i32,
-            true,
-        );
+        sb_simd(t, s_lo, s_hi, 2 * i, 1 + 2 * i, 30 - 8 * i as i32, true);
     }
     for i in 0..=3 {
         sh_simd(t, s_lo, s_hi, i, 4 + i);
     }
     for i in 0..=1 {
-        sb_simd(
-            t,
-            s_lo,
-            s_hi,
-            4 + 3 * i,
-            5 + i,
-            24 - 16 * i as i32,
-            true,
-        );
+        sb_simd(t, s_lo, s_hi, 4 + 3 * i, 5 + i, 24 - 16 * i as i32, true);
     }
     for i in 0..=1 {
         sh_simd(t, s_lo, s_hi, 4 + i, 6 + i);
@@ -1735,7 +1647,6 @@ fn inverse_adst8_simd(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_adst16_simd(
     t: &mut [v128; MAX_TX_WIDTH],
     s_lo: &mut [v128; MAX_ADST_WIDTH],
@@ -1744,15 +1655,7 @@ fn inverse_adst16_simd(
 ) -> Result<(), TileSyntaxError> {
     inverse_adst_input_permutation_simd(t, 4, copy_t);
     for i in 0..=7 {
-        sb_simd(
-            t,
-            s_lo,
-            s_hi,
-            2 * i,
-            1 + 2 * i,
-            31 - 4 * i as i32,
-            true,
-        );
+        sb_simd(t, s_lo, s_hi, 2 * i, 1 + 2 * i, 31 - 4 * i as i32, true);
     }
     for i in 0..=7 {
         sh_simd(t, s_lo, s_hi, i, 8 + i);
@@ -1819,7 +1722,6 @@ fn inverse_adst16_simd(
     Ok(())
 }
 
-#[cfg(target_arch = "wasm32")]
 fn inverse_adst_simd(
     t: &mut [v128; MAX_TX_WIDTH],
     n: usize,
@@ -2005,13 +1907,6 @@ fn inverse_adst16_with_scratch(
     }
 
     Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn inverse_adst(t: &mut [i32; MAX_TX_WIDTH], n: usize) -> Result<(), TileSyntaxError> {
-    let mut s = [0i64; MAX_ADST_WIDTH];
-    let mut copy_t = [0i32; MAX_ADST_WIDTH];
-    inverse_adst_with_scratch(t, n, &mut s, &mut copy_t)
 }
 
 fn inverse_adst_with_scratch(
