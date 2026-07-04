@@ -152,34 +152,6 @@ impl<'a> ModeInfoView<'a> {
         Ok(())
     }
 
-    pub(crate) fn raw_parts(self) -> ModeInfoViewRaw {
-        ModeInfoViewRaw {
-            data: self.data.as_ptr() as usize,
-            len: self.data.len(),
-            mi_cols: self.mi_cols,
-            band_mi_col_start: self.band_mi_col_start,
-            band_mi_col_end: self.band_mi_col_end,
-        }
-    }
-
-    pub(crate) unsafe fn from_raw_parts(raw: ModeInfoViewRaw) -> Result<Self, TileSyntaxError> {
-        if !raw.len.is_multiple_of(STORED_MODE_INFO_BYTES) {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-        if raw.mi_cols != 0 && raw.band_mi_col_start > raw.band_mi_col_end {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-        // SAFETY: The caller guarantees that raw.data/raw.len describe a
-        // live immutable mode-history region for the duration of the job.
-        let data = unsafe { core::slice::from_raw_parts(raw.data as *const u8, raw.len) };
-        Ok(Self {
-            data,
-            mi_cols: raw.mi_cols,
-            band_mi_col_start: raw.band_mi_col_start,
-            band_mi_col_end: raw.band_mi_col_end,
-        })
-    }
-
     #[allow(dead_code)]
     pub(super) fn get(self, index: usize) -> Result<StoredModeInfo, TileSyntaxError> {
         let entry = self.entry(index)?;
@@ -382,15 +354,6 @@ impl<'a> ModeInfoViewMut<'a> {
         self.entry_mut(index)?.copy_from_slice(bytes);
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ModeInfoViewRaw {
-    pub(crate) data: usize,
-    pub(crate) len: usize,
-    pub(crate) mi_cols: usize,
-    pub(crate) band_mi_col_start: usize,
-    pub(crate) band_mi_col_end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -27,7 +27,6 @@ mod wasm;
 use compressed_header::{
     CompressedHeader, TxMode, parse_inter_compressed_header, parse_intra_compressed_header,
 };
-use core::mem::{align_of, size_of};
 use header::{HeaderParserState, parse_uncompressed_frame_header};
 use probability::{NonCoefAdaptationConfig, ProbabilityState, SyntaxCounts};
 use tile::parse_tile_layout;
@@ -58,7 +57,6 @@ const REFERENCE_FRAME_SLOTS: usize = 8;
 // before the next frame needs to choose a writable current buffer.
 const FRAME_POOL_BUFFERS: usize = 1 + REFERENCE_FRAME_SLOTS;
 const MODE_HISTORY_SLOTS: usize = 2;
-const WORKER_COUNTS_ALIGN: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodedFrameRange {
@@ -108,7 +106,6 @@ pub struct WorkspaceLayout {
     max_height: u32,
     frame_pool: FramePoolLayout,
     mode_history: ModeHistoryLayout,
-    worker_counts: ByteRange,
 }
 
 impl WorkspaceLayout {
@@ -118,18 +115,12 @@ impl WorkspaceLayout {
         let max_mi_count =
             frame_mi_count(max_width, max_height).map_err(|_| DecodeError::InvalidConfig)?;
         let mode_history = ModeHistoryLayout::new(frame_pool.total_bytes(), max_mi_count)?;
-        let worker_counts_start = align_up(mode_history.total_bytes(), WORKER_COUNTS_ALIGN)?;
-        let worker_counts_len = size_of::<SyntaxCounts>()
-            .checked_mul(pool::WORKER_COUNT)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let worker_counts = ByteRange::new(worker_counts_start, worker_counts_len)?;
 
         Ok(Self {
             max_width,
             max_height,
             frame_pool,
             mode_history,
-            worker_counts,
         })
     }
 
@@ -142,9 +133,7 @@ impl WorkspaceLayout {
     }
 
     pub fn total_bytes(self) -> usize {
-        self.worker_counts
-            .end()
-            .expect("worker-counts layout was checked at construction")
+        self.mode_history.total_bytes()
     }
 }
 
@@ -248,34 +237,6 @@ impl ByteRange {
     }
 }
 
-fn align_up(value: usize, align: usize) -> Result<usize, DecodeError> {
-    if !align.is_power_of_two() {
-        return Err(DecodeError::InvalidConfig);
-    }
-    value
-        .checked_add(align - 1)
-        .map(|value| value & !(align - 1))
-        .ok_or(DecodeError::InvalidConfig)
-}
-
-fn syntax_counts_slice(bytes: &mut [u8]) -> Result<&mut [SyntaxCounts], DecodeError> {
-    if bytes.len() != size_of::<SyntaxCounts>() * pool::WORKER_COUNT {
-        return Err(DecodeError::InvalidConfig);
-    }
-    if !(bytes.as_mut_ptr() as usize).is_multiple_of(align_of::<SyntaxCounts>()) {
-        return Err(DecodeError::InvalidConfig);
-    }
-
-    let ptr = bytes.as_mut_ptr().cast::<SyntaxCounts>();
-    // SAFETY: WorkspaceLayout places this region at a 16-byte-aligned offset
-    // and sizes it to exactly WORKER_COUNT whole SyntaxCounts objects.  The
-    // backing memory is the decoder arena's initialized u8 storage, and
-    // SyntaxCounts is entirely integer arrays, so every byte pattern is a
-    // valid value.  The returned slice is disjoint from the frame pool and
-    // mode-history slices created by reconstruction_buffers.
-    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, pool::WORKER_COUNT) })
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameLayout {
     y: PlaneLayout,
@@ -353,7 +314,6 @@ type ReconstructionBuffers<'a> = (
     CurrentFrameMut<'a>,
     Option<ReferenceFrames<'a>>,
     FrameModeBuffers<'a>,
-    &'a mut [SyntaxCounts],
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -395,25 +355,17 @@ impl<'a> DecodeWorkspace<'a> {
         let frame_pool_layout = self.layout.frame_pool;
         let frame_layout = frame_pool_layout.frame;
         let mode_history = self.layout.mode_history;
-        let worker_counts = self.layout.worker_counts;
         let frame_pool_end = frame_pool_layout.total_bytes();
         let first_history = mode_history.slots[0];
         if first_history.start != frame_pool_end {
             return Err(DecodeError::InvalidConfig);
         }
         let history_end = mode_history.slots[MODE_HISTORY_SLOTS - 1].end()?;
-        if history_end > worker_counts.start || worker_counts.end()? > self.memory.len() {
+        if history_end > self.memory.len() {
             return Err(DecodeError::InvalidConfig);
         }
 
-        let (before_worker_counts, worker_counts_and_after) =
-            self.memory.split_at_mut(worker_counts.start);
-        let worker_counts_bytes = worker_counts_and_after
-            .get_mut(..worker_counts.len)
-            .ok_or(DecodeError::InvalidConfig)?;
-        let worker_counts = syntax_counts_slice(worker_counts_bytes)?;
-
-        let (frame_pool, history_and_after) = before_worker_counts.split_at_mut(first_history.start);
+        let (frame_pool, history_and_after) = self.memory.split_at_mut(first_history.start);
         let current_range = frame_pool_layout.buffer(request.current_frame_slot)?;
         let current_end = current_range.end()?;
         if current_end > frame_pool.len() {
@@ -455,7 +407,7 @@ impl<'a> DecodeWorkspace<'a> {
             request.mi_count,
         )?;
 
-        Ok((current_frame, reference_frames, mode_buffers, worker_counts))
+        Ok((current_frame, reference_frames, mode_buffers))
     }
 
     fn current_i420_frame(
@@ -1094,7 +1046,7 @@ impl Decoder {
             .copied()
             .ok_or(DecodeError::InvalidConfig)?;
         {
-            let (mut current_frame, reference_frames, mode_buffers, worker_counts) = workspace
+            let (mut current_frame, reference_frames, mode_buffers) = workspace
                 .reconstruction_buffers(ReconstructionBufferRequest {
                     current_frame_slot,
                     initialize_current_frame,
@@ -1116,22 +1068,23 @@ impl Decoder {
                     &tile_layout,
                     TileParseBuffers::new(
                         &mut self.syntax_counts,
-                        worker_counts,
                         mode_buffers,
                         &mut current_frame,
+                        None,
                     ),
                 )
             } else {
-                let reference_frames = reference_frames.ok_or(DecodeError::InvalidBitstream)?;
+                if reference_frames.is_none() {
+                    return Err(DecodeError::InvalidBitstream);
+                }
                 parse_inter_tiles(
                     coded_frame,
                     &header,
                     &compressed_header,
                     self.probability_state.current(),
                     &tile_layout,
-                    TileParseBuffers::with_references(
+                    TileParseBuffers::new(
                         &mut self.syntax_counts,
-                        worker_counts,
                         mode_buffers,
                         &mut current_frame,
                         reference_frames,
@@ -1390,7 +1343,7 @@ fn validate_limits(max_width: u32, max_height: u32) -> Result<(), DecodeError> {
 mod tests {
     use super::{
         DecodeError, DecodeOutcome, DecodeWorkspace, Decoder, I420Frame, PlaneShape,
-        SyntaxCounts, WORKER_COUNTS_ALIGN, WorkspaceLayout, align_up, pool, required_i420_len,
+        WorkspaceLayout, required_i420_len,
     };
 
     #[test]
@@ -1423,15 +1376,10 @@ mod tests {
         let frame_pool_bytes = 16 * 16 * 3 / 2 * 9;
         let mode_history_slot_bytes = 4 * super::tile_syntax::STORED_MODE_INFO_BYTES;
         let mode_history_end = frame_pool_bytes + 2 * mode_history_slot_bytes;
-        let worker_counts_start = align_up(mode_history_end, WORKER_COUNTS_ALIGN).unwrap();
-        let worker_counts_bytes = core::mem::size_of::<SyntaxCounts>() * pool::WORKER_COUNT;
 
         assert_eq!(layout.max_width(), 16);
         assert_eq!(layout.max_height(), 16);
-        assert_eq!(
-            layout.total_bytes(),
-            worker_counts_start + worker_counts_bytes
-        );
+        assert_eq!(layout.total_bytes(), mode_history_end);
         assert_eq!(layout.frame_pool.buffers[0].start, 0);
         assert_eq!(layout.frame_pool.buffers[0].len, 16 * 16 * 3 / 2);
         assert_eq!(layout.frame_pool.buffers[1].start, 16 * 16 * 3 / 2);
@@ -1450,8 +1398,6 @@ mod tests {
             layout.mode_history.slots[1].end().unwrap(),
             mode_history_end
         );
-        assert_eq!(layout.worker_counts.start, worker_counts_start);
-        assert_eq!(layout.worker_counts.len, worker_counts_bytes);
         assert_eq!(layout.frame_pool.frame.y.offset, 0);
         assert_eq!(layout.frame_pool.frame.y.shape.stride, 16);
         assert_eq!(layout.frame_pool.frame.y.len(), 16 * 16);
@@ -1469,8 +1415,6 @@ mod tests {
         let frame_bytes = 24 * 16 + 2 * 12 * 8;
         let mode_history_slot_bytes = 6 * super::tile_syntax::STORED_MODE_INFO_BYTES;
         let mode_history_end = frame_bytes * 9 + 2 * mode_history_slot_bytes;
-        let worker_counts_start = align_up(mode_history_end, WORKER_COUNTS_ALIGN).unwrap();
-        let worker_counts_bytes = core::mem::size_of::<SyntaxCounts>() * pool::WORKER_COUNT;
 
         assert_eq!(layout.max_width(), 17);
         assert_eq!(layout.max_height(), 9);
@@ -1478,10 +1422,7 @@ mod tests {
         assert_eq!(layout.frame_pool.frame.u.shape, PlaneShape::new(12, 8, 12));
         assert_eq!(layout.frame_pool.frame.v.shape, PlaneShape::new(12, 8, 12));
         assert_eq!(layout.frame_pool.buffers[0].len, frame_bytes);
-        assert_eq!(
-            layout.total_bytes(),
-            worker_counts_start + worker_counts_bytes
-        );
+        assert_eq!(layout.total_bytes(), mode_history_end);
     }
 
     #[test]

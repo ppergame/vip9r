@@ -27,13 +27,11 @@ use coef::*;
 use inter_predict::*;
 use intra_predict::*;
 use loop_filter::*;
+use mode_info::ModeInfoViewMutRaw;
 #[cfg(any(test, feature = "wasm-tests"))]
 pub(crate) use mode_info::STORED_MODE_INFO_BYTES;
 use mode_info::*;
-pub(crate) use mode_info::{
-    FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len,
-};
-use mode_info::{ModeInfoViewMutRaw, ModeInfoViewRaw};
+pub(crate) use mode_info::{FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len};
 use residual::*;
 use tables::*;
 
@@ -147,32 +145,27 @@ impl<'a> CurrentFrameMut<'a> {
         }
     }
 
-    unsafe fn from_band_raw(raw: CurrentFrameBandRaw) -> Result<Self, TileSyntaxError> {
+    unsafe fn from_band_raw(
+        raw: CurrentFrameRaw,
+        mi_col_start: usize,
+        mi_col_end: usize,
+    ) -> Result<Self, TileSyntaxError> {
         Ok(Self {
             // SAFETY: The caller's band-splitting contract guarantees that
             // each raw plane points at the live current-frame storage and that
             // simultaneously constructed bands have disjoint column ranges.
             y: unsafe {
-                CurrentPlaneMut::from_raw_band(
-                    raw.frame.y,
-                    luma_band(raw.mi_col_start, raw.mi_col_end)?,
-                )?
+                CurrentPlaneMut::from_raw_band(raw.y, luma_band(mi_col_start, mi_col_end)?)?
             },
             // SAFETY: Same as for luma; chroma bands are the corresponding
             // half-resolution column ranges, with the last band extending to
             // the plane edge by the plane-band constructor.
             u: unsafe {
-                CurrentPlaneMut::from_raw_band(
-                    raw.frame.u,
-                    chroma_band(raw.mi_col_start, raw.mi_col_end)?,
-                )?
+                CurrentPlaneMut::from_raw_band(raw.u, chroma_band(mi_col_start, mi_col_end)?)?
             },
             // SAFETY: Same as for U.
             v: unsafe {
-                CurrentPlaneMut::from_raw_band(
-                    raw.frame.v,
-                    chroma_band(raw.mi_col_start, raw.mi_col_end)?,
-                )?
+                CurrentPlaneMut::from_raw_band(raw.v, chroma_band(mi_col_start, mi_col_end)?)?
             },
         })
     }
@@ -297,11 +290,7 @@ impl<'a> CurrentPlaneMut<'a> {
         Ok(())
     }
 
-    pub(super) fn check_band_span(
-        &self,
-        x: usize,
-        width: usize,
-    ) -> Result<(), TileSyntaxError> {
+    pub(super) fn check_band_span(&self, x: usize, width: usize) -> Result<(), TileSyntaxError> {
         if width == 0 {
             return Ok(());
         }
@@ -335,13 +324,6 @@ struct CurrentPlaneRaw {
     width: usize,
     height: usize,
     stride: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CurrentFrameBandRaw {
-    frame: CurrentFrameRaw,
-    mi_col_start: usize,
-    mi_col_end: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,7 +453,6 @@ impl<'a> ReferencePlane<'a> {
 
 pub(crate) struct TileParseBuffers<'a, 'm, 'f, 'r> {
     counts: &'a mut SyntaxCounts,
-    worker_counts: &'a mut [SyntaxCounts],
     mode_buffers: FrameModeBuffers<'m>,
     current_frame: &'a mut CurrentFrameMut<'f>,
     reference_frames: Option<ReferenceFrames<'r>>,
@@ -480,32 +461,15 @@ pub(crate) struct TileParseBuffers<'a, 'm, 'f, 'r> {
 impl<'a, 'm, 'f, 'r> TileParseBuffers<'a, 'm, 'f, 'r> {
     pub(crate) const fn new(
         counts: &'a mut SyntaxCounts,
-        worker_counts: &'a mut [SyntaxCounts],
         mode_buffers: FrameModeBuffers<'m>,
         current_frame: &'a mut CurrentFrameMut<'f>,
+        reference_frames: Option<ReferenceFrames<'r>>,
     ) -> Self {
         Self {
             counts,
-            worker_counts,
             mode_buffers,
             current_frame,
-            reference_frames: None,
-        }
-    }
-
-    pub(crate) const fn with_references(
-        counts: &'a mut SyntaxCounts,
-        worker_counts: &'a mut [SyntaxCounts],
-        mode_buffers: FrameModeBuffers<'m>,
-        current_frame: &'a mut CurrentFrameMut<'f>,
-        reference_frames: ReferenceFrames<'r>,
-    ) -> Self {
-        Self {
-            counts,
-            worker_counts,
-            mode_buffers,
-            current_frame,
-            reference_frames: Some(reference_frames),
+            reference_frames,
         }
     }
 }
@@ -568,10 +532,9 @@ pub(crate) fn parse_inter_tiles(
 
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
-    let reference_frames = buffers
-        .reference_frames
-        .ok_or(TileSyntaxError::InvalidBitstream)?;
-    buffers.reference_frames = Some(reference_frames);
+    if buffers.reference_frames.is_none() {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
     let config = TileParserConfig {
         frame_is_intra: false,
         frame_width: header.frame_width,
@@ -598,90 +561,51 @@ pub(crate) fn parse_inter_tiles(
     Ok(())
 }
 
+/// Everything a column-band job reads that is identical across the wave.
+/// Lives on the coordinator's stack from before dispatch until after join;
+/// jobs carry a pointer to it. Read-only state crosses as plain references —
+/// their true lifetime ("until join") is enforced by the pool protocol, not
+/// the type system. Only the two shared-mutable surfaces stay as raw parts,
+/// because every job must rebuild its own band-restricted view over them.
 #[derive(Clone, Copy)]
-pub(crate) struct TileJob {
-    frame: ByteSliceRaw,
-    tiles: TileSliceRaw,
-    probabilities: usize,
+struct TileWave<'a> {
+    frame: &'a [u8],
+    tiles: &'a [TileDescriptor],
+    probabilities: &'a FrameContext,
     config: TileParserConfig,
-    mode_buffers: FrameModeBuffersRaw,
-    current_frame: CurrentFrameBandRaw,
-    reference_frames: ReferenceFramesRaw,
-    counts: usize,
-    result: usize,
-    tile_col: usize,
     tile_cols: usize,
     tile_rows: usize,
-}
-
-#[derive(Clone, Copy)]
-struct ByteSliceRaw {
-    data: usize,
-    len: usize,
-}
-
-#[derive(Clone, Copy)]
-struct TileSliceRaw {
-    data: usize,
-    len: usize,
-}
-
-#[derive(Clone, Copy)]
-struct FrameModeBuffersRaw {
-    use_prev_frame_mvs: bool,
-    prev_frame_modes: Option<ModeInfoViewRaw>,
+    prev_frame_modes: Option<ModeInfoView<'a>>,
+    current_frame: CurrentFrameRaw,
     current_frame_modes: Option<ModeInfoViewMutRaw>,
+    reference_frames: Option<ReferenceFrames<'a>>,
 }
 
+/// One column band of the wave. All pointers are usize-erased because job
+/// slots are statics: `wave` targets the coordinator's stack-resident
+/// TileWave, `counts` the worker's WORKER_SYNTAX_COUNTS entry (0 when counts
+/// are off), and `result` the coordinator's stack-resident result cell (0 for
+/// the coordinator's own jobs, which take the result by return value).
 #[derive(Clone, Copy)]
-struct ReferenceFramesRaw {
-    present: bool,
-    frames: [Option<ReferenceFrameRaw>; 4],
+pub(crate) struct TileJob {
+    wave: usize,
+    tile_col: usize,
+    mi_col_start: usize,
+    mi_col_end: usize,
+    counts: usize,
+    result: usize,
 }
 
-#[derive(Clone, Copy)]
-struct ReferenceFrameRaw {
-    y: ReferencePlaneRaw,
-    u: ReferencePlaneRaw,
-    v: ReferencePlaneRaw,
-}
-
-#[derive(Clone, Copy)]
-struct ReferencePlaneRaw {
-    data: usize,
-    len: usize,
-    width: usize,
-    height: usize,
-    stride: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TileJobResult {
-    tile_index: usize,
-    error: Option<TileSyntaxError>,
-}
-
-impl TileJobResult {
-    const fn ok() -> Self {
-        Self {
-            tile_index: usize::MAX,
-            error: None,
-        }
-    }
-
-    const fn error(tile_index: usize, error: TileSyntaxError) -> Self {
-        Self {
-            tile_index,
-            error: Some(error),
-        }
-    }
-}
-
+/// A tile decode failure tagged with the row-major index of the tile it is
+/// attributed to; error selection across bands takes the lowest index to
+/// match serial decode's first-failure reporting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TileBandError {
     tile_index: usize,
     error: TileSyntaxError,
 }
+
+type TileBandResult = Result<(), TileBandError>;
 
 pub(crate) fn run_tile_job(job: TileJob) {
     let result = decode_tile_job(job);
@@ -690,7 +614,7 @@ pub(crate) fn run_tile_job(job: TileJob) {
     // live and slot-disjoint until after join's Acquire observes this worker's
     // Release acknowledgement.
     unsafe {
-        *(job.result as *mut TileJobResult) = result;
+        *(job.result as *mut TileBandResult) = result;
     }
 }
 
@@ -744,6 +668,13 @@ fn parse_tile_frame_serial(
     Ok(())
 }
 
+/// Per-worker syntax-count accumulators. Coordinator-owned, like SESSION:
+/// the coordinator clears them before dispatch and merges after join, and
+/// workers only ever write through the pointer handed to them in their job
+/// slot. Not in the workspace arena because nothing about it is per-frame or
+/// per-geometry — it is fixed decoder state.
+static mut WORKER_SYNTAX_COUNTS: [SyntaxCounts; WORKER_COUNT] = [SyntaxCounts::ZERO; WORKER_COUNT];
+
 fn parse_tile_frame_parallel(
     frame: &[u8],
     probabilities: &FrameContext,
@@ -753,80 +684,75 @@ fn parse_tile_frame_parallel(
     tile_cols: usize,
     tile_rows: usize,
 ) -> Result<(), TileSyntaxError> {
-    if buffers.worker_counts.len() < WORKER_COUNT {
-        return Err(TileSyntaxError::ResourceLimit);
-    }
-
     let tiles = layout.as_slice();
-    let frame_raw = ByteSliceRaw {
-        data: frame.as_ptr() as usize,
-        len: frame.len(),
+    let wave = TileWave {
+        frame,
+        tiles,
+        probabilities,
+        config,
+        tile_cols,
+        tile_rows,
+        prev_frame_modes: buffers.mode_buffers.prev_frame_modes,
+        current_frame: buffers.current_frame.raw_parts(),
+        current_frame_modes: buffers
+            .mode_buffers
+            .current_frame_modes
+            .as_mut()
+            .map(ModeInfoViewMut::raw_parts),
+        reference_frames: buffers.reference_frames,
     };
-    let tiles_raw = TileSliceRaw {
-        data: tiles.as_ptr() as usize,
-        len: tiles.len(),
-    };
-    let current_frame_raw = buffers.current_frame.raw_parts();
-    let mode_buffers_raw = FrameModeBuffersRaw::from_buffers(&mut buffers.mode_buffers);
-    let reference_frames_raw = ReferenceFramesRaw::from_option(buffers.reference_frames);
-    let worker_jobs = core::cmp::min(WORKER_COUNT, tile_cols - 1);
-    let mut worker_results = [TileJobResult::ok(); WORKER_COUNT];
-    let mut jobs = [None; WORKER_COUNT];
+    // SAFETY: The coordinator is the only caller and no wave is in flight —
+    // the previous wave was joined before parse_tile_frame_parallel returned,
+    // and workers touch the array only through per-wave slot pointers.
+    let worker_counts = unsafe { &mut *core::ptr::addr_of_mut!(WORKER_SYNTAX_COUNTS) };
 
+    let worker_jobs = core::cmp::min(WORKER_COUNT, tile_cols - 1);
+    let mut worker_results: [TileBandResult; WORKER_COUNT] = [Ok(()); WORKER_COUNT];
+    let mut jobs = [None; WORKER_COUNT];
     for worker_index in 0..worker_jobs {
-        if config.accumulate_counts {
-            buffers.worker_counts[worker_index].clear();
-        }
         let counts = if config.accumulate_counts {
-            &mut buffers.worker_counts[worker_index] as *mut SyntaxCounts as usize
+            worker_counts[worker_index].clear();
+            &mut worker_counts[worker_index] as *mut SyntaxCounts as usize
         } else {
             0
         };
-        jobs[worker_index] = Some(pool::Job::Tile(make_tile_job(TileJobParts {
-            frame: frame_raw,
-            tiles: tiles_raw,
-            probabilities: probabilities as *const FrameContext as usize,
-            config,
-            mode_buffers: mode_buffers_raw,
-            current_frame: current_frame_raw,
-            reference_frames: reference_frames_raw,
-            counts,
-            result: &mut worker_results[worker_index] as *mut TileJobResult as usize,
+        let (mi_col_start, mi_col_end) =
+            column_mi_range(tiles, tile_cols, tile_rows, worker_index)?;
+        jobs[worker_index] = Some(pool::Job::Tile(TileJob {
+            wave: &wave as *const TileWave as usize,
             tile_col: worker_index,
-            tile_cols,
-            tile_rows,
-            tile_range: column_mi_range(tiles, tile_cols, tile_rows, worker_index)?,
-        })));
+            mi_col_start,
+            mi_col_end,
+            counts,
+            result: &mut worker_results[worker_index] as *mut TileBandResult as usize,
+        }));
     }
 
     pool::dispatch(&jobs);
 
     // No early return between dispatch and join: workers hold pointers into
-    // this frame's stack (their result cells), so every path must join before
-    // unwinding. Errors funnel through the result aggregation instead.
-    let mut best = TileJobResult::ok();
+    // this frame's stack (the wave and their result cells), so every path
+    // must join before unwinding. Errors funnel through the result
+    // aggregation instead.
+    let mut best: TileBandResult = Ok(());
     for tile_col in worker_jobs..tile_cols {
         let result = match column_mi_range(tiles, tile_cols, tile_rows, tile_col) {
-            Ok(tile_range) => decode_tile_job(make_tile_job(TileJobParts {
-                frame: frame_raw,
-                tiles: tiles_raw,
-                probabilities: probabilities as *const FrameContext as usize,
-                config,
-                mode_buffers: mode_buffers_raw,
-                current_frame: current_frame_raw,
-                reference_frames: reference_frames_raw,
+            Ok((mi_col_start, mi_col_end)) => decode_tile_job(TileJob {
+                wave: &wave as *const TileWave as usize,
+                tile_col,
+                mi_col_start,
+                mi_col_end,
                 counts: if config.accumulate_counts {
                     buffers.counts as *mut SyntaxCounts as usize
                 } else {
                     0
                 },
                 result: 0,
-                tile_col,
-                tile_cols,
-                tile_rows,
-                tile_range,
-            })),
-            Err(error) => TileJobResult::error(tile_col, error),
+            }),
+            Err(error) => Err(TileBandError {
+                tile_index: tile_col,
+                error,
+            }),
         };
         choose_earliest_error(&mut best, result);
     }
@@ -838,160 +764,92 @@ fn parse_tile_frame_parallel(
     for &result in worker_results.iter().take(worker_jobs) {
         choose_earliest_error(&mut best, result);
     }
-    if let Some(error) = best.error {
-        return Err(error);
+    if let Err(failure) = best {
+        return Err(failure.error);
     }
 
     if config.accumulate_counts {
-        for counts in buffers.worker_counts.iter().take(worker_jobs) {
+        for counts in worker_counts.iter().take(worker_jobs) {
             buffers.counts.merge_from(counts);
         }
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct TileJobParts {
-    frame: ByteSliceRaw,
-    tiles: TileSliceRaw,
-    probabilities: usize,
-    config: TileParserConfig,
-    mode_buffers: FrameModeBuffersRaw,
-    current_frame: CurrentFrameRaw,
-    reference_frames: ReferenceFramesRaw,
-    counts: usize,
-    result: usize,
-    tile_col: usize,
-    tile_cols: usize,
-    tile_rows: usize,
-    tile_range: (usize, usize),
-}
-
-fn make_tile_job(parts: TileJobParts) -> TileJob {
-    TileJob {
-        frame: parts.frame,
-        tiles: parts.tiles,
-        probabilities: parts.probabilities,
-        config: parts.config,
-        mode_buffers: parts.mode_buffers,
-        current_frame: CurrentFrameBandRaw {
-            frame: parts.current_frame,
-            mi_col_start: parts.tile_range.0,
-            mi_col_end: parts.tile_range.1,
-        },
-        reference_frames: parts.reference_frames,
-        counts: parts.counts,
-        result: parts.result,
-        tile_col: parts.tile_col,
-        tile_cols: parts.tile_cols,
-        tile_rows: parts.tile_rows,
+fn choose_earliest_error(best: &mut TileBandResult, candidate: TileBandResult) {
+    if let Err(new) = candidate {
+        let earlier = match *best {
+            Ok(()) => true,
+            Err(old) => new.tile_index < old.tile_index,
+        };
+        if earlier {
+            *best = Err(new);
+        }
     }
 }
 
-fn choose_earliest_error(best: &mut TileJobResult, candidate: TileJobResult) {
-    if candidate.error.is_some() && candidate.tile_index < best.tile_index {
-        *best = candidate;
-    }
-}
-
-fn decode_tile_job(job: TileJob) -> TileJobResult {
-    match decode_tile_job_inner(job) {
-        Ok(()) => TileJobResult::ok(),
-        Err(error) => TileJobResult::error(error.tile_index, error.error),
-    }
-}
-
-fn decode_tile_job_inner(job: TileJob) -> Result<(), TileBandError> {
-    let first_tile_index = job
-        .tile_col
-        .min(job.tile_cols.saturating_mul(job.tile_rows).saturating_sub(1));
-    // SAFETY: Job raw pointers were captured from live coordinator slices
-    // before dispatch and the coordinator does not free or rewrite them until
-    // after join.
-    let frame = unsafe { core::slice::from_raw_parts(job.frame.data as *const u8, job.frame.len) };
-    // SAFETY: Same as frame; descriptors are immutable for the wave.
-    let tiles =
-        unsafe { core::slice::from_raw_parts(job.tiles.data as *const TileDescriptor, job.tiles.len) };
-    // SAFETY: Frame probabilities are immutable decoder state for the wave.
-    let probabilities = unsafe { &*(job.probabilities as *const FrameContext) };
+fn decode_tile_job(job: TileJob) -> TileBandResult {
+    // SAFETY: The wave lives in parse_tile_frame_parallel's stack frame,
+    // which does not return between dispatch and join; its references are
+    // valid for at least that long, and this job runs strictly inside it.
+    let wave = unsafe { &*(job.wave as *const TileWave) };
+    // Failures before any tile decodes are attributed to this column's row-0
+    // tile, whose row-major index is the column index itself.
+    let band_error = |error| TileBandError {
+        tile_index: job.tile_col,
+        error,
+    };
     // SAFETY: Band views are column-disjoint, live only for this wave, and all
     // cross-thread visibility is ordered by pool dispatch/join.
-    let mut current_frame = unsafe { CurrentFrameMut::from_band_raw(job.current_frame) }
-        .map_err(|error| TileBandError {
-            tile_index: first_tile_index,
-            error,
-        })?;
-    // SAFETY: The raw mode buffers point at immutable previous modes and the
-    // current mode grid; mutable current-grid accesses are restricted to this
-    // job's MI-column band.
-    let mode_buffers = unsafe {
-        job.mode_buffers.to_buffers(
-            job.config.frame_mis.1,
-            job.current_frame.mi_col_start,
-            job.current_frame.mi_col_end,
-        )
+    let mut current_frame = unsafe {
+        CurrentFrameMut::from_band_raw(wave.current_frame, job.mi_col_start, job.mi_col_end)
     }
-    .map_err(|error| TileBandError {
-        tile_index: first_tile_index,
-        error,
-    })?;
-    // SAFETY: Reference frames are read-only frame-pool slices that remain
-    // live for the decode wave.
-    let reference_frames = unsafe { job.reference_frames.to_option() }.map_err(|error| {
-        TileBandError {
-            tile_index: first_tile_index,
-            error,
-        }
-    })?;
+    .map_err(band_error)?;
+    let current_frame_modes = match wave.current_frame_modes {
+        // SAFETY: Same band contract as the planes, over the current mode
+        // grid: one view per column-disjoint band, every write band-checked.
+        Some(raw) => Some(
+            unsafe {
+                ModeInfoViewMut::from_raw_band(
+                    raw,
+                    wave.config.frame_mis.1,
+                    job.mi_col_start,
+                    job.mi_col_end,
+                )
+            }
+            .map_err(band_error)?,
+        ),
+        None => None,
+    };
+    let mode_buffers = FrameModeBuffers::new(
+        wave.config.use_prev_frame_mvs,
+        wave.prev_frame_modes,
+        current_frame_modes,
+    );
     parse_tile_band(
-        TileBandDecode {
-            frame,
-            tiles,
-            tile_col: job.tile_col,
-            tile_cols: job.tile_cols,
-            tile_rows: job.tile_rows,
-            config: job.config,
-            mode_buffers,
-        },
-        TileParseBandShared {
-            probabilities,
-            counts: job.counts as *mut SyntaxCounts,
-            current_frame: &mut current_frame,
-            reference_frames,
-        },
+        wave,
+        job.tile_col,
+        mode_buffers,
+        &mut current_frame,
+        job.counts as *mut SyntaxCounts,
     )
 }
 
-struct TileParseBandShared<'a, 'f, 'r> {
-    probabilities: &'a FrameContext,
-    counts: *mut SyntaxCounts,
-    current_frame: &'a mut CurrentFrameMut<'f>,
-    reference_frames: Option<ReferenceFrames<'r>>,
-}
-
-struct TileBandDecode<'a, 'm> {
-    frame: &'a [u8],
-    tiles: &'a [TileDescriptor],
-    tile_col: usize,
-    tile_cols: usize,
-    tile_rows: usize,
-    config: TileParserConfig,
-    mode_buffers: FrameModeBuffers<'m>,
-}
-
 fn parse_tile_band(
-    request: TileBandDecode<'_, '_>,
-    shared: TileParseBandShared<'_, '_, '_>,
-) -> Result<(), TileBandError> {
-    let TileBandDecode {
+    wave: &TileWave<'_>,
+    tile_col: usize,
+    mut mode_buffers: FrameModeBuffers<'_>,
+    current_frame: &mut CurrentFrameMut<'_>,
+    counts: *mut SyntaxCounts,
+) -> TileBandResult {
+    let TileWave {
         frame,
         tiles,
-        tile_col,
         tile_cols,
         tile_rows,
         config,
-        mut mode_buffers,
-    } = request;
+        ..
+    } = *wave;
     let (_, mi_cols) = config.frame_mis;
     let mut contexts = TileModeContexts::new(mi_cols).map_err(|error| TileBandError {
         tile_index: tile_col,
@@ -1022,11 +880,11 @@ fn parse_tile_band(
             config,
             mode_buffers.for_tile(),
             TileParseShared {
-                probabilities: shared.probabilities,
-                counts: shared.counts,
+                probabilities: wave.probabilities,
+                counts,
                 contexts: &mut contexts,
-                current_frame: &mut *shared.current_frame,
-                reference_frames: shared.reference_frames,
+                current_frame: &mut *current_frame,
+                reference_frames: wave.reference_frames,
             },
         )
         .map_err(|error| TileBandError { tile_index, error })?;
@@ -1064,7 +922,9 @@ fn column_mi_range(
     if tile_col >= tile_cols {
         return Err(TileSyntaxError::InvalidBitstream);
     }
-    let first = tiles.get(tile_col).ok_or(TileSyntaxError::InvalidBitstream)?;
+    let first = tiles
+        .get(tile_col)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
     let start =
         usize::try_from(first.mi_col_start).map_err(|_| TileSyntaxError::InvalidBitstream)?;
     let end = usize::try_from(first.mi_col_end).map_err(|_| TileSyntaxError::InvalidBitstream)?;
@@ -1087,148 +947,6 @@ fn column_mi_range(
         }
     }
     Ok((start, end))
-}
-
-impl FrameModeBuffersRaw {
-    fn from_buffers(buffers: &mut FrameModeBuffers<'_>) -> Self {
-        Self {
-            use_prev_frame_mvs: buffers.use_prev_frame_mvs,
-            prev_frame_modes: buffers.prev_frame_modes.map(ModeInfoView::raw_parts),
-            current_frame_modes: buffers
-                .current_frame_modes
-                .as_mut()
-                .map(ModeInfoViewMut::raw_parts),
-        }
-    }
-
-    unsafe fn to_buffers(
-        self,
-        mi_cols: usize,
-        band_mi_col_start: usize,
-        band_mi_col_end: usize,
-    ) -> Result<FrameModeBuffers<'static>, TileSyntaxError> {
-        let prev_frame_modes = match self.prev_frame_modes {
-            Some(raw) => {
-                // SAFETY: The raw immutable view points at previous-mode
-                // history that stays live for the wave.
-                Some(unsafe { ModeInfoView::from_raw_parts(raw) }?)
-            }
-            None => None,
-        };
-        let current_frame_modes = match self.current_frame_modes {
-            Some(raw) => {
-                // SAFETY: Current mode writes are restricted by the constructed
-                // band view and the bands are column-disjoint for the wave.
-                Some(unsafe {
-                    ModeInfoViewMut::from_raw_band(
-                        raw,
-                        mi_cols,
-                        band_mi_col_start,
-                        band_mi_col_end,
-                    )
-                }?)
-            }
-            None => None,
-        };
-        Ok(FrameModeBuffers::new(
-            self.use_prev_frame_mvs,
-            prev_frame_modes,
-            current_frame_modes,
-        ))
-    }
-}
-
-impl ReferenceFramesRaw {
-    const fn none() -> Self {
-        Self {
-            present: false,
-            frames: [None; 4],
-        }
-    }
-
-    fn from_option(frames: Option<ReferenceFrames<'_>>) -> Self {
-        match frames {
-            Some(frames) => Self {
-                present: true,
-                frames: frames.frames.map(|frame| frame.map(ReferenceFrameRaw::from_frame)),
-            },
-            None => Self::none(),
-        }
-    }
-
-    unsafe fn to_option(self) -> Result<Option<ReferenceFrames<'static>>, TileSyntaxError> {
-        if !self.present {
-            return Ok(None);
-        }
-        let mut frames = [None; 4];
-        for (dst, src) in frames.iter_mut().zip(self.frames) {
-            *dst = match src {
-                Some(frame) => {
-                    // SAFETY: Reference frame raw parts are read-only live
-                    // frame-pool slices for the duration of the wave.
-                    Some(unsafe { frame.to_frame() }?)
-                }
-                None => None,
-            };
-        }
-        Ok(Some(ReferenceFrames::new(frames)))
-    }
-}
-
-impl ReferenceFrameRaw {
-    fn from_frame(frame: ReferenceFrame<'_>) -> Self {
-        Self {
-            y: ReferencePlaneRaw::from_plane(frame.y),
-            u: ReferencePlaneRaw::from_plane(frame.u),
-            v: ReferencePlaneRaw::from_plane(frame.v),
-        }
-    }
-
-    unsafe fn to_frame(self) -> Result<ReferenceFrame<'static>, TileSyntaxError> {
-        Ok(ReferenceFrame::new(
-            // SAFETY: The raw plane points at immutable frame-pool storage
-            // that outlives the decode wave.
-            unsafe { self.y.to_plane() }?,
-            // SAFETY: Same as Y.
-            unsafe { self.u.to_plane() }?,
-            // SAFETY: Same as Y.
-            unsafe { self.v.to_plane() }?,
-        ))
-    }
-}
-
-impl ReferencePlaneRaw {
-    fn from_plane(plane: ReferencePlane<'_>) -> Self {
-        Self {
-            data: plane.data.as_ptr() as usize,
-            len: plane.data.len(),
-            width: plane.width,
-            height: plane.height,
-            stride: plane.stride,
-        }
-    }
-
-    unsafe fn to_plane(self) -> Result<ReferencePlane<'static>, TileSyntaxError> {
-        if self.width == 0 || self.height == 0 || self.stride < self.width {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-        let len = self
-            .stride
-            .checked_mul(self.height)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
-        if self.len < len {
-            return Err(TileSyntaxError::InvalidBitstream);
-        }
-        // SAFETY: The raw plane points at immutable frame-pool storage that
-        // remains live while workers decode this wave.
-        let data = unsafe { core::slice::from_raw_parts(self.data as *const u8, self.len) };
-        Ok(ReferencePlane {
-            data,
-            width: self.width,
-            height: self.height,
-            stride: self.stride,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2452,10 +2170,7 @@ impl TileParser<'_, '_, '_> {
                 if filter_index >= SWITCHABLE_FILTERS {
                     return Err(TileSyntaxError::InvalidBitstream);
                 }
-                increment_syntax_count!(
-                    self,
-                    counts_interp_filter[usize::from(ctx)][filter_index]
-                );
+                increment_syntax_count!(self, counts_interp_filter[usize::from(ctx)][filter_index]);
                 Ok(filter)
             }
             filter => fixed_interp_filter(filter),
@@ -3361,8 +3076,7 @@ impl TileParser<'_, '_, '_> {
                         decoder,
                         probability_row,
                         syntax_counts_from_raw(accumulate_counts, counts)?.map(|counts| {
-                            &mut counts.counts_more_coefs[tx_index][plane_type][ref_type][band]
-                                [ctx]
+                            &mut counts.counts_more_coefs[tx_index][plane_type][ref_type][band][ctx]
                         }),
                     )?
                 {
@@ -4809,8 +4523,6 @@ mod tests {
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
         let mut counts = SyntaxCounts::default();
-        let mut worker_counts: [SyntaxCounts; WORKER_COUNT] =
-            core::array::from_fn(|_| SyntaxCounts::default());
         let mut current_frame_storage = TestCurrentFrame::new(16, 16);
         let mut current_frame = current_frame_storage.as_current_frame();
 
@@ -4823,9 +4535,9 @@ mod tests {
                 &layout,
                 TileParseBuffers::new(
                     &mut counts,
-                    &mut worker_counts,
                     FrameModeBuffers::current(None),
                     &mut current_frame,
+                    None,
                 ),
             ),
             Ok(())
@@ -4840,14 +4552,7 @@ mod tests {
 
         // SAFETY: The test constructs a single band view and does not use the
         // original full view while the band view is live.
-        let mut band = unsafe {
-            CurrentFrameMut::from_band_raw(CurrentFrameBandRaw {
-                frame: raw,
-                mi_col_start: 0,
-                mi_col_end: 1,
-            })
-        }
-        .unwrap();
+        let mut band = unsafe { CurrentFrameMut::from_band_raw(raw, 0, 1) }.unwrap();
 
         assert_eq!(band.y.sample_clamped(0, 0), Ok(128));
         assert_eq!(band.y.set_visible(7, 0, 17), Ok(()));
@@ -4888,14 +4593,7 @@ mod tests {
 
         // SAFETY: The test constructs only the last band view from the raw
         // full-frame parts and does not use the original view concurrently.
-        let band = unsafe {
-            CurrentFrameMut::from_band_raw(CurrentFrameBandRaw {
-                frame: raw,
-                mi_col_start: 2,
-                mi_col_end: 3,
-            })
-        }
-        .unwrap();
+        let band = unsafe { CurrentFrameMut::from_band_raw(raw, 2, 3) }.unwrap();
 
         assert_eq!(band.y.sample_clamped(100, 0), Ok(128));
         assert_eq!(band.u.sample_clamped(100, 0), Ok(128));

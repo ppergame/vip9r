@@ -488,17 +488,26 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     every error (including job-construction failures in the mop-up loop)
     funnels through per-slot results, aggregated after join by lowest tile
     index to match serial error reporting.
-  - Cross-thread state: per-worker `SyntaxCounts` live in a workspace-arena
-    region (3 × size, 16-aligned), pointers ride the job slots, merged
-    after join in worker order via saturating adds; all counts work is
-    skipped when adaptation is off (`error_resilient ||
-    frame_parallel_decoding_mode` — the whole realworld perf corpus).
-    Current-frame planes and the mode grid cross the slot boundary as raw
-    parts rebuilt into band-restricted views: bands are column-disjoint but
-    row-interleaved in memory (safe `split_at_mut` can't express it), the
-    unsafe is confined to split/rebuild, and every accessor checks the band
-    so a cross-band access is an `InvalidBitstream` decode error instead of
-    a data race. Visibility rides the pool's Release/Acquire edges.
+  - Cross-thread state: everything a job reads that is identical across the
+    wave lives in one stack-resident `TileWave` on the coordinator's frame;
+    a job slot carries just the wave pointer, the band's mi-column range,
+    and two destination pointers (counts, result cell). Read-only state
+    (coded frame, tile descriptors, probabilities, prev modes, reference
+    frames) crosses inside the wave as plain references — their "until
+    join" lifetime is enforced by the pool protocol, not the type system.
+    Only the two shared-mutable surfaces stay as raw parts: current-frame
+    planes and the mode grid are rebuilt per job into band-restricted
+    views. Bands are column-disjoint but row-interleaved in memory (safe
+    `split_at_mut` can't express it), the unsafe is confined to
+    split/rebuild, and every accessor checks the band so a cross-band
+    access is an `InvalidBitstream` decode error instead of a data race.
+    Per-worker `SyntaxCounts` live in the `WORKER_SYNTAX_COUNTS` static —
+    coordinator-owned like SESSION (workers write only through their slot
+    pointer), cleared before dispatch, merged after join in worker order
+    via saturating adds; all counts work is skipped when adaptation is off
+    (`error_resilient || frame_parallel_decoding_mode` — the whole
+    realworld perf corpus). Visibility rides the pool's Release/Acquire
+    edges.
 - Spawn frontends (landed 2026-07-03): the stack-layout ABI constants live
   in `js/src/wasm-driver/stack-layout.ts`, shared by both spawners. d8:
   `wasm-driver/pool.ts` (string-source worker, constants interpolated); the

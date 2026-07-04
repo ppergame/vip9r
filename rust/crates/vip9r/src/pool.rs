@@ -12,8 +12,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) const WORKER_COUNT: usize = 3;
 
-/// One dispatched unit of work. Tile jobs carry only plain raw parts: all
-/// pointers target frame/workspace/coded-frame storage whose ownership is
+/// One dispatched unit of work. Tile jobs carry plain Copy data: a pointer
+/// to the wave's coordinator-stack shared context plus this band's column
+/// range and destination pointers. Ownership of everything they target is
 /// handed to the worker by the epoch Release and returned by the remaining
 /// Release decrement.  The wasm-test fill variant is kept only for protocol
 /// smoke tests under the `::pool::` export name.
@@ -62,7 +63,11 @@ unsafe impl Sync for ControlBlock {}
 static POOL: ControlBlock = ControlBlock {
     epoch: AtomicU32::new(0),
     remaining: AtomicU32::new(0),
-    slots: [const { Slot { job: UnsafeCell::new(None) } }; WORKER_COUNT],
+    slots: [const {
+        Slot {
+            job: UnsafeCell::new(None),
+        }
+    }; WORKER_COUNT],
 };
 
 /// Whether the frontend has spawned the worker pool over this memory. The
@@ -98,8 +103,7 @@ pub(crate) fn dispatch(jobs: &[Option<Job>; WORKER_COUNT]) {
     for (slot, job) in POOL.slots.iter().zip(jobs) {
         unsafe { *slot.job.get() = *job };
     }
-    POOL.remaining
-        .store(WORKER_COUNT as u32, Ordering::Relaxed);
+    POOL.remaining.store(WORKER_COUNT as u32, Ordering::Relaxed);
     POOL.epoch.fetch_add(1, Ordering::Release);
     unsafe {
         core::arch::wasm32::memory_atomic_notify(POOL.epoch.as_ptr().cast(), u32::MAX);

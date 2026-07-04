@@ -91,8 +91,36 @@ pub(crate) struct SyntaxCounts {
 }
 
 impl SyntaxCounts {
+    /// All-zero counts, usable as a static initializer.
+    pub(crate) const ZERO: Self = Self {
+        counts_intra_mode: [[0; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+        counts_uv_mode: [[0; INTRA_MODES]; INTRA_MODES],
+        counts_partition: [[0; PARTITION_TYPES]; PARTITION_CONTEXTS],
+        counts_interp_filter: [[0; SWITCHABLE_FILTERS]; INTERP_FILTER_CONTEXTS],
+        counts_inter_mode: [[0; INTER_MODES]; INTER_MODE_CONTEXTS],
+        counts_tx_size: [[[0; TX_SIZES]; TX_SIZE_CONTEXTS]; TX_SIZES],
+        counts_is_inter: [[0; 2]; IS_INTER_CONTEXTS],
+        counts_comp_mode: [[0; 2]; COMP_MODE_CONTEXTS],
+        counts_single_ref: [[[0; 2]; 2]; REF_CONTEXTS],
+        counts_comp_ref: [[0; 2]; REF_CONTEXTS],
+        counts_skip: [[0; 2]; SKIP_CONTEXTS],
+        counts_mv_joint: [0; MV_JOINTS],
+        counts_mv_sign: [[0; 2]; 2],
+        counts_mv_class: [[0; MV_CLASSES]; 2],
+        counts_mv_class0_bit: [[0; CLASS0_SIZE]; 2],
+        counts_mv_class0_fr: [[[0; MV_FR_SIZE]; CLASS0_SIZE]; 2],
+        counts_mv_class0_hp: [[0; 2]; 2],
+        counts_mv_bits: [[[0; 2]; MV_OFFSET_BITS]; 2],
+        counts_mv_fr: [[0; MV_FR_SIZE]; 2],
+        counts_mv_hp: [[0; 2]; 2],
+        counts_token: [[[[[[0; UNCONSTRAINED_NODES]; PREV_COEF_CONTEXTS]; COEF_BANDS]; REF_TYPES];
+            BLOCK_TYPES]; TX_SIZES],
+        counts_more_coefs: [[[[[[0; 2]; PREV_COEF_CONTEXTS]; COEF_BANDS]; REF_TYPES]; BLOCK_TYPES];
+            TX_SIZES],
+    };
+
     pub(crate) fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self::ZERO;
     }
 
     pub(crate) fn merge_from(&mut self, other: &Self) {
