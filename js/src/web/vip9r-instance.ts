@@ -13,7 +13,11 @@ export { wasmUrl };
 export async function instantiateVip9r(
   dims: { width: number; height: number },
   onLog: (message: string) => void,
-): Promise<{ instance: WebAssembly.Instance; memory: WebAssembly.Memory }> {
+): Promise<{
+  instance: WebAssembly.Instance;
+  module: WebAssembly.Module;
+  memory: WebAssembly.Memory;
+}> {
   const sink = (entry: WasmLog) => onLog(formatWasmLog(entry));
   const module = await WebAssembly.compileStreaming(fetch(wasmUrl));
   // Async instantiation both times: Chrome rejects sync instantiation of
@@ -24,5 +28,5 @@ export async function instantiateVip9r(
   );
   const memory = createVip9rMemory(sessionMaxPages(scratch.exports, dims));
   const instance = await WebAssembly.instantiate(module, makeVip9rImports(memory, sink));
-  return { instance, memory };
+  return { instance, module, memory };
 }

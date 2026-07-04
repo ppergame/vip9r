@@ -55,11 +55,31 @@ static POOL: ControlBlock = ControlBlock {
     slots: [const { Slot { job: UnsafeCell::new(None) } }; WORKER_COUNT],
 };
 
+/// Whether the frontend has spawned the worker pool over this memory. The
+/// pool is all-or-nothing: join counts acknowledgements from every worker,
+/// so dispatching with fewer than WORKER_COUNT live workers hangs. Frontends
+/// that spawn no workers (wasm unit tests outside this module, harnesses
+/// without a pool flag) leave this off and decode stays serial.
+static ACTIVE: AtomicU32 = AtomicU32::new(0);
+
+/// Called by the frontend (via `vip9r_pool_activate`) after all
+/// WORKER_COUNT workers are spawned. Workers that are still starting up are
+/// fine: a worker that first loads `epoch` after a dispatch sees the bumped
+/// value and reads its slot.
+pub(crate) fn activate() {
+    ACTIVE.store(1, Ordering::Relaxed);
+}
+
+pub(crate) fn is_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed) != 0
+}
+
 const WAIT_TIMED_OUT: i32 = 2;
 
 /// Publish a wave: one optional job per worker. Requires the previous wave
 /// to be joined. Every slot is rewritten, so a stale job can never re-run.
 pub(crate) fn dispatch(jobs: &[Option<Job>; WORKER_COUNT]) {
+    assert!(is_active(), "dispatch without an activated worker pool");
     assert_eq!(
         POOL.remaining.load(Ordering::Relaxed),
         0,

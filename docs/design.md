@@ -437,12 +437,39 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
   - Teardown is JS `Worker.terminate()`: safe while the worker is parked in
     `memory.atomic.wait32` and at process exit (d8-probed 2026-07-03); no
     wasm-side shutdown path exists.
+  - Activation (2026-07-03): the pool is all-or-nothing, 0 or 3 workers —
+    join counts acknowledgements from every worker, so a partial pool hangs,
+    and the fixed stack layout plus the fewer-cores degrade decision
+    (oversubscribe, correctness over performance) leave no client for which
+    1-2 workers is the right answer. A frontend that spawned all three
+    workers calls `vip9r_pool_activate` once; the flag is a pool.rs static,
+    default off, and `dispatch` asserts it. Frontends that spawn no workers
+    (wasm unit tests outside `::pool::`, harnesses without a pool flag) stay
+    on the serial path. Activation does not wait for worker startup: a
+    worker whose first `epoch` load happens after a dispatch sees the bumped
+    value and reads its slot.
+  - Frontend policy: web always spawns (nested workers from the decode
+    worker; Cobalt is Chromium-based and trusted for nested workers). d8 /
+    perf harness use an explicit pool flag in request config — never
+    inferred from the CPU pin set, matching the no-quiet-fallbacks rule and
+    keeping serial-on-4-cores and oversubscribed-on-3-cores (Pixel A720
+    cluster) runs expressible.
   - Dispatch: no job queue. Coordinator dispatches an initial wave of one
     tile per worker, decodes one tile itself, serially mops up any
     remainder, then joins. Modal cases degrade cleanly: 4 tiles = wave of 3
     + own tile + empty remainder; 2 tiles = wave of 1 with two None slots;
     single-tile clips skip dispatch/join entirely. >4-tile clips serialize
     the excess on the coordinator — accepted until content demands a queue.
+- Spawn frontends (landed 2026-07-03): the stack-layout ABI constants live
+  in `js/src/wasm-driver/stack-layout.ts`, shared by both spawners. d8:
+  `wasm-driver/pool.ts` (string-source worker, constants interpolated); the
+  wasm-tests runner spawns + activates for `::pool::` tests. Web:
+  `web/pool.ts` + `web/pool-worker.ts` (module worker, sync instantiation so
+  layout-assert throws reach the spawner's `onerror`), spawned from the
+  demo's decode worker on every playback, then `vip9r_pool_activate` — the
+  nested-worker + rebind path is exercised even while decode is serial.
+  Verified on Chrome 2026-07-03: three parked pool-worker targets during
+  playback, clean console.
 - `VideoFrame` construction from SAB-backed views verified on Chrome and
   Cobalt (user-tested, 2026-07-03).
 

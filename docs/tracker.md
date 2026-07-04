@@ -569,17 +569,27 @@ availability/MV search, no cross-tile pixel reads).
       pinned: `Worker.terminate()`, safe mid-`wait32` and at process exit
       (d8-probed); no wasm-side shutdown path. Per-worker scratch pointers
       flow through job slots once tile-parallel decode defines them
-- [ ] web pool frontend: spawn the 3 workers from the demo's decode worker
-      (nested workers) over the shared memory, same rebind/asserts as the d8
-      helper; lands with tile-parallel demo integration
-- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`);
-      characterize streamer thermals/frequency under sustained 4-core load.
+- [x] web pool frontend (2026-07-03): `web/pool.ts` + `pool-worker.ts` spawn
+      the 3 workers from the demo's decode worker (nested workers) over the
+      shared memory, same rebind/asserts as the d8 helper (ABI constants
+      shared via `wasm-driver/stack-layout.ts`); spawns + activates on every
+      playback so the path stays exercised while decode is serial. Pool
+      activation settled with it: all-or-nothing 0/3, `vip9r_pool_activate`
+      export, dispatch asserts, default-off serial. Verified on Chrome —
+      three parked pool-worker targets during playback
+- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`) and an
+      explicit pool flag on the wasm runner / request config (never inferred
+      from the pin set — serial-on-4-cores and oversubscribed-on-3-cores
+      runs, e.g. the Pixel A720 cluster, stay expressible); characterize
+      streamer thermals/frequency under sustained 4-core load.
       (Shared-vs-plain artifact detection dropped: the ABI break is accepted,
       old-ABI baselines are dead, cross-ABI A/B replaced by the logged-numbers
       eyeball at the spike boundary)
-- [ ] decide the degrade story for the hardcoded-4-threads layout: clips with
-      more tile columns than threads and clients with fewer cores (minimum
-      correctness, not performance)
+- [x] degrade story for the hardcoded-4-threads layout (2026-07-03): pool is
+      all-or-nothing 0/3 — fewer-core clients run all 3 workers
+      oversubscribed (correct, slow) or activate nothing and decode serially;
+      >4-tile clips already serialize the excess on the coordinator. No
+      intermediate worker counts
 - [ ] tile-parallel tile decode: per-thread `SyntaxCounts` (merge after join;
       skip accumulation entirely when adaptation is off — the `frame_parallel=1`
       corpus makes it dead work even single-threaded), per-thread

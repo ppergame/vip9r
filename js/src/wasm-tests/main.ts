@@ -213,6 +213,11 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
     }
     if (testName.includes(POOL_TEST_MARKER)) {
       pool = spawnWorkerPool(module, memory);
+      const activate = instance.exports.vip9r_pool_activate;
+      if (typeof activate !== "function") {
+        return fail("missing wasm export: vip9r_pool_activate", logs);
+      }
+      activate();
     }
 
     const value = test();

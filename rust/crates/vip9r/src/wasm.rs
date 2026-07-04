@@ -423,6 +423,15 @@ pub extern "C" fn vip9r_worker_main(worker_index: u32) -> ! {
     crate::pool::worker_main(worker_index)
 }
 
+// The frontend calls this once after spawning all three pool workers over
+// this memory; without it decode stays serial and dispatch asserts. The pool
+// is all-or-nothing (join counts acknowledgements from every worker), so
+// there is no worker-count parameter.
+#[unsafe(no_mangle)]
+pub extern "C" fn vip9r_pool_activate() {
+    crate::pool::activate();
+}
+
 // Exact static requirement in wasm pages (shadow stacks + data + workspace
 // arena) for a session with the given max dimensions; the growable packet
 // tail sits above it, so a memory maximum must add packet capacity on top.
