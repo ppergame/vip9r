@@ -582,13 +582,6 @@ availability/MV search, no cross-tile pixel reads).
       (139.7→63.5 ms/f), BBB −59.7% (104.5→42.0), f247 flag=0 −53.4%
       (132.3→61.7); serial path noise; corpus 339/339 pooled, compliance
       307/307 both modes
-- [ ] Pixel pooled measurement + activation policy: pooled decode on the
-      Pixel measures 3.3x slower than serial X4 — schedutil/EAS leaves the
-      A720 policy at idle freq (578→357 MHz) for futex-parked workers; the
-      daemon pins affinity but never locks frequencies. Harness follow-up:
-      frequency locking for pinned runs. Product follow-up: demo activates
-      the pool unconditionally, which can be an outright pessimization on
-      fast-serial big.LITTLE devices — activation policy is open
 - [ ] loop filter SB-row wavefront: `loop_filter_frame` is the serial remainder
       after tile parallelism (~10-19% A55); parallelize as its own measured pass
 - [x] demo: `VideoFrame` construction from SAB-backed views verified on Chrome
@@ -629,4 +622,4 @@ not an expected harvest.
 
 ## M7 — Stretch
 
-relaxed-simd · little-core (Cortex-A520)
+relaxed-simd

@@ -27,6 +27,11 @@ const CANNED: CannedClip[] = [
     label: "jellyfish - 720p30",
   },
   {
+    name: "youtube-coral",
+    path: "youtube/mN9_buCmKLE/mN9_buCmKLE-f247-720p30-vp9-rawprefix-0000-2000.webm",
+    label: "youtube coral f247 - 720p30",
+  },
+  {
     name: "bbb",
     path: "realworld/wikimedia/big-buck-bunny-720p25-1_54mbps.webm",
     label: "big buck bunny - 720p25",
