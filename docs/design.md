@@ -472,12 +472,33 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     inferred from the CPU pin set, matching the no-quiet-fallbacks rule and
     keeping serial-on-4-cores and oversubscribed-on-3-cores (Pixel A720
     cluster) runs expressible.
-  - Dispatch: no job queue. Coordinator dispatches an initial wave of one
-    tile per worker, decodes one tile itself, serially mops up any
-    remainder, then joins. Modal cases degrade cleanly: 4 tiles = wave of 3
-    + own tile + empty remainder; 2 tiles = wave of 1 with two None slots;
-    single-tile clips skip dispatch/join entirely. >4-tile clips serialize
-    the excess on the coordinator — accepted until content demands a queue.
+  - Dispatch (landed 2026-07-04): no job queue. The parallel unit is the
+    tile *column band* — spec `clear_above_context()` runs once per frame,
+    so above context carries across tile rows within a column; one thread
+    owns every tile row of a column, decoded in row order with its own
+    fresh `TileModeContexts` (equivalent to the frame-level clear because
+    bands never touch each other's columns). Coordinator dispatches a wave
+    of one column per worker, decodes all remaining columns itself between
+    dispatch and join, then joins. Modal cases degrade cleanly: 4 columns =
+    wave of 3 + own column; 2 columns = wave of 1 with two None slots;
+    single-column clips (and pool-off) take the untouched serial loop.
+    >4-column clips serialize the excess on the coordinator — accepted
+    until content demands a queue. No early return between dispatch and
+    join: workers write result cells in the coordinator's stack frame, so
+    every error (including job-construction failures in the mop-up loop)
+    funnels through per-slot results, aggregated after join by lowest tile
+    index to match serial error reporting.
+  - Cross-thread state: per-worker `SyntaxCounts` live in a workspace-arena
+    region (3 × size, 16-aligned), pointers ride the job slots, merged
+    after join in worker order via saturating adds; all counts work is
+    skipped when adaptation is off (`error_resilient ||
+    frame_parallel_decoding_mode` — the whole realworld perf corpus).
+    Current-frame planes and the mode grid cross the slot boundary as raw
+    parts rebuilt into band-restricted views: bands are column-disjoint but
+    row-interleaved in memory (safe `split_at_mut` can't express it), the
+    unsafe is confined to split/rebuild, and every accessor checks the band
+    so a cross-band access is an `InvalidBitstream` decode error instead of
+    a data race. Visibility rides the pool's Release/Acquire edges.
 - Spawn frontends (landed 2026-07-03): the stack-layout ABI constants live
   in `js/src/wasm-driver/stack-layout.ts`, shared by both spawners. d8:
   `wasm-driver/pool.ts` (string-source worker, constants interpolated); the

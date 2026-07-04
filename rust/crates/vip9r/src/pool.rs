@@ -12,11 +12,21 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) const WORKER_COUNT: usize = 3;
 
-/// One dispatched unit of work. Placeholder fill-job shape until
-/// tile-parallel decode lands: fill `len` bytes at `addr` with a
-/// position-dependent pattern from `seed`.
+/// One dispatched unit of work. Tile jobs carry only plain raw parts: all
+/// pointers target frame/workspace/coded-frame storage whose ownership is
+/// handed to the worker by the epoch Release and returned by the remaining
+/// Release decrement.  The wasm-test fill variant is kept only for protocol
+/// smoke tests under the `::pool::` export name.
 #[derive(Clone, Copy)]
-pub(crate) struct Job {
+pub(crate) enum Job {
+    Tile(crate::tile_syntax::TileJob),
+    #[cfg(feature = "wasm-tests")]
+    Fill(FillJob),
+}
+
+#[cfg(feature = "wasm-tests")]
+#[derive(Clone, Copy)]
+pub(crate) struct FillJob {
     pub addr: usize,
     pub len: usize,
     pub seed: u8,
@@ -152,8 +162,19 @@ pub(crate) fn worker_main(worker_index: u32) -> ! {
     }
 }
 
-// Placeholder job body until tile-parallel decode lands.
 fn run_job(job: Job) {
+    match job {
+        Job::Tile(job) => crate::tile_syntax::run_tile_job(job),
+        #[cfg(feature = "wasm-tests")]
+        Job::Fill(job) => run_fill_job(job),
+    }
+}
+
+#[cfg(feature = "wasm-tests")]
+fn run_fill_job(job: FillJob) {
+    // SAFETY: Pool smoke tests pass stack buffers that remain live until
+    // after join.  Slot handoff and completion use the same Release/Acquire
+    // edges as real tile jobs.
     let bytes = unsafe { core::slice::from_raw_parts_mut(job.addr as *mut u8, job.len) };
     for (offset, byte) in bytes.iter_mut().enumerate() {
         *byte = job.seed.wrapping_add(offset as u8);
@@ -165,7 +186,7 @@ fn run_job(job: Job) {
 // never join, which the bounded join turns into a failure instead of a hang.
 #[vip9r_wasm_test_macros::wasm_tests]
 mod tests {
-    use super::{Job, WORKER_COUNT, dispatch, join};
+    use super::{FillJob, Job, WORKER_COUNT, dispatch, join};
 
     const JOIN_TIMEOUT_NS: i64 = 5_000_000_000;
     const JOB_LEN: usize = 64;
@@ -175,11 +196,11 @@ mod tests {
     // the coordinator can point them.
     fn job(buffer: &mut [u8; JOB_LEN], seed: u8) -> Job {
         buffer.fill(0);
-        Job {
+        Job::Fill(FillJob {
             addr: buffer.as_mut_ptr() as usize,
             len: JOB_LEN,
             seed,
-        }
+        })
     }
 
     fn assert_filled(buffer: &[u8; JOB_LEN], seed: u8) {

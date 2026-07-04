@@ -112,6 +112,9 @@ pub(crate) fn mode_info_byte_len(mi_count: usize) -> Option<usize> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ModeInfoView<'a> {
     pub(super) data: &'a [u8],
+    mi_cols: usize,
+    band_mi_col_start: usize,
+    band_mi_col_end: usize,
 }
 
 impl<'a> ModeInfoView<'a> {
@@ -119,10 +122,16 @@ impl<'a> ModeInfoView<'a> {
         if !data.len().is_multiple_of(STORED_MODE_INFO_BYTES) {
             return Err(DecodeError::InvalidConfig);
         }
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            mi_cols: 0,
+            band_mi_col_start: 0,
+            band_mi_col_end: 0,
+        })
     }
 
     fn entry(self, index: usize) -> Result<&'a [u8], TileSyntaxError> {
+        self.check_band(index)?;
         let start = mode_info_offset(index)?;
         let end = start
             .checked_add(STORED_MODE_INFO_BYTES)
@@ -130,6 +139,45 @@ impl<'a> ModeInfoView<'a> {
         self.data
             .get(start..end)
             .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn check_band(self, index: usize) -> Result<(), TileSyntaxError> {
+        if self.mi_cols == 0 {
+            return Ok(());
+        }
+        let col = index % self.mi_cols;
+        if col < self.band_mi_col_start || col >= self.band_mi_col_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn raw_parts(self) -> ModeInfoViewRaw {
+        ModeInfoViewRaw {
+            data: self.data.as_ptr() as usize,
+            len: self.data.len(),
+            mi_cols: self.mi_cols,
+            band_mi_col_start: self.band_mi_col_start,
+            band_mi_col_end: self.band_mi_col_end,
+        }
+    }
+
+    pub(crate) unsafe fn from_raw_parts(raw: ModeInfoViewRaw) -> Result<Self, TileSyntaxError> {
+        if !raw.len.is_multiple_of(STORED_MODE_INFO_BYTES) {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        if raw.mi_cols != 0 && raw.band_mi_col_start > raw.band_mi_col_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        // SAFETY: The caller guarantees that raw.data/raw.len describe a
+        // live immutable mode-history region for the duration of the job.
+        let data = unsafe { core::slice::from_raw_parts(raw.data as *const u8, raw.len) };
+        Ok(Self {
+            data,
+            mi_cols: raw.mi_cols,
+            band_mi_col_start: raw.band_mi_col_start,
+            band_mi_col_end: raw.band_mi_col_end,
+        })
     }
 
     #[allow(dead_code)]
@@ -216,6 +264,9 @@ impl<'a> ModeInfoView<'a> {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ModeInfoViewMut<'a> {
     pub(super) data: &'a mut [u8],
+    mi_cols: usize,
+    band_mi_col_start: usize,
+    band_mi_col_end: usize,
 }
 
 impl<'a> ModeInfoViewMut<'a> {
@@ -223,7 +274,12 @@ impl<'a> ModeInfoViewMut<'a> {
         if !data.len().is_multiple_of(STORED_MODE_INFO_BYTES) {
             return Err(DecodeError::InvalidConfig);
         }
-        Ok(Self { data })
+        Ok(Self {
+            data,
+            mi_cols: 0,
+            band_mi_col_start: 0,
+            band_mi_col_end: 0,
+        })
     }
 
     pub(crate) fn clear(&mut self) {
@@ -231,11 +287,21 @@ impl<'a> ModeInfoViewMut<'a> {
     }
 
     pub(super) fn as_view(&self) -> ModeInfoView<'_> {
-        ModeInfoView { data: self.data }
+        ModeInfoView {
+            data: self.data,
+            mi_cols: self.mi_cols,
+            band_mi_col_start: self.band_mi_col_start,
+            band_mi_col_end: self.band_mi_col_end,
+        }
     }
 
     pub(super) fn reborrow(&mut self) -> ModeInfoViewMut<'_> {
-        ModeInfoViewMut { data: self.data }
+        ModeInfoViewMut {
+            data: self.data,
+            mi_cols: self.mi_cols,
+            band_mi_col_start: self.band_mi_col_start,
+            band_mi_col_end: self.band_mi_col_end,
+        }
     }
 
     #[allow(dead_code)]
@@ -244,6 +310,7 @@ impl<'a> ModeInfoViewMut<'a> {
     }
 
     fn entry_mut(&mut self, index: usize) -> Result<&mut [u8], TileSyntaxError> {
+        self.check_band(index)?;
         let start = mode_info_offset(index)?;
         let end = start
             .checked_add(STORED_MODE_INFO_BYTES)
@@ -251,6 +318,50 @@ impl<'a> ModeInfoViewMut<'a> {
         self.data
             .get_mut(start..end)
             .ok_or(TileSyntaxError::InvalidBitstream)
+    }
+
+    fn check_band(&self, index: usize) -> Result<(), TileSyntaxError> {
+        if self.mi_cols == 0 {
+            return Ok(());
+        }
+        let col = index % self.mi_cols;
+        if col < self.band_mi_col_start || col >= self.band_mi_col_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn raw_parts(&mut self) -> ModeInfoViewMutRaw {
+        ModeInfoViewMutRaw {
+            data: self.data.as_mut_ptr() as usize,
+            len: self.data.len(),
+        }
+    }
+
+    pub(crate) unsafe fn from_raw_band(
+        raw: ModeInfoViewMutRaw,
+        mi_cols: usize,
+        band_mi_col_start: usize,
+        band_mi_col_end: usize,
+    ) -> Result<Self, TileSyntaxError> {
+        if mi_cols == 0
+            || band_mi_col_start > band_mi_col_end
+            || band_mi_col_end > mi_cols
+            || !raw.len.is_multiple_of(STORED_MODE_INFO_BYTES)
+        {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        // SAFETY: The band splitter creates one mutable view per
+        // column-disjoint band from this raw full-grid region, and the pool's
+        // Release/Acquire protocol joins all users before the coordinator
+        // reuses the original grid.
+        let data = unsafe { core::slice::from_raw_parts_mut(raw.data as *mut u8, raw.len) };
+        Ok(Self {
+            data,
+            mi_cols,
+            band_mi_col_start,
+            band_mi_col_end,
+        })
     }
 
     #[allow(dead_code)]
@@ -271,6 +382,21 @@ impl<'a> ModeInfoViewMut<'a> {
         self.entry_mut(index)?.copy_from_slice(bytes);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModeInfoViewRaw {
+    pub(crate) data: usize,
+    pub(crate) len: usize,
+    pub(crate) mi_cols: usize,
+    pub(crate) band_mi_col_start: usize,
+    pub(crate) band_mi_col_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModeInfoViewMutRaw {
+    pub(crate) data: usize,
+    pub(crate) len: usize,
 }
 
 pub(crate) struct FrameModeBuffers<'a> {
@@ -1374,7 +1500,8 @@ mod tests {
             let mut parser = TileParser {
                 decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
                 probabilities: &probabilities,
-                counts: &mut counts,
+                counts: &mut counts as *mut SyntaxCounts,
+                accumulate_counts: true,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: false,
@@ -1462,7 +1589,8 @@ mod tests {
         let parser = TileParser {
             decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
             probabilities: &probabilities,
-            counts: &mut counts,
+            counts: &mut counts as *mut SyntaxCounts,
+            accumulate_counts: true,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: false,

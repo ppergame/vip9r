@@ -1038,6 +1038,7 @@ pub(super) fn inter_prediction_row_mut<'a>(
     }
 
     let width = core::cmp::min(width, plane.width - x);
+    plane.check_band_span(x, width)?;
     let start = y
         .checked_mul(plane.stride)
         .and_then(|base| base.checked_add(x))
@@ -1267,12 +1268,16 @@ mod tests {
                                         width: PLANE_STRIDE,
                                         height: PLANE_HEIGHT,
                                         stride: PLANE_STRIDE,
+                                        band_x_start: 0,
+                                        band_x_end: PLANE_STRIDE,
                                     };
                                     let mut simd_plane = CurrentPlaneMut {
                                         data: &mut simd_data,
                                         width: PLANE_STRIDE,
                                         height: PLANE_HEIGHT,
                                         stride: PLANE_STRIDE,
+                                        band_x_start: 0,
+                                        band_x_end: PLANE_STRIDE,
                                     };
 
                                     inter_predict_subpel_unscaled_block_scalar(
@@ -1404,7 +1409,8 @@ mod tests {
             let mut parser = TileParser {
                 decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
                 probabilities: &probabilities,
-                counts: &mut counts,
+                counts: &mut counts as *mut SyntaxCounts,
+                accumulate_counts: true,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: false,

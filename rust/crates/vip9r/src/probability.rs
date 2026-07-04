@@ -94,6 +94,53 @@ impl SyntaxCounts {
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
+
+    pub(crate) fn merge_from(&mut self, other: &Self) {
+        self.counts_intra_mode.add_from(&other.counts_intra_mode);
+        self.counts_uv_mode.add_from(&other.counts_uv_mode);
+        self.counts_partition.add_from(&other.counts_partition);
+        self.counts_interp_filter
+            .add_from(&other.counts_interp_filter);
+        self.counts_inter_mode.add_from(&other.counts_inter_mode);
+        self.counts_tx_size.add_from(&other.counts_tx_size);
+        self.counts_is_inter.add_from(&other.counts_is_inter);
+        self.counts_comp_mode.add_from(&other.counts_comp_mode);
+        self.counts_single_ref.add_from(&other.counts_single_ref);
+        self.counts_comp_ref.add_from(&other.counts_comp_ref);
+        self.counts_skip.add_from(&other.counts_skip);
+        self.counts_mv_joint.add_from(&other.counts_mv_joint);
+        self.counts_mv_sign.add_from(&other.counts_mv_sign);
+        self.counts_mv_class.add_from(&other.counts_mv_class);
+        self.counts_mv_class0_bit
+            .add_from(&other.counts_mv_class0_bit);
+        self.counts_mv_class0_fr
+            .add_from(&other.counts_mv_class0_fr);
+        self.counts_mv_class0_hp
+            .add_from(&other.counts_mv_class0_hp);
+        self.counts_mv_bits.add_from(&other.counts_mv_bits);
+        self.counts_mv_fr.add_from(&other.counts_mv_fr);
+        self.counts_mv_hp.add_from(&other.counts_mv_hp);
+        self.counts_token.add_from(&other.counts_token);
+        self.counts_more_coefs.add_from(&other.counts_more_coefs);
+    }
+}
+
+trait AddCounts {
+    fn add_from(&mut self, other: &Self);
+}
+
+impl AddCounts for u32 {
+    fn add_from(&mut self, other: &Self) {
+        *self = self.saturating_add(*other);
+    }
+}
+
+impl<T: AddCounts, const N: usize> AddCounts for [T; N] {
+    fn add_from(&mut self, other: &Self) {
+        for (dst, src) in self.iter_mut().zip(other) {
+            dst.add_from(src);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

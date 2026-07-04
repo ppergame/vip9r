@@ -2006,6 +2006,7 @@ pub(super) fn residual_block_inside(
             .1
             .checked_add(size)
             .is_some_and(|bottom| bottom <= plane.height)
+        && plane.span_inside_band(start.0, size)
 }
 
 pub(super) fn add_residual_block_scalar(
@@ -2058,6 +2059,7 @@ pub(super) fn add_residual_block_interior_simd(
         let dst_end = dst_start
             .checked_add(size)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
+        plane.check_band_span(start.0, size)?;
         let dst = plane
             .data
             .get_mut(dst_start..dst_end)

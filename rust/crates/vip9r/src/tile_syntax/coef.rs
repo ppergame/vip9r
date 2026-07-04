@@ -34,10 +34,12 @@ pub(super) fn coef_band_table(tx_size: TxSize) -> &'static [u8] {
 pub(super) fn read_more_coefs(
     decoder: &mut BoolDecoder<'_>,
     probability_row: &[u8; 3],
-    counts: &mut [u32; 2],
+    counts: Option<&mut [u32; 2]>,
 ) -> Result<bool, TileSyntaxError> {
     let more_coefs = decoder.read_bool(probability_row[0])?;
-    increment_count(&mut counts[bool_index(more_coefs)]);
+    if let Some(counts) = counts {
+        increment_count(&mut counts[bool_index(more_coefs)]);
+    }
     Ok(more_coefs)
 }
 
@@ -45,7 +47,7 @@ pub(super) fn read_more_coefs(
 pub(super) fn read_token(
     decoder: &mut BoolDecoder<'_>,
     probability_row: &[u8; 3],
-    counts: &mut [u32; 3],
+    mut counts: Option<&mut [u32; 3]>,
 ) -> Result<CoefToken, TileSyntaxError> {
     let mut node = 0usize;
     loop {
@@ -54,7 +56,9 @@ pub(super) fn read_token(
         match TOKEN_TREE[node][bit] {
             TokenTreeBranch::Node(next) => node = usize::from(next),
             TokenTreeBranch::Token(token) => {
-                increment_count(&mut counts[coef_token_count_index(token)]);
+                if let Some(counts) = counts.as_deref_mut() {
+                    increment_count(&mut counts[coef_token_count_index(token)]);
+                }
                 return Ok(token);
             }
         }
@@ -255,7 +259,8 @@ mod tests {
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
             probabilities: &probabilities,
-            counts: &mut counts,
+            counts: &mut counts as *mut SyntaxCounts,
+            accumulate_counts: true,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -315,7 +320,8 @@ mod tests {
             let mut parser = TileParser {
                 decoder: BoolDecoder::new(&data).unwrap(),
                 probabilities: &probabilities,
-                counts: &mut counts,
+                counts: &mut counts as *mut SyntaxCounts,
+                accumulate_counts: true,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: true,
@@ -380,7 +386,8 @@ mod tests {
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x01, 0x80]).unwrap(),
             probabilities: &sign_probabilities,
-            counts: &mut counts,
+            counts: &mut counts as *mut SyntaxCounts,
+            accumulate_counts: true,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -452,7 +459,8 @@ mod tests {
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x00, 0x00]).unwrap(),
             probabilities: &probabilities,
-            counts: &mut counts,
+            counts: &mut counts as *mut SyntaxCounts,
+            accumulate_counts: true,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,
@@ -493,7 +501,8 @@ mod tests {
         let mut parser = TileParser {
             decoder: BoolDecoder::new(&[0x50, 0x00]).unwrap(),
             probabilities: &probabilities,
-            counts: &mut counts,
+            counts: &mut counts as *mut SyntaxCounts,
+            accumulate_counts: true,
             contexts: &mut contexts,
             tx_mode: TxMode::Only4x4,
             frame_is_intra: true,

@@ -1150,3 +1150,44 @@ streamer cpu0:
   measured core is ~5% (jellyfish on cpu:0 vs three-core load: 193.8 vs 184.6
   ms/frame) plus ~1% extra spread. The M6 scaling budget is compute-bound:
   neither thermals nor DRAM bandwidth will eat the multiplier.
+
+## 2026-07-04 — M6 threads: tile-parallel tile decode
+
+- Tile columns now decode in parallel: a wave hands one column band each to
+  up to three workers, the coordinator decodes the remaining columns between
+  dispatch and join, and the loop filter stays frame-wide on the coordinator.
+  The parallel unit is the column *band* — all tile rows of a column on one
+  thread — because `clear_above_context()` is per frame, so above context
+  carries across tile rows within a column; a fresh per-band
+  `TileModeContexts` is then exactly the frame-level clear. Single-column
+  clips and pool-off runs keep the untouched serial loop.
+- The shared-mutable surface went per-thread or loud: per-worker
+  `SyntaxCounts` live in a new workspace-arena region and merge after join;
+  all counts work (accumulate, zero, merge) is skipped when adaptation is off
+  (`error_resilient || frame_parallel_decoding_mode` — the whole realworld
+  perf corpus), which also deletes dead work from serial decode. Current-frame
+  planes and the mode grid cross the job boundary as raw parts rebuilt into
+  band-restricted views: the unsafe is confined to the split/rebuild, and
+  every accessor checks the band so a cross-band access is an
+  `InvalidBitstream` decode failure instead of a data race.
+- A55 streamer (`cpu:0-3`, 0:5 windows, corrected deltas, spreads ≤0.8%):
+  jellyfish −54.6% (139.7 → 63.5 ms/frame), BBB −59.7% (104.5 → 42.0), and
+  the adaptation-on flag=0 lane f247 −53.4% (132.3 → 61.7) — the per-worker
+  counts merge is bit-exact and keeps the win. Serial no-pool decode is
+  unchanged (−0.15% at 1.8% spread). 2.2–2.5x against the ffvp9 ~2.9x anchor
+  with the loop filter (~10–19%) still serial — Amdahl-consistent. BBB now
+  sits 5% over its 40 ms budget; jellyfish 1.9x over 33.3. The loop-filter
+  SB-row wavefront is the next lever.
+- Review caught one real bug in the grinder's dispatch path: an error return
+  between dispatch and join would unwind the coordinator frame while workers
+  still held pointers to its stack-resident result cells; errors now funnel
+  through result aggregation so join always runs.
+- Negative result, recorded: pooled decode on the Pixel measures 3.3x
+  *slower* than serial X4 (12.2 → 41 ms/frame pinned `cpu:4-7`; worse under
+  an all-cores pin). Telemetry shows the A720 policy parked at 578→357 MHz:
+  the daemon controls affinity only, and schedutil/EAS never ramps for the
+  futex-parked worker threads. Pixel pooled numbers are meaningless until
+  the harness locks frequencies — and product-side, pool activation on a
+  fast-serial big.LITTLE device can be a real pessimization.
+- Suite: wasm tests 100/100 (band-view + pool coverage), compliance corpus
+  307/307 pooled and serial, full corpus 339/339 pooled, vitest 43/43.

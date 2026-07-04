@@ -9,6 +9,7 @@ use crate::header::{
     InterpolationFilter, LoopFilterParams, MAX_SEGMENTS, SEG_LVL_ALT_L, SEG_LVL_REF_FRAME,
     SEG_LVL_SKIP, SegmentationParams, UncompressedFrameHeader,
 };
+use crate::pool::{self, WORKER_COUNT};
 use crate::probability::{
     CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
 };
@@ -29,7 +30,10 @@ use loop_filter::*;
 #[cfg(any(test, feature = "wasm-tests"))]
 pub(crate) use mode_info::STORED_MODE_INFO_BYTES;
 use mode_info::*;
-pub(crate) use mode_info::{FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len};
+pub(crate) use mode_info::{
+    FrameModeBuffers, ModeInfoView, ModeInfoViewMut, mode_info_byte_len,
+};
+use mode_info::{ModeInfoViewMutRaw, ModeInfoViewRaw};
 use residual::*;
 use tables::*;
 
@@ -134,6 +138,44 @@ impl<'a> CurrentFrameMut<'a> {
             _ => Err(TileSyntaxError::InvalidBitstream),
         }
     }
+
+    fn raw_parts(&mut self) -> CurrentFrameRaw {
+        CurrentFrameRaw {
+            y: self.y.raw_parts(),
+            u: self.u.raw_parts(),
+            v: self.v.raw_parts(),
+        }
+    }
+
+    unsafe fn from_band_raw(raw: CurrentFrameBandRaw) -> Result<Self, TileSyntaxError> {
+        Ok(Self {
+            // SAFETY: The caller's band-splitting contract guarantees that
+            // each raw plane points at the live current-frame storage and that
+            // simultaneously constructed bands have disjoint column ranges.
+            y: unsafe {
+                CurrentPlaneMut::from_raw_band(
+                    raw.frame.y,
+                    luma_band(raw.mi_col_start, raw.mi_col_end)?,
+                )?
+            },
+            // SAFETY: Same as for luma; chroma bands are the corresponding
+            // half-resolution column ranges, with the last band extending to
+            // the plane edge by the plane-band constructor.
+            u: unsafe {
+                CurrentPlaneMut::from_raw_band(
+                    raw.frame.u,
+                    chroma_band(raw.mi_col_start, raw.mi_col_end)?,
+                )?
+            },
+            // SAFETY: Same as for U.
+            v: unsafe {
+                CurrentPlaneMut::from_raw_band(
+                    raw.frame.v,
+                    chroma_band(raw.mi_col_start, raw.mi_col_end)?,
+                )?
+            },
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +184,8 @@ pub(crate) struct CurrentPlaneMut<'a> {
     width: usize,
     height: usize,
     stride: usize,
+    band_x_start: usize,
+    band_x_end: usize,
 }
 
 impl<'a> CurrentPlaneMut<'a> {
@@ -165,6 +209,8 @@ impl<'a> CurrentPlaneMut<'a> {
             width,
             height,
             stride: shape.stride,
+            band_x_start: 0,
+            band_x_end: width,
         })
     }
 
@@ -175,6 +221,7 @@ impl<'a> CurrentPlaneMut<'a> {
 
         let x = core::cmp::min(x, self.width - 1);
         let y = core::cmp::min(y, self.height - 1);
+        self.check_band_x(x)?;
         let index = y
             .checked_mul(self.stride)
             .and_then(|row| row.checked_add(x))
@@ -189,6 +236,7 @@ impl<'a> CurrentPlaneMut<'a> {
         if x >= self.width || y >= self.height {
             return Ok(());
         }
+        self.check_band_x(x)?;
 
         let index = y
             .checked_mul(self.stride)
@@ -200,6 +248,128 @@ impl<'a> CurrentPlaneMut<'a> {
             .ok_or(TileSyntaxError::InvalidBitstream)? = value;
         Ok(())
     }
+
+    fn raw_parts(&mut self) -> CurrentPlaneRaw {
+        CurrentPlaneRaw {
+            data: self.data.as_mut_ptr() as usize,
+            len: self.data.len(),
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+        }
+    }
+
+    unsafe fn from_raw_band(
+        raw: CurrentPlaneRaw,
+        band: PlaneBand,
+    ) -> Result<Self, TileSyntaxError> {
+        if raw.stride < raw.width || band.x_start > band.x_end || band.x_start > raw.width {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let len = raw
+            .stride
+            .checked_mul(raw.height)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if raw.len < len {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let band_x_end = core::cmp::min(band.x_end, raw.width);
+        // SAFETY: The raw parts came from a live CurrentPlaneMut over the
+        // current frame.  The band splitter creates aliased full-plane slices
+        // only with disjoint accepted column ranges; every direct access path
+        // checks those ranges and reports InvalidBitstream before touching a
+        // cross-band column.
+        let data = unsafe { core::slice::from_raw_parts_mut(raw.data as *mut u8, raw.len) };
+        Ok(Self {
+            data,
+            width: raw.width,
+            height: raw.height,
+            stride: raw.stride,
+            band_x_start: band.x_start,
+            band_x_end,
+        })
+    }
+
+    fn check_band_x(&self, x: usize) -> Result<(), TileSyntaxError> {
+        if x < self.band_x_start || x >= self.band_x_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_band_span(
+        &self,
+        x: usize,
+        width: usize,
+    ) -> Result<(), TileSyntaxError> {
+        if width == 0 {
+            return Ok(());
+        }
+        let end = x
+            .checked_add(width)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if x < self.band_x_start || end > self.band_x_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        Ok(())
+    }
+
+    pub(super) fn span_inside_band(&self, x: usize, width: usize) -> bool {
+        width == 0
+            || x.checked_add(width)
+                .is_some_and(|end| x >= self.band_x_start && end <= self.band_x_end)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentFrameRaw {
+    y: CurrentPlaneRaw,
+    u: CurrentPlaneRaw,
+    v: CurrentPlaneRaw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CurrentPlaneRaw {
+    data: usize,
+    len: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CurrentFrameBandRaw {
+    frame: CurrentFrameRaw,
+    mi_col_start: usize,
+    mi_col_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlaneBand {
+    x_start: usize,
+    x_end: usize,
+}
+
+fn luma_band(mi_col_start: usize, mi_col_end: usize) -> Result<PlaneBand, TileSyntaxError> {
+    Ok(PlaneBand {
+        x_start: mi_col_start
+            .checked_mul(8)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+        x_end: mi_col_end
+            .checked_mul(8)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+    })
+}
+
+fn chroma_band(mi_col_start: usize, mi_col_end: usize) -> Result<PlaneBand, TileSyntaxError> {
+    Ok(PlaneBand {
+        x_start: mi_col_start
+            .checked_mul(4)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+        x_end: mi_col_end
+            .checked_mul(4)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -301,6 +471,7 @@ impl<'a> ReferencePlane<'a> {
 
 pub(crate) struct TileParseBuffers<'a, 'm, 'f, 'r> {
     counts: &'a mut SyntaxCounts,
+    worker_counts: &'a mut [SyntaxCounts],
     mode_buffers: FrameModeBuffers<'m>,
     current_frame: &'a mut CurrentFrameMut<'f>,
     reference_frames: Option<ReferenceFrames<'r>>,
@@ -309,11 +480,13 @@ pub(crate) struct TileParseBuffers<'a, 'm, 'f, 'r> {
 impl<'a, 'm, 'f, 'r> TileParseBuffers<'a, 'm, 'f, 'r> {
     pub(crate) const fn new(
         counts: &'a mut SyntaxCounts,
+        worker_counts: &'a mut [SyntaxCounts],
         mode_buffers: FrameModeBuffers<'m>,
         current_frame: &'a mut CurrentFrameMut<'f>,
     ) -> Self {
         Self {
             counts,
+            worker_counts,
             mode_buffers,
             current_frame,
             reference_frames: None,
@@ -322,12 +495,14 @@ impl<'a, 'm, 'f, 'r> TileParseBuffers<'a, 'm, 'f, 'r> {
 
     pub(crate) const fn with_references(
         counts: &'a mut SyntaxCounts,
+        worker_counts: &'a mut [SyntaxCounts],
         mode_buffers: FrameModeBuffers<'m>,
         current_frame: &'a mut CurrentFrameMut<'f>,
         reference_frames: ReferenceFrames<'r>,
     ) -> Self {
         Self {
             counts,
+            worker_counts,
             mode_buffers,
             current_frame,
             reference_frames: Some(reference_frames),
@@ -349,40 +524,26 @@ pub(crate) fn parse_intra_tiles(
 
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
-    let mut contexts = TileModeContexts::new(mi_cols)?;
+    let config = TileParserConfig {
+        frame_is_intra: true,
+        frame_width: header.frame_width,
+        frame_height: header.frame_height,
+        tx_mode: compressed_header.tx_mode,
+        reference_mode: ReferenceMode::Single,
+        compound_reference: None,
+        interpolation_filter: None,
+        allow_high_precision_mv: false,
+        use_prev_frame_mvs: false,
+        ref_frame_sign_bias: [false; 4],
+        lossless: header.lossless,
+        dequant: FrameDequant::from_header(header),
+        frame_mis: (mi_rows, mi_cols),
+        segmentation: header.segmentation,
+        segment_map_reset: true,
+        accumulate_counts: !header.error_resilient_mode && !header.frame_parallel_decoding_mode,
+    };
 
-    for tile in layout.as_slice() {
-        let config = TileParserConfig {
-            frame_is_intra: true,
-            frame_width: header.frame_width,
-            frame_height: header.frame_height,
-            tx_mode: compressed_header.tx_mode,
-            reference_mode: ReferenceMode::Single,
-            compound_reference: None,
-            interpolation_filter: None,
-            allow_high_precision_mv: false,
-            use_prev_frame_mvs: false,
-            ref_frame_sign_bias: [false; 4],
-            lossless: header.lossless,
-            dequant: FrameDequant::from_header(header),
-            frame_mis: (mi_rows, mi_cols),
-            segmentation: header.segmentation,
-            segment_map_reset: true,
-        };
-        parse_tile(
-            frame,
-            tile,
-            config,
-            buffers.mode_buffers.for_tile(),
-            TileParseShared {
-                probabilities,
-                counts: &mut *buffers.counts,
-                contexts: &mut contexts,
-                current_frame: &mut *buffers.current_frame,
-                reference_frames: None,
-            },
-        )?;
-    }
+    parse_tile_frame(frame, probabilities, layout, config, &mut buffers)?;
 
     loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
 
@@ -407,29 +568,165 @@ pub(crate) fn parse_inter_tiles(
 
     let mi_cols = mi_size(header.frame_width)?;
     let mi_rows = mi_size(header.frame_height)?;
-    let mut contexts = TileModeContexts::new(mi_cols)?;
     let reference_frames = buffers
         .reference_frames
         .ok_or(TileSyntaxError::InvalidBitstream)?;
+    buffers.reference_frames = Some(reference_frames);
+    let config = TileParserConfig {
+        frame_is_intra: false,
+        frame_width: header.frame_width,
+        frame_height: header.frame_height,
+        tx_mode: compressed_header.tx_mode,
+        reference_mode: compressed_header.reference_mode,
+        compound_reference: compressed_header.compound_reference,
+        interpolation_filter: header.interpolation_filter,
+        allow_high_precision_mv: header.allow_high_precision_mv,
+        use_prev_frame_mvs: buffers.mode_buffers.use_prev_frame_mvs,
+        ref_frame_sign_bias: header.ref_frame_sign_bias,
+        lossless: header.lossless,
+        dequant: FrameDequant::from_header(header),
+        frame_mis: (mi_rows, mi_cols),
+        segmentation: header.segmentation,
+        segment_map_reset: header.error_resilient_mode,
+        accumulate_counts: !header.error_resilient_mode && !header.frame_parallel_decoding_mode,
+    };
+
+    parse_tile_frame(frame, probabilities, layout, config, &mut buffers)?;
+
+    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct TileJob {
+    frame: ByteSliceRaw,
+    tiles: TileSliceRaw,
+    probabilities: usize,
+    config: TileParserConfig,
+    mode_buffers: FrameModeBuffersRaw,
+    current_frame: CurrentFrameBandRaw,
+    reference_frames: ReferenceFramesRaw,
+    counts: usize,
+    result: usize,
+    tile_col: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ByteSliceRaw {
+    data: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TileSliceRaw {
+    data: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FrameModeBuffersRaw {
+    use_prev_frame_mvs: bool,
+    prev_frame_modes: Option<ModeInfoViewRaw>,
+    current_frame_modes: Option<ModeInfoViewMutRaw>,
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceFramesRaw {
+    present: bool,
+    frames: [Option<ReferenceFrameRaw>; 4],
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceFrameRaw {
+    y: ReferencePlaneRaw,
+    u: ReferencePlaneRaw,
+    v: ReferencePlaneRaw,
+}
+
+#[derive(Clone, Copy)]
+struct ReferencePlaneRaw {
+    data: usize,
+    len: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TileJobResult {
+    tile_index: usize,
+    error: Option<TileSyntaxError>,
+}
+
+impl TileJobResult {
+    const fn ok() -> Self {
+        Self {
+            tile_index: usize::MAX,
+            error: None,
+        }
+    }
+
+    const fn error(tile_index: usize, error: TileSyntaxError) -> Self {
+        Self {
+            tile_index,
+            error: Some(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TileBandError {
+    tile_index: usize,
+    error: TileSyntaxError,
+}
+
+pub(crate) fn run_tile_job(job: TileJob) {
+    let result = decode_tile_job(job);
+    // SAFETY: The coordinator stores a pointer to this wave's per-slot
+    // result cell in the job before the Release epoch bump.  The cell remains
+    // live and slot-disjoint until after join's Acquire observes this worker's
+    // Release acknowledgement.
+    unsafe {
+        *(job.result as *mut TileJobResult) = result;
+    }
+}
+
+fn parse_tile_frame(
+    frame: &[u8],
+    probabilities: &FrameContext,
+    layout: &TileLayout,
+    config: TileParserConfig,
+    buffers: &mut TileParseBuffers<'_, '_, '_, '_>,
+) -> Result<(), TileSyntaxError> {
+    let (tile_cols, tile_rows) = tile_grid(layout)?;
+    if !pool::is_active() || tile_cols == 1 {
+        return parse_tile_frame_serial(frame, probabilities, layout, config, buffers);
+    }
+    parse_tile_frame_parallel(
+        frame,
+        probabilities,
+        layout,
+        config,
+        buffers,
+        tile_cols,
+        tile_rows,
+    )
+}
+
+fn parse_tile_frame_serial(
+    frame: &[u8],
+    probabilities: &FrameContext,
+    layout: &TileLayout,
+    config: TileParserConfig,
+    buffers: &mut TileParseBuffers<'_, '_, '_, '_>,
+) -> Result<(), TileSyntaxError> {
+    let (_, mi_cols) = config.frame_mis;
+    let mut contexts = TileModeContexts::new(mi_cols)?;
 
     for tile in layout.as_slice() {
-        let config = TileParserConfig {
-            frame_is_intra: false,
-            frame_width: header.frame_width,
-            frame_height: header.frame_height,
-            tx_mode: compressed_header.tx_mode,
-            reference_mode: compressed_header.reference_mode,
-            compound_reference: compressed_header.compound_reference,
-            interpolation_filter: header.interpolation_filter,
-            allow_high_precision_mv: header.allow_high_precision_mv,
-            use_prev_frame_mvs: buffers.mode_buffers.use_prev_frame_mvs,
-            ref_frame_sign_bias: header.ref_frame_sign_bias,
-            lossless: header.lossless,
-            dequant: FrameDequant::from_header(header),
-            frame_mis: (mi_rows, mi_cols),
-            segmentation: header.segmentation,
-            segment_map_reset: header.error_resilient_mode,
-        };
         parse_tile(
             frame,
             tile,
@@ -437,17 +734,501 @@ pub(crate) fn parse_inter_tiles(
             buffers.mode_buffers.for_tile(),
             TileParseShared {
                 probabilities,
-                counts: &mut *buffers.counts,
+                counts: buffers.counts as *mut SyntaxCounts,
                 contexts: &mut contexts,
                 current_frame: &mut *buffers.current_frame,
-                reference_frames: Some(reference_frames),
+                reference_frames: buffers.reference_frames,
             },
         )?;
     }
-
-    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
-
     Ok(())
+}
+
+fn parse_tile_frame_parallel(
+    frame: &[u8],
+    probabilities: &FrameContext,
+    layout: &TileLayout,
+    config: TileParserConfig,
+    buffers: &mut TileParseBuffers<'_, '_, '_, '_>,
+    tile_cols: usize,
+    tile_rows: usize,
+) -> Result<(), TileSyntaxError> {
+    if buffers.worker_counts.len() < WORKER_COUNT {
+        return Err(TileSyntaxError::ResourceLimit);
+    }
+
+    let tiles = layout.as_slice();
+    let frame_raw = ByteSliceRaw {
+        data: frame.as_ptr() as usize,
+        len: frame.len(),
+    };
+    let tiles_raw = TileSliceRaw {
+        data: tiles.as_ptr() as usize,
+        len: tiles.len(),
+    };
+    let current_frame_raw = buffers.current_frame.raw_parts();
+    let mode_buffers_raw = FrameModeBuffersRaw::from_buffers(&mut buffers.mode_buffers);
+    let reference_frames_raw = ReferenceFramesRaw::from_option(buffers.reference_frames);
+    let worker_jobs = core::cmp::min(WORKER_COUNT, tile_cols - 1);
+    let mut worker_results = [TileJobResult::ok(); WORKER_COUNT];
+    let mut jobs = [None; WORKER_COUNT];
+
+    for worker_index in 0..worker_jobs {
+        if config.accumulate_counts {
+            buffers.worker_counts[worker_index].clear();
+        }
+        let counts = if config.accumulate_counts {
+            &mut buffers.worker_counts[worker_index] as *mut SyntaxCounts as usize
+        } else {
+            0
+        };
+        jobs[worker_index] = Some(pool::Job::Tile(make_tile_job(TileJobParts {
+            frame: frame_raw,
+            tiles: tiles_raw,
+            probabilities: probabilities as *const FrameContext as usize,
+            config,
+            mode_buffers: mode_buffers_raw,
+            current_frame: current_frame_raw,
+            reference_frames: reference_frames_raw,
+            counts,
+            result: &mut worker_results[worker_index] as *mut TileJobResult as usize,
+            tile_col: worker_index,
+            tile_cols,
+            tile_rows,
+            tile_range: column_mi_range(tiles, tile_cols, tile_rows, worker_index)?,
+        })));
+    }
+
+    pool::dispatch(&jobs);
+
+    // No early return between dispatch and join: workers hold pointers into
+    // this frame's stack (their result cells), so every path must join before
+    // unwinding. Errors funnel through the result aggregation instead.
+    let mut best = TileJobResult::ok();
+    for tile_col in worker_jobs..tile_cols {
+        let result = match column_mi_range(tiles, tile_cols, tile_rows, tile_col) {
+            Ok(tile_range) => decode_tile_job(make_tile_job(TileJobParts {
+                frame: frame_raw,
+                tiles: tiles_raw,
+                probabilities: probabilities as *const FrameContext as usize,
+                config,
+                mode_buffers: mode_buffers_raw,
+                current_frame: current_frame_raw,
+                reference_frames: reference_frames_raw,
+                counts: if config.accumulate_counts {
+                    buffers.counts as *mut SyntaxCounts as usize
+                } else {
+                    0
+                },
+                result: 0,
+                tile_col,
+                tile_cols,
+                tile_rows,
+                tile_range,
+            })),
+            Err(error) => TileJobResult::error(tile_col, error),
+        };
+        choose_earliest_error(&mut best, result);
+    }
+
+    if !pool::join(-1) {
+        return Err(TileSyntaxError::ResourceLimit);
+    }
+
+    for &result in worker_results.iter().take(worker_jobs) {
+        choose_earliest_error(&mut best, result);
+    }
+    if let Some(error) = best.error {
+        return Err(error);
+    }
+
+    if config.accumulate_counts {
+        for counts in buffers.worker_counts.iter().take(worker_jobs) {
+            buffers.counts.merge_from(counts);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct TileJobParts {
+    frame: ByteSliceRaw,
+    tiles: TileSliceRaw,
+    probabilities: usize,
+    config: TileParserConfig,
+    mode_buffers: FrameModeBuffersRaw,
+    current_frame: CurrentFrameRaw,
+    reference_frames: ReferenceFramesRaw,
+    counts: usize,
+    result: usize,
+    tile_col: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+    tile_range: (usize, usize),
+}
+
+fn make_tile_job(parts: TileJobParts) -> TileJob {
+    TileJob {
+        frame: parts.frame,
+        tiles: parts.tiles,
+        probabilities: parts.probabilities,
+        config: parts.config,
+        mode_buffers: parts.mode_buffers,
+        current_frame: CurrentFrameBandRaw {
+            frame: parts.current_frame,
+            mi_col_start: parts.tile_range.0,
+            mi_col_end: parts.tile_range.1,
+        },
+        reference_frames: parts.reference_frames,
+        counts: parts.counts,
+        result: parts.result,
+        tile_col: parts.tile_col,
+        tile_cols: parts.tile_cols,
+        tile_rows: parts.tile_rows,
+    }
+}
+
+fn choose_earliest_error(best: &mut TileJobResult, candidate: TileJobResult) {
+    if candidate.error.is_some() && candidate.tile_index < best.tile_index {
+        *best = candidate;
+    }
+}
+
+fn decode_tile_job(job: TileJob) -> TileJobResult {
+    match decode_tile_job_inner(job) {
+        Ok(()) => TileJobResult::ok(),
+        Err(error) => TileJobResult::error(error.tile_index, error.error),
+    }
+}
+
+fn decode_tile_job_inner(job: TileJob) -> Result<(), TileBandError> {
+    let first_tile_index = job
+        .tile_col
+        .min(job.tile_cols.saturating_mul(job.tile_rows).saturating_sub(1));
+    // SAFETY: Job raw pointers were captured from live coordinator slices
+    // before dispatch and the coordinator does not free or rewrite them until
+    // after join.
+    let frame = unsafe { core::slice::from_raw_parts(job.frame.data as *const u8, job.frame.len) };
+    // SAFETY: Same as frame; descriptors are immutable for the wave.
+    let tiles =
+        unsafe { core::slice::from_raw_parts(job.tiles.data as *const TileDescriptor, job.tiles.len) };
+    // SAFETY: Frame probabilities are immutable decoder state for the wave.
+    let probabilities = unsafe { &*(job.probabilities as *const FrameContext) };
+    // SAFETY: Band views are column-disjoint, live only for this wave, and all
+    // cross-thread visibility is ordered by pool dispatch/join.
+    let mut current_frame = unsafe { CurrentFrameMut::from_band_raw(job.current_frame) }
+        .map_err(|error| TileBandError {
+            tile_index: first_tile_index,
+            error,
+        })?;
+    // SAFETY: The raw mode buffers point at immutable previous modes and the
+    // current mode grid; mutable current-grid accesses are restricted to this
+    // job's MI-column band.
+    let mode_buffers = unsafe {
+        job.mode_buffers.to_buffers(
+            job.config.frame_mis.1,
+            job.current_frame.mi_col_start,
+            job.current_frame.mi_col_end,
+        )
+    }
+    .map_err(|error| TileBandError {
+        tile_index: first_tile_index,
+        error,
+    })?;
+    // SAFETY: Reference frames are read-only frame-pool slices that remain
+    // live for the decode wave.
+    let reference_frames = unsafe { job.reference_frames.to_option() }.map_err(|error| {
+        TileBandError {
+            tile_index: first_tile_index,
+            error,
+        }
+    })?;
+    parse_tile_band(
+        TileBandDecode {
+            frame,
+            tiles,
+            tile_col: job.tile_col,
+            tile_cols: job.tile_cols,
+            tile_rows: job.tile_rows,
+            config: job.config,
+            mode_buffers,
+        },
+        TileParseBandShared {
+            probabilities,
+            counts: job.counts as *mut SyntaxCounts,
+            current_frame: &mut current_frame,
+            reference_frames,
+        },
+    )
+}
+
+struct TileParseBandShared<'a, 'f, 'r> {
+    probabilities: &'a FrameContext,
+    counts: *mut SyntaxCounts,
+    current_frame: &'a mut CurrentFrameMut<'f>,
+    reference_frames: Option<ReferenceFrames<'r>>,
+}
+
+struct TileBandDecode<'a, 'm> {
+    frame: &'a [u8],
+    tiles: &'a [TileDescriptor],
+    tile_col: usize,
+    tile_cols: usize,
+    tile_rows: usize,
+    config: TileParserConfig,
+    mode_buffers: FrameModeBuffers<'m>,
+}
+
+fn parse_tile_band(
+    request: TileBandDecode<'_, '_>,
+    shared: TileParseBandShared<'_, '_, '_>,
+) -> Result<(), TileBandError> {
+    let TileBandDecode {
+        frame,
+        tiles,
+        tile_col,
+        tile_cols,
+        tile_rows,
+        config,
+        mut mode_buffers,
+    } = request;
+    let (_, mi_cols) = config.frame_mis;
+    let mut contexts = TileModeContexts::new(mi_cols).map_err(|error| TileBandError {
+        tile_index: tile_col,
+        error,
+    })?;
+
+    for tile_row in 0..tile_rows {
+        let tile_index = tile_row
+            .checked_mul(tile_cols)
+            .and_then(|base| base.checked_add(tile_col))
+            .ok_or(TileBandError {
+                tile_index: tile_col,
+                error: TileSyntaxError::InvalidBitstream,
+            })?;
+        let tile = tiles.get(tile_index).ok_or(TileBandError {
+            tile_index,
+            error: TileSyntaxError::InvalidBitstream,
+        })?;
+        if usize::from(tile.tile_col) != tile_col || usize::from(tile.tile_row) != tile_row {
+            return Err(TileBandError {
+                tile_index,
+                error: TileSyntaxError::InvalidBitstream,
+            });
+        }
+        parse_tile(
+            frame,
+            tile,
+            config,
+            mode_buffers.for_tile(),
+            TileParseShared {
+                probabilities: shared.probabilities,
+                counts: shared.counts,
+                contexts: &mut contexts,
+                current_frame: &mut *shared.current_frame,
+                reference_frames: shared.reference_frames,
+            },
+        )
+        .map_err(|error| TileBandError { tile_index, error })?;
+    }
+    Ok(())
+}
+
+fn tile_grid(layout: &TileLayout) -> Result<(usize, usize), TileSyntaxError> {
+    let tiles = layout.as_slice();
+    let last = tiles.last().ok_or(TileSyntaxError::InvalidBitstream)?;
+    let tile_cols = usize::from(last.tile_col)
+        .checked_add(1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let tile_rows = usize::from(last.tile_row)
+        .checked_add(1)
+        .ok_or(TileSyntaxError::InvalidBitstream)?;
+    if tile_cols == 0
+        || tile_rows == 0
+        || tile_cols
+            .checked_mul(tile_rows)
+            .ok_or(TileSyntaxError::InvalidBitstream)?
+            != tiles.len()
+    {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    Ok((tile_cols, tile_rows))
+}
+
+fn column_mi_range(
+    tiles: &[TileDescriptor],
+    tile_cols: usize,
+    tile_rows: usize,
+    tile_col: usize,
+) -> Result<(usize, usize), TileSyntaxError> {
+    if tile_col >= tile_cols {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    let first = tiles.get(tile_col).ok_or(TileSyntaxError::InvalidBitstream)?;
+    let start =
+        usize::try_from(first.mi_col_start).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    let end = usize::try_from(first.mi_col_end).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    for tile_row in 0..tile_rows {
+        let tile_index = tile_row
+            .checked_mul(tile_cols)
+            .and_then(|base| base.checked_add(tile_col))
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let tile = tiles
+            .get(tile_index)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if usize::from(tile.tile_col) != tile_col
+            || usize::from(tile.tile_row) != tile_row
+            || usize::try_from(tile.mi_col_start).map_err(|_| TileSyntaxError::InvalidBitstream)?
+                != start
+            || usize::try_from(tile.mi_col_end).map_err(|_| TileSyntaxError::InvalidBitstream)?
+                != end
+        {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+    }
+    Ok((start, end))
+}
+
+impl FrameModeBuffersRaw {
+    fn from_buffers(buffers: &mut FrameModeBuffers<'_>) -> Self {
+        Self {
+            use_prev_frame_mvs: buffers.use_prev_frame_mvs,
+            prev_frame_modes: buffers.prev_frame_modes.map(ModeInfoView::raw_parts),
+            current_frame_modes: buffers
+                .current_frame_modes
+                .as_mut()
+                .map(ModeInfoViewMut::raw_parts),
+        }
+    }
+
+    unsafe fn to_buffers(
+        self,
+        mi_cols: usize,
+        band_mi_col_start: usize,
+        band_mi_col_end: usize,
+    ) -> Result<FrameModeBuffers<'static>, TileSyntaxError> {
+        let prev_frame_modes = match self.prev_frame_modes {
+            Some(raw) => {
+                // SAFETY: The raw immutable view points at previous-mode
+                // history that stays live for the wave.
+                Some(unsafe { ModeInfoView::from_raw_parts(raw) }?)
+            }
+            None => None,
+        };
+        let current_frame_modes = match self.current_frame_modes {
+            Some(raw) => {
+                // SAFETY: Current mode writes are restricted by the constructed
+                // band view and the bands are column-disjoint for the wave.
+                Some(unsafe {
+                    ModeInfoViewMut::from_raw_band(
+                        raw,
+                        mi_cols,
+                        band_mi_col_start,
+                        band_mi_col_end,
+                    )
+                }?)
+            }
+            None => None,
+        };
+        Ok(FrameModeBuffers::new(
+            self.use_prev_frame_mvs,
+            prev_frame_modes,
+            current_frame_modes,
+        ))
+    }
+}
+
+impl ReferenceFramesRaw {
+    const fn none() -> Self {
+        Self {
+            present: false,
+            frames: [None; 4],
+        }
+    }
+
+    fn from_option(frames: Option<ReferenceFrames<'_>>) -> Self {
+        match frames {
+            Some(frames) => Self {
+                present: true,
+                frames: frames.frames.map(|frame| frame.map(ReferenceFrameRaw::from_frame)),
+            },
+            None => Self::none(),
+        }
+    }
+
+    unsafe fn to_option(self) -> Result<Option<ReferenceFrames<'static>>, TileSyntaxError> {
+        if !self.present {
+            return Ok(None);
+        }
+        let mut frames = [None; 4];
+        for (dst, src) in frames.iter_mut().zip(self.frames) {
+            *dst = match src {
+                Some(frame) => {
+                    // SAFETY: Reference frame raw parts are read-only live
+                    // frame-pool slices for the duration of the wave.
+                    Some(unsafe { frame.to_frame() }?)
+                }
+                None => None,
+            };
+        }
+        Ok(Some(ReferenceFrames::new(frames)))
+    }
+}
+
+impl ReferenceFrameRaw {
+    fn from_frame(frame: ReferenceFrame<'_>) -> Self {
+        Self {
+            y: ReferencePlaneRaw::from_plane(frame.y),
+            u: ReferencePlaneRaw::from_plane(frame.u),
+            v: ReferencePlaneRaw::from_plane(frame.v),
+        }
+    }
+
+    unsafe fn to_frame(self) -> Result<ReferenceFrame<'static>, TileSyntaxError> {
+        Ok(ReferenceFrame::new(
+            // SAFETY: The raw plane points at immutable frame-pool storage
+            // that outlives the decode wave.
+            unsafe { self.y.to_plane() }?,
+            // SAFETY: Same as Y.
+            unsafe { self.u.to_plane() }?,
+            // SAFETY: Same as Y.
+            unsafe { self.v.to_plane() }?,
+        ))
+    }
+}
+
+impl ReferencePlaneRaw {
+    fn from_plane(plane: ReferencePlane<'_>) -> Self {
+        Self {
+            data: plane.data.as_ptr() as usize,
+            len: plane.data.len(),
+            width: plane.width,
+            height: plane.height,
+            stride: plane.stride,
+        }
+    }
+
+    unsafe fn to_plane(self) -> Result<ReferencePlane<'static>, TileSyntaxError> {
+        if self.width == 0 || self.height == 0 || self.stride < self.width {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        let len = self
+            .stride
+            .checked_mul(self.height)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if self.len < len {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        // SAFETY: The raw plane points at immutable frame-pool storage that
+        // remains live while workers decode this wave.
+        let data = unsafe { core::slice::from_raw_parts(self.data as *const u8, self.len) };
+        Ok(ReferencePlane {
+            data,
+            width: self.width,
+            height: self.height,
+            stride: self.stride,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -467,11 +1248,12 @@ struct TileParserConfig {
     frame_mis: (usize, usize),
     segmentation: SegmentationParams,
     segment_map_reset: bool,
+    accumulate_counts: bool,
 }
 
 struct TileParseShared<'a, 'f, 'r> {
     probabilities: &'a FrameContext,
-    counts: &'a mut SyntaxCounts,
+    counts: *mut SyntaxCounts,
     contexts: &'a mut TileModeContexts,
     current_frame: &'a mut CurrentFrameMut<'f>,
     reference_frames: Option<ReferenceFrames<'r>>,
@@ -517,6 +1299,7 @@ fn parse_tile(
         decoder,
         probabilities,
         counts,
+        accumulate_counts: config.accumulate_counts,
         contexts,
         tx_mode: config.tx_mode,
         frame_is_intra: config.frame_is_intra,
@@ -570,7 +1353,8 @@ fn parse_tile(
 struct TileParser<'a, 'b, 'r> {
     decoder: BoolDecoder<'a>,
     probabilities: &'b FrameContext,
-    counts: &'b mut SyntaxCounts,
+    counts: *mut SyntaxCounts,
+    accumulate_counts: bool,
     contexts: &'b mut TileModeContexts,
     tx_mode: TxMode,
     frame_is_intra: bool,
@@ -597,6 +1381,14 @@ struct TileParser<'a, 'b, 'r> {
     intra: IntraPredictionBuffers,
     residual: ResidualBuffers,
     interp_buffer: InterpBuffer,
+}
+
+macro_rules! increment_syntax_count {
+    ($parser:expr, $($field:tt)+) => {{
+        if let Some(counts) = $parser.counts_mut()? {
+            increment_count(&mut counts.$($field)+);
+        }
+    }};
 }
 
 struct IntraPredictionBuffers {
@@ -731,6 +1523,21 @@ impl IntraPredictionEdges {
 }
 
 impl TileParser<'_, '_, '_> {
+    fn counts_mut(&mut self) -> Result<Option<&mut SyntaxCounts>, TileSyntaxError> {
+        if !self.accumulate_counts {
+            return Ok(None);
+        }
+        if self.counts.is_null() {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        // SAFETY: When accumulation is enabled, serial decode passes the
+        // decoder's single counts object and parallel decode passes either the
+        // coordinator's object (for coordinator-owned bands) or this worker's
+        // disjoint workspace slot.  &mut self guarantees one transient mutable
+        // access at a time within the parser.
+        Ok(Some(unsafe { &mut *self.counts }))
+    }
+
     fn decode_partition(
         &mut self,
         row: usize,
@@ -819,7 +1626,7 @@ impl TileParser<'_, '_, '_> {
         };
 
         let partition = PartitionType::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-        increment_count(&mut self.counts.counts_partition[ctx][partition.index()]);
+        increment_syntax_count!(self, counts_partition[ctx][partition.index()]);
         Ok(partition)
     }
 
@@ -1052,7 +1859,7 @@ impl TileParser<'_, '_, '_> {
         let is_inter = self
             .decoder
             .read_bool(self.probabilities.is_inter_prob[ctx])?;
-        increment_count(&mut self.counts.counts_is_inter[ctx][bool_index(is_inter)]);
+        increment_syntax_count!(self, counts_is_inter[ctx][bool_index(is_inter)]);
         Ok(is_inter)
     }
 
@@ -1279,7 +2086,7 @@ impl TileParser<'_, '_, '_> {
             .contexts
             .skip_context(self.left_row_base, row, col, avail_u, avail_l)?;
         let skip = self.decoder.read_bool(self.probabilities.skip_prob[ctx])?;
-        increment_count(&mut self.counts.counts_skip[ctx][bool_index(skip)]);
+        increment_syntax_count!(self, counts_skip[ctx][bool_index(skip)]);
         Ok(skip)
     }
 
@@ -1310,8 +2117,9 @@ impl TileParser<'_, '_, '_> {
                 TxSize::Tx4x4 => 0,
             };
             let tx_size = TxSize::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-            increment_count(
-                &mut self.counts.counts_tx_size[max_tx_size.index()][ctx][tx_size.index()],
+            increment_syntax_count!(
+                self,
+                counts_tx_size[max_tx_size.index()][ctx][tx_size.index()]
             );
             Ok(tx_size)
         } else {
@@ -1446,7 +2254,7 @@ impl TileParser<'_, '_, '_> {
             .ok_or(TileSyntaxError::InvalidBitstream)?;
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
         let mode = IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-        increment_count(&mut self.counts.counts_intra_mode[ctx][mode.index()]);
+        increment_syntax_count!(self, counts_intra_mode[ctx][mode.index()]);
         Ok(mode)
     }
 
@@ -1460,7 +2268,7 @@ impl TileParser<'_, '_, '_> {
         let probs = &self.probabilities.uv_mode_probs[y_mode.index()];
         let raw = self.decoder.read_tree(&INTRA_MODE_TREE, probs)?;
         let mode = IntraMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-        increment_count(&mut self.counts.counts_uv_mode[y_mode.index()][mode.index()]);
+        increment_syntax_count!(self, counts_uv_mode[y_mode.index()][mode.index()]);
         Ok(mode)
     }
 
@@ -1486,7 +2294,7 @@ impl TileParser<'_, '_, '_> {
             let compound = self
                 .decoder
                 .read_bool(self.probabilities.comp_mode_prob[ctx])?;
-            increment_count(&mut self.counts.counts_comp_mode[ctx][bool_index(compound)]);
+            increment_syntax_count!(self, counts_comp_mode[ctx][bool_index(compound)]);
             if compound {
                 return self.read_compound_ref_frames(left, above, avail_l, avail_u);
             }
@@ -1498,13 +2306,13 @@ impl TileParser<'_, '_, '_> {
         let single_ref_p1 = self
             .decoder
             .read_bool(self.probabilities.single_ref_prob[ctx][0])?;
-        increment_count(&mut self.counts.counts_single_ref[ctx][0][bool_index(single_ref_p1)]);
+        increment_syntax_count!(self, counts_single_ref[ctx][0][bool_index(single_ref_p1)]);
         let ref_frame = if single_ref_p1 {
             let ctx = single_ref_p2_context(left, above, avail_l, avail_u);
             let single_ref_p2 = self
                 .decoder
                 .read_bool(self.probabilities.single_ref_prob[ctx][1])?;
-            increment_count(&mut self.counts.counts_single_ref[ctx][1][bool_index(single_ref_p2)]);
+            increment_syntax_count!(self, counts_single_ref[ctx][1][bool_index(single_ref_p2)]);
             if single_ref_p2 {
                 ALTREF_FRAME
             } else {
@@ -1538,7 +2346,7 @@ impl TileParser<'_, '_, '_> {
             self.decoder
                 .read_bool(self.probabilities.comp_ref_prob[ctx])?,
         );
-        increment_count(&mut self.counts.counts_comp_ref[ctx][comp_ref]);
+        increment_syntax_count!(self, counts_comp_ref[ctx][comp_ref]);
         let fixed_ref = reference_frame_raw(compound.comp_fixed_ref);
         let variable_ref = reference_frame_raw(compound.comp_var_ref[comp_ref]);
         let fixed_index = usize::from(self.sign_bias(fixed_ref)?);
@@ -1599,7 +2407,7 @@ impl TileParser<'_, '_, '_> {
             .ok_or(TileSyntaxError::InvalidBitstream)?;
         let raw = self.decoder.read_tree(&INTER_MODE_TREE, probs)?;
         let mode = InterMode::from_raw(raw).ok_or(TileSyntaxError::InvalidBitstream)?;
-        increment_count(&mut self.counts.counts_inter_mode[ctx][mode.index()]);
+        increment_syntax_count!(self, counts_inter_mode[ctx][mode.index()]);
         Ok(mode)
     }
 
@@ -1644,8 +2452,9 @@ impl TileParser<'_, '_, '_> {
                 if filter_index >= SWITCHABLE_FILTERS {
                     return Err(TileSyntaxError::InvalidBitstream);
                 }
-                increment_count(
-                    &mut self.counts.counts_interp_filter[usize::from(ctx)][filter_index],
+                increment_syntax_count!(
+                    self,
+                    counts_interp_filter[usize::from(ctx)][filter_index]
                 );
                 Ok(filter)
             }
@@ -1676,7 +2485,7 @@ impl TileParser<'_, '_, '_> {
         let joint = self
             .decoder
             .read_tree(&MV_JOINT_TREE, &self.probabilities.mv_probs.joint)?;
-        increment_count(&mut self.counts.counts_mv_joint[usize::from(joint)]);
+        increment_syntax_count!(self, counts_mv_joint[usize::from(joint)]);
         let mut diff_row = 0i32;
         let mut diff_col = 0i32;
         if matches!(joint, 2 | 3) {
@@ -1692,23 +2501,23 @@ impl TileParser<'_, '_, '_> {
     fn read_mv_component(&mut self, comp: usize, use_hp: bool) -> Result<i32, TileSyntaxError> {
         let probs = &self.probabilities.mv_probs;
         let sign = self.decoder.read_bool(probs.sign[comp])?;
-        increment_count(&mut self.counts.counts_mv_sign[comp][bool_index(sign)]);
+        increment_syntax_count!(self, counts_mv_sign[comp][bool_index(sign)]);
         let mv_class = usize::from(self.decoder.read_tree(&MV_CLASS_TREE, &probs.class[comp])?);
-        increment_count(&mut self.counts.counts_mv_class[comp][mv_class]);
+        increment_syntax_count!(self, counts_mv_class[comp][mv_class]);
         let mag = if mv_class == 0 {
             let class0_bit = usize::from(self.decoder.read_bool(probs.class0_bit[comp])?);
-            increment_count(&mut self.counts.counts_mv_class0_bit[comp][class0_bit]);
+            increment_syntax_count!(self, counts_mv_class0_bit[comp][class0_bit]);
             let class0_fr = usize::from(
                 self.decoder
                     .read_tree(&MV_FR_TREE, &probs.class0_fr[comp][class0_bit])?,
             );
-            increment_count(&mut self.counts.counts_mv_class0_fr[comp][class0_bit][class0_fr]);
+            increment_syntax_count!(self, counts_mv_class0_fr[comp][class0_bit][class0_fr]);
             let class0_hp = if use_hp {
                 usize::from(self.decoder.read_bool(probs.class0_hp[comp])?)
             } else {
                 1
             };
-            increment_count(&mut self.counts.counts_mv_class0_hp[comp][class0_hp]);
+            increment_syntax_count!(self, counts_mv_class0_hp[comp][class0_hp]);
             ((class0_bit << 3) | (class0_fr << 1) | class0_hp) + 1
         } else {
             let mut d = 0usize;
@@ -1717,19 +2526,19 @@ impl TileParser<'_, '_, '_> {
                     return Err(TileSyntaxError::InvalidBitstream);
                 }
                 let mv_bit = self.decoder.read_bool(probs.bits[comp][i])?;
-                increment_count(&mut self.counts.counts_mv_bits[comp][i][bool_index(mv_bit)]);
+                increment_syntax_count!(self, counts_mv_bits[comp][i][bool_index(mv_bit)]);
                 if mv_bit {
                     d |= 1usize << i;
                 }
             }
             let mv_fr = usize::from(self.decoder.read_tree(&MV_FR_TREE, &probs.fr[comp])?);
-            increment_count(&mut self.counts.counts_mv_fr[comp][mv_fr]);
+            increment_syntax_count!(self, counts_mv_fr[comp][mv_fr]);
             let mv_hp = if use_hp {
                 usize::from(self.decoder.read_bool(probs.hp[comp])?)
             } else {
                 1
             };
-            increment_count(&mut self.counts.counts_mv_hp[comp][mv_hp]);
+            increment_syntax_count!(self, counts_mv_hp[comp][mv_hp]);
             (CLASS0_SIZE << (mv_class + 2)) + ((d << 3) | (mv_fr << 1) | mv_hp) + 1
         };
         let mag = i32::try_from(mag).map_err(|_| TileSyntaxError::InvalidBitstream)?;
@@ -2521,9 +3330,8 @@ impl TileParser<'_, '_, '_> {
         let ac_quant = self
             .dequant
             .get_ac_quant_for_segment(plane, block.segment_id);
-        let counts = &mut *self.counts;
-        let counts_more_coefs = &mut counts.counts_more_coefs[tx_index][plane_type][ref_type];
-        let counts_token = &mut counts.counts_token[tx_index][plane_type][ref_type];
+        let counts = self.counts;
+        let accumulate_counts = self.accumulate_counts;
         let decoder = &mut self.decoder;
         let residual = &mut self.residual;
         residual.clear_dequantized_dirty();
@@ -2552,13 +3360,22 @@ impl TileParser<'_, '_, '_> {
                     && !read_more_coefs(
                         decoder,
                         probability_row,
-                        &mut counts_more_coefs[band][ctx],
+                        syntax_counts_from_raw(accumulate_counts, counts)?.map(|counts| {
+                            &mut counts.counts_more_coefs[tx_index][plane_type][ref_type][band]
+                                [ctx]
+                        }),
                     )?
                 {
                     break;
                 }
 
-                let token = read_token(decoder, probability_row, &mut counts_token[band][ctx])?;
+                let token = read_token(
+                    decoder,
+                    probability_row,
+                    syntax_counts_from_raw(accumulate_counts, counts)?.map(|counts| {
+                        &mut counts.counts_token[tx_index][plane_type][ref_type][band][ctx]
+                    }),
+                )?;
                 token_cache[pos] = ENERGY_CLASS[token.index()];
                 if token == CoefToken::Zero {
                     check_eob = false;
@@ -2966,6 +3783,23 @@ const fn bool_index(value: bool) -> usize {
 
 fn increment_count(count: &mut u32) {
     *count = count.saturating_add(1);
+}
+
+fn syntax_counts_from_raw<'a>(
+    accumulate_counts: bool,
+    counts: *mut SyntaxCounts,
+) -> Result<Option<&'a mut SyntaxCounts>, TileSyntaxError> {
+    if !accumulate_counts {
+        return Ok(None);
+    }
+    if counts.is_null() {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+    // SAFETY: The caller passes the parser/job-local counts pointer.  Parallel
+    // jobs use disjoint worker slots and the coordinator uses its own counts;
+    // callers immediately project the returned reference to one counter row
+    // and do not keep overlapping mutable references alive.
+    Ok(Some(unsafe { &mut *counts }))
 }
 
 fn row_offset(left_row_base: usize, row: usize) -> Result<usize, TileSyntaxError> {
@@ -3717,6 +4551,8 @@ mod test_support {
             width: LOOP_FILTER_TEST_WIDTH,
             height: LOOP_FILTER_TEST_HEIGHT,
             stride: LOOP_FILTER_TEST_STRIDE,
+            band_x_start: 0,
+            band_x_end: LOOP_FILTER_TEST_WIDTH,
         };
         loop_filter_segment(
             &mut plane,
@@ -3973,6 +4809,8 @@ mod tests {
         let layout = parse_tile_layout(&frame, &header).unwrap();
         let compressed_header = CompressedHeader::intra(TxMode::Only4x4);
         let mut counts = SyntaxCounts::default();
+        let mut worker_counts: [SyntaxCounts; WORKER_COUNT] =
+            core::array::from_fn(|_| SyntaxCounts::default());
         let mut current_frame_storage = TestCurrentFrame::new(16, 16);
         let mut current_frame = current_frame_storage.as_current_frame();
 
@@ -3985,11 +4823,112 @@ mod tests {
                 &layout,
                 TileParseBuffers::new(
                     &mut counts,
+                    &mut worker_counts,
                     FrameModeBuffers::current(None),
                     &mut current_frame,
                 ),
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn current_frame_band_views_reject_cross_band_luma_and_chroma_access() {
+        let mut current_frame_storage = TestCurrentFrame::new(16, 16);
+        let mut current_frame = current_frame_storage.as_current_frame();
+        let raw = current_frame.raw_parts();
+
+        // SAFETY: The test constructs a single band view and does not use the
+        // original full view while the band view is live.
+        let mut band = unsafe {
+            CurrentFrameMut::from_band_raw(CurrentFrameBandRaw {
+                frame: raw,
+                mi_col_start: 0,
+                mi_col_end: 1,
+            })
+        }
+        .unwrap();
+
+        assert_eq!(band.y.sample_clamped(0, 0), Ok(128));
+        assert_eq!(band.y.set_visible(7, 0, 17), Ok(()));
+        assert_eq!(
+            band.y.sample_clamped(8, 0),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+        assert_eq!(
+            band.y.set_visible(8, 0, 19),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+
+        assert_eq!(band.u.sample_clamped(0, 0), Ok(128));
+        assert_eq!(band.u.set_visible(3, 0, 23), Ok(()));
+        assert_eq!(
+            band.u.sample_clamped(4, 0),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+        assert_eq!(
+            band.u.set_visible(4, 0, 29),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+    }
+
+    #[test]
+    fn current_frame_last_band_extends_to_plane_edge() {
+        let mut y = [128u8; 18 * 8];
+        let mut u = [128u8; 9 * 4];
+        let mut v = [128u8; 9 * 4];
+        let y_shape = crate::PlaneShape::new(18, 8, 18);
+        let uv_shape = crate::PlaneShape::new(9, 4, 9);
+        let mut current_frame = CurrentFrameMut::new(
+            CurrentPlaneMut::new(&mut y, y_shape).unwrap(),
+            CurrentPlaneMut::new(&mut u, uv_shape).unwrap(),
+            CurrentPlaneMut::new(&mut v, uv_shape).unwrap(),
+        );
+        let raw = current_frame.raw_parts();
+
+        // SAFETY: The test constructs only the last band view from the raw
+        // full-frame parts and does not use the original view concurrently.
+        let band = unsafe {
+            CurrentFrameMut::from_band_raw(CurrentFrameBandRaw {
+                frame: raw,
+                mi_col_start: 2,
+                mi_col_end: 3,
+            })
+        }
+        .unwrap();
+
+        assert_eq!(band.y.sample_clamped(100, 0), Ok(128));
+        assert_eq!(band.u.sample_clamped(100, 0), Ok(128));
+        assert_eq!(
+            band.y.sample_clamped(15, 0),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+        assert_eq!(
+            band.u.sample_clamped(7, 0),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+    }
+
+    #[test]
+    fn mode_grid_band_view_rejects_out_of_band_indices() {
+        let mut bytes = [0u8; 8 * STORED_MODE_INFO_BYTES];
+        let mut modes = ModeInfoViewMut::new(&mut bytes).unwrap();
+        let raw = modes.raw_parts();
+
+        // SAFETY: This test creates one mutable band view and does not use the
+        // original full-grid view while it is live.
+        let mut band = unsafe { ModeInfoViewMut::from_raw_band(raw, 4, 1, 3) }.unwrap();
+        let encoded = [0u8; STORED_MODE_INFO_BYTES];
+
+        assert_eq!(band.set_encoded(1, &encoded), Ok(()));
+        assert_eq!(band.set_encoded(6, &encoded), Ok(()));
+        assert_eq!(
+            band.set_encoded(0, &encoded),
+            Err(TileSyntaxError::InvalidBitstream)
+        );
+        assert_eq!(
+            band.as_view().segment_map_id(3),
+            Err(TileSyntaxError::InvalidBitstream)
         );
     }
 
@@ -4011,7 +4950,8 @@ mod tests {
             let mut parser = TileParser {
                 decoder,
                 probabilities: &probabilities,
-                counts: &mut counts,
+                counts: &mut counts as *mut SyntaxCounts,
+                accumulate_counts: true,
                 contexts: &mut contexts,
                 tx_mode: TxMode::Only4x4,
                 frame_is_intra: true,

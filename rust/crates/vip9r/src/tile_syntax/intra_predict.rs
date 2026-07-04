@@ -102,6 +102,7 @@ pub(super) fn store_intra_edge_plane_row(
     if plane.width == 0 || plane.height == 0 || y >= plane.height || end_x > plane.width {
         return Ok(false);
     }
+    plane.check_band_span(start_x, len)?;
 
     let start = y
         .checked_mul(plane.stride)
@@ -706,6 +707,7 @@ pub(super) fn intra_prediction_row_mut<'a>(
         return Ok(None);
     }
     let visible_width = core::cmp::min(width, plane.width - x);
+    plane.check_band_span(x, visible_width)?;
     let start = y
         .checked_mul(plane.stride)
         .and_then(|row| row.checked_add(x))
@@ -946,6 +948,8 @@ mod tests {
                                 width: 40,
                                 height: HEIGHT,
                                 stride: STRIDE,
+                                band_x_start: 0,
+                                band_x_end: 40,
                             };
                             write_prediction_block_scalar(
                                 &mut scalar_plane,
@@ -962,6 +966,8 @@ mod tests {
                                 width: 40,
                                 height: HEIGHT,
                                 stride: STRIDE,
+                                band_x_start: 0,
+                                band_x_end: 40,
                             };
                             assert!(
                                 write_common_intra_prediction_direct(
