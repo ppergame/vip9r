@@ -23,8 +23,7 @@ ALL_EXCLUDE = {
     "youtube/yUsYZ75JSw0/yUsYZ75JSw0-f302-720p60-vp9-rawprefix-0000-2000.webm",
 }
 RUNNER = REPO_ROOT / "js/dist/wasm-driver/golden.js"
-TARGET_DIR = REPO_ROOT / "rust/target/wasm-release"
-WASM = TARGET_DIR / "wasm32-unknown-unknown/release/vip9r.wasm"
+WASM = REPO_ROOT / "rust/target/wasm32-unknown-unknown/release/vip9r.wasm"
 
 # Every md5-backed corpus file except the movie/VOD perf clips (estimated
 # >70s decode each on the host; everything here finishes in well under a
@@ -368,7 +367,6 @@ def build_wasm() -> None:
         [
             "cargo", "build", "--quiet",
             "--manifest-path", str(REPO_ROOT / "rust/Cargo.toml"),
-            "--target-dir", str(TARGET_DIR),
             "--target", "wasm32-unknown-unknown",
             "-p", "vip9r", "--release",
         ],

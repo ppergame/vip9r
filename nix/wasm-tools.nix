@@ -26,14 +26,13 @@
         echo "could not find vip9r Cargo workspace from $git_root" >&2
         exit 2
       fi
-
-      # The default and wasm-tests feature builds produce the same cdylib name.
-      # Keep their Cargo caches separate so alternating wrappers does not rebuild.
-      target_base="$rust_root/target"
     }
 
-    select_wasm_target_dir() {
-      target_dir="$target_base/$1"
+    select_wasm_tests_target_dir() {
+      # The default and wasm-tests feature builds produce the same cdylib name.
+      # Keep the feature build separate from the ambient release artifact used
+      # by the web dev server and golden/perf wrappers.
+      target_dir="$rust_root/target/wasm-tests"
       wasm_path="$target_dir/wasm32-unknown-unknown/release/vip9r.wasm"
     }
 
@@ -61,7 +60,7 @@ in {
 
       ${common}
       locate_project
-      select_wasm_target_dir wasm-tests
+      select_wasm_tests_target_dir
       runner="$project_root/js/dist/wasm-driver/tests.js"
       require_runner "$runner"
 
@@ -88,7 +87,7 @@ in {
 
       ${common}
       locate_project
-      select_wasm_target_dir wasm-release
+      wasm_path="$rust_root/target/wasm32-unknown-unknown/release/vip9r.wasm"
       runner="$project_root/js/dist/wasm-driver/microbench.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
@@ -97,8 +96,7 @@ in {
 
       # cd: cargo resolves .cargo/config.toml (target-feature flags) from cwd,
       # not --manifest-path.
-      (cd "$rust_root" && cargo build --target-dir "$target_dir" \
-        --target wasm32-unknown-unknown -p vip9r --release)
+      (cd "$rust_root" && cargo build --target wasm32-unknown-unknown -p vip9r --release)
       exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };
@@ -118,7 +116,7 @@ in {
 
       ${common}
       locate_project
-      select_wasm_target_dir wasm-release
+      wasm_path="$rust_root/target/wasm32-unknown-unknown/release/vip9r.wasm"
       runner="$project_root/js/dist/wasm-driver/golden.js"
       require_runner "$runner"
       if [[ "$show_help" -eq 1 ]]; then
@@ -127,8 +125,7 @@ in {
 
       # cd: cargo resolves .cargo/config.toml (target-feature flags) from cwd,
       # not --manifest-path.
-      (cd "$rust_root" && cargo build --target-dir "$target_dir" \
-        --target wasm32-unknown-unknown -p vip9r --release)
+      (cd "$rust_root" && cargo build --target wasm32-unknown-unknown -p vip9r --release)
       exec "${v8.linux64}/d8" --no-liftoff --module "$runner" -- "$wasm_path" "$@"
     '';
   };

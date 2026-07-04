@@ -306,15 +306,12 @@ def build_candidate(tests: bool) -> Path:
 
 def build_release_candidate() -> Path:
     rust_root = locate_rust_workspace()
-    target_dir = rust_root / "target/wasm-release"
-    wasm_path = target_dir / "wasm32-unknown-unknown/release/vip9r.wasm"
+    wasm_path = rust_root / "target/wasm32-unknown-unknown/release/vip9r.wasm"
     cmd = [
         "cargo",
         "build",
         "--manifest-path",
         str(rust_root / "Cargo.toml"),
-        "--target-dir",
-        str(target_dir),
         "--target",
         "wasm32-unknown-unknown",
         "-p",
