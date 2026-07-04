@@ -7,7 +7,7 @@
 
 import { COORDINATOR_STACK_TOP, MIN_HEAP_BASE, WORKER_STACK_TOPS } from "../wasm-driver/stack-layout";
 import { formatWasmLog, makeVip9rImports } from "../wasm-driver/wasm-env";
-import type { PoolWorkerInit } from "./pool";
+import type { PoolWorkerEvent, PoolWorkerInit } from "./pool";
 
 self.onmessage = (event: MessageEvent<PoolWorkerInit>) => {
   const { module, memory, workerIndex } = event.data;
@@ -28,5 +28,10 @@ self.onmessage = (event: MessageEvent<PoolWorkerInit>) => {
     throw new Error(`__heap_base ${heapBase.value} below the worker stack region (--global-base missing?)`);
   }
   stackPointer.value = WORKER_STACK_TOPS[workerIndex];
+  post({ type: "ready", workerIndex });
   (instance.exports.vip9r_worker_main as (workerIndex: number) => never)(workerIndex);
 };
+
+function post(event: PoolWorkerEvent): void {
+  self.postMessage(event);
+}

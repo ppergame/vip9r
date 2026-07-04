@@ -2,7 +2,7 @@ import { Vp9Decoder } from "../wasm";
 import type { NativeFrame } from "../wasm";
 import { parseVp9Input } from "../wasm-driver/golden";
 import { packetTimestampUs } from "./media-time";
-import { spawnWorkerPool } from "./pool";
+import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
 
 export type WorkerInit = {
@@ -90,16 +90,10 @@ async function decodeAll(media: ArrayBuffer): Promise<void> {
   const { instance, module, memory } = await instantiateVip9r(input, (message) =>
     post({ type: "log", message, error: true }),
   );
-  // Tile workers park in the shared memory's pool; decode stays serial until
-  // tile-parallel dispatch lands, but spawning here exercises the nested-
-  // worker spawn and shadow-stack rebind path on every playback. The pool
-  // dies with this worker.
-  spawnWorkerPool(module, memory, (message) => post({ type: "log", message, error: true }));
-  const activatePool = instance.exports.vip9r_pool_activate;
-  if (typeof activatePool !== "function") {
-    throw new Error("missing wasm export: vip9r_pool_activate");
-  }
-  activatePool();
+  // The pool dies with this worker.
+  await activateWorkerPool(instance, module, memory, (message) =>
+    post({ type: "log", message, error: true }),
+  );
   const decoder = new Vp9Decoder(instance, input.width, input.height);
 
   let frames = 0;

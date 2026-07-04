@@ -7,6 +7,7 @@ import type { NativeFrame } from "../wasm";
 import { parseVp9Input } from "../wasm-driver/golden";
 import type { DemuxedVp9, Vp9Packet } from "../wasm-driver/golden";
 import { packetTimestampUs } from "./media-time";
+import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
 
 export type BenchLane = "vip9r" | "wc-sw" | "wc-hw";
@@ -88,7 +89,11 @@ type Vip9rPassStats = {
 };
 
 async function vip9rLane(input: DemuxedVp9, packets: Vp9Packet[]): Promise<LaneResult> {
-  const { instance, memory } = await instantiateVip9r(input, (message) =>
+  const { instance, module, memory } = await instantiateVip9r(input, (message) =>
+    post({ type: "log", message, error: true }),
+  );
+  // Tile-parallel like playback, so the lane measures what the player runs.
+  const pool = await activateWorkerPool(instance, module, memory, (message) =>
     post({ type: "log", message, error: true }),
   );
   const decoder = new Vp9Decoder(instance, input.width, input.height);
@@ -98,6 +103,9 @@ async function vip9rLane(input: DemuxedVp9, packets: Vp9Packet[]): Promise<LaneR
   const before = performance.now();
   const stats = vip9rPass(decoder, memory, input, packets);
   const wallMs = performance.now() - before;
+  // Idle pool workers cost nothing, but the WebCodecs lanes should not share
+  // the process with three parked threads holding the wasm memory alive.
+  pool.terminate();
   return { lane: "vip9r", wallMs, ...stats };
 }
 
