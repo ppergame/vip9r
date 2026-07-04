@@ -78,6 +78,7 @@ const framesInput = el<HTMLInputElement>("frames");
 const logPane = el<HTMLDivElement>("log");
 
 function log(message: string, kind: "info" | "error" = "info"): void {
+  (kind === "error" ? console.error : console.log)(message);
   const line = document.createElement("div");
   line.textContent = `${new Date().toISOString().slice(11, 19)} ${message}`;
   if (kind === "error") {
@@ -235,8 +236,9 @@ async function startBenchRun(): Promise<void> {
 }
 
 async function bootWasmCheck(): Promise<void> {
-  const { instance } = await instantiateVip9r({ width: 1280, height: 720 }, (message) =>
-    log(message, "error"),
+  const { instance } = await instantiateVip9r(
+    { width: 1280, height: 720 },
+    (message) => log(message, "error"),
   );
   new Vp9Decoder(instance, 1280, 720);
   log(`wasm ok: ${wasmUrl.split("/").pop()}`);

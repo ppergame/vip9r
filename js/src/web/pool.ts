@@ -34,6 +34,12 @@ export async function activateWorkerPool(
   memory: WebAssembly.Memory,
   onError: (message: string) => void,
 ): Promise<WorkerPool> {
+  if (!sharedMemoryTransferable(memory)) {
+    onError(
+      "worker pool disabled: shared memory transfer blocked; decoding single-threaded",
+    );
+    return { ready: Promise.resolve(), terminate() {} };
+  }
   const pool = spawnWorkerPool(module, memory, onError);
   await pool.ready;
   const activate = instance.exports.vip9r_pool_activate;
@@ -42,6 +48,24 @@ export async function activateWorkerPool(
   }
   activate();
   return pool;
+}
+
+// Whether shared memory survives postMessage cannot be predicted from
+// self.crossOriginIsolated: Cobalt launched with
+// --enable-blink-features=SharedArrayBuffer transfers fine while
+// crossOriginIsolated stays false. Probe the actual serializer gate with a
+// throwaway channel — same Blink check the worker postMessage would hit.
+function sharedMemoryTransferable(memory: WebAssembly.Memory): boolean {
+  const channel = new MessageChannel();
+  try {
+    channel.port1.postMessage(memory);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    channel.port1.close();
+    channel.port2.close();
+  }
 }
 
 // The coordinator instance must be instantiated to completion before this is
