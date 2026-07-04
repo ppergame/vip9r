@@ -1,6 +1,7 @@
 use super::*;
 
 use core::arch::wasm32::*;
+use core::sync::atomic::AtomicU32;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LoopFilterConfig<'a> {
@@ -109,25 +110,226 @@ pub(super) fn loop_filter_frame(
     };
     let strengths = loop_filter_strength_lut(config.params, config.segmentation)?;
 
-    let mut row = 0usize;
-    while row < config.mi_rows {
-        let mut col = 0usize;
-        while col < config.mi_cols {
-            let sb_info = loop_filter_superblock_info(config, &strengths, row, col)?;
-            for plane in 0..PLANES {
-                for pass in 0..2 {
-                    loop_filter_superblock(current_frame, config, &sb_info, plane, pass, row, col)?;
-                }
-            }
-            col = col
-                .checked_add(MI_BLOCK_64)
-                .ok_or(TileSyntaxError::InvalidBitstream)?;
-        }
-        row = row
-            .checked_add(MI_BLOCK_64)
-            .ok_or(TileSyntaxError::InvalidBitstream)?;
+    let sb_rows = config.mi_rows.div_ceil(MI_BLOCK_64);
+    let sb_cols = config.mi_cols.div_ceil(MI_BLOCK_64);
+    if pool::is_active() && (2..=MAX_WAVEFRONT_SB_ROWS).contains(&sb_rows) {
+        return loop_filter_frame_wavefront(config, &strengths, current_frame, sb_rows, sb_cols);
     }
 
+    for sb_row in 0..sb_rows {
+        for sb_col in 0..sb_cols {
+            loop_filter_superblock_all(
+                current_frame,
+                config,
+                &strengths,
+                sb_row * MI_BLOCK_64,
+                sb_col * MI_BLOCK_64,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn loop_filter_superblock_all(
+    current_frame: &mut CurrentFrameMut<'_>,
+    config: LoopFilterConfig<'_>,
+    strengths: &LoopFilterStrengthLut,
+    row: usize,
+    col: usize,
+) -> Result<(), TileSyntaxError> {
+    let sb_info = loop_filter_superblock_info(config, strengths, row, col)?;
+    for plane in 0..PLANES {
+        for pass in 0..2 {
+            loop_filter_superblock(current_frame, config, &sb_info, plane, pass, row, col)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SB-row wavefront
+//
+// Filtering superblock (r, c) touches only its own 64x64 extent plus an
+// 8-pixel apron into the left and above neighbors (edge-0 filters write up
+// to 7 and read up to 8 samples across the boundary; nothing reaches right
+// of or below the superblock). In-row order makes the left apron safe. The
+// above apron overlaps the *left apron of the above-right neighbor*: the
+// vertical edge-0 filter of (r-1, c+1) writes into the bottom-right corner
+// pixels of (r-1, c) that the horizontal edge-0 filter of (r, c) reads and
+// writes. Hence the wavefront lag: row r may filter column c once row r-1
+// has completed column c+1. Under that constraint every reorderable
+// superblock pair has disjoint touch windows, so the schedule is bit-exact
+// against serial raster order, and simultaneously active windows never
+// alias (the containment `check_window_rect` in `loop_filter_segment`
+// verifies each segment stays inside its window).
+
+/// VP9 frame dimensions cap at 2^16, so 65536 / 64 superblock rows bound the
+/// watermark table. Larger (malformed) frames fall back to serial filtering.
+const MAX_WAVEFRONT_SB_ROWS: usize = 1024;
+
+/// Wavefront participants: the coordinator plus every pool worker.
+/// Participant p owns superblock rows p, p + 4, p + 8, ...
+const LOOP_FILTER_PARTICIPANTS: usize = WORKER_COUNT + 1;
+
+/// Everything a wavefront participant needs. Lives on the coordinator's
+/// stack from before dispatch until after join; jobs carry a pointer to it.
+/// `watermarks[r]` counts fully filtered superblocks of row r; participants
+/// publish with Release stores and wait with Acquire loads, which also
+/// carries the filtered pixels of the row above.
+pub(super) struct LoopFilterWave<'a> {
+    config: LoopFilterConfig<'a>,
+    strengths: &'a LoopFilterStrengthLut,
+    current_frame: CurrentFrameRaw,
+    sb_rows: usize,
+    sb_cols: usize,
+    watermarks: &'a [AtomicU32],
+}
+
+/// One wavefront participant's job. Pointers are usize-erased because job
+/// slots are statics: `wave` targets the coordinator's stack-resident
+/// LoopFilterWave, `result` the coordinator's stack-resident result cell.
+#[derive(Clone, Copy)]
+pub(crate) struct LoopFilterJob {
+    wave: usize,
+    participant: usize,
+    result: usize,
+}
+
+/// A filtering failure tagged with the raster index of the superblock it is
+/// attributed to; error selection across participants takes the lowest index
+/// to match serial filtering's first-failure reporting.
+#[derive(Clone, Copy)]
+struct LoopFilterBandError {
+    sb_index: usize,
+    error: TileSyntaxError,
+}
+
+type LoopFilterBandResult = Result<(), LoopFilterBandError>;
+
+pub(crate) fn run_loop_filter_job(job: LoopFilterJob) {
+    // SAFETY: The wave lives in loop_filter_frame_wavefront's stack frame,
+    // which does not return between dispatch and join.
+    let wave = unsafe { &*(job.wave as *const LoopFilterWave) };
+    let result = loop_filter_band(wave, job.participant);
+    // SAFETY: The result cell is live and slot-disjoint until after join,
+    // exactly like tile job result cells.
+    unsafe {
+        *(job.result as *mut LoopFilterBandResult) = result;
+    }
+}
+
+fn loop_filter_frame_wavefront(
+    config: LoopFilterConfig<'_>,
+    strengths: &LoopFilterStrengthLut,
+    current_frame: &mut CurrentFrameMut<'_>,
+    sb_rows: usize,
+    sb_cols: usize,
+) -> Result<(), TileSyntaxError> {
+    let watermarks = [const { AtomicU32::new(0) }; MAX_WAVEFRONT_SB_ROWS];
+    let wave = LoopFilterWave {
+        config,
+        strengths,
+        current_frame: current_frame.raw_parts(),
+        sb_rows,
+        sb_cols,
+        watermarks: &watermarks[..sb_rows],
+    };
+
+    let mut worker_results: [LoopFilterBandResult; WORKER_COUNT] = [Ok(()); WORKER_COUNT];
+    let mut jobs = [None; WORKER_COUNT];
+    for (worker_index, job) in jobs.iter_mut().enumerate() {
+        *job = Some(pool::Job::LoopFilter(LoopFilterJob {
+            wave: &wave as *const LoopFilterWave as usize,
+            participant: worker_index + 1,
+            result: &mut worker_results[worker_index] as *mut LoopFilterBandResult as usize,
+        }));
+    }
+
+    pool::dispatch(&jobs);
+
+    // No early return between dispatch and join: workers hold pointers into
+    // this frame's stack. The coordinator owns row 0, so filtering starts
+    // before the workers finish waking.
+    let mut best = loop_filter_band(&wave, 0);
+
+    if !pool::join(-1) {
+        return Err(TileSyntaxError::ResourceLimit);
+    }
+
+    for &result in &worker_results {
+        if let Err(new) = result {
+            let earlier = match best {
+                Ok(()) => true,
+                Err(old) => new.sb_index < old.sb_index,
+            };
+            if earlier {
+                best = Err(new);
+            }
+        }
+    }
+    best.map_err(|failure| failure.error)
+}
+
+fn loop_filter_band(wave: &LoopFilterWave<'_>, participant: usize) -> LoopFilterBandResult {
+    // SAFETY: Every participant holds an aliased full-plane view, but all
+    // accesses stay inside the current superblock window (checked per
+    // segment) and simultaneously active windows are disjoint under the
+    // watermark lag; cross-thread visibility rides the watermark
+    // Release/Acquire edges and the pool dispatch/join edges.
+    let mut current_frame = unsafe { CurrentFrameMut::from_raw_windowed(wave.current_frame) };
+
+    let mut failure: LoopFilterBandResult = Ok(());
+    let mut sb_row = participant;
+    while sb_row < wave.sb_rows {
+        for sb_col in 0..wave.sb_cols {
+            if failure.is_err() {
+                break;
+            }
+            let result = match current_frame.as_mut() {
+                Ok(frame) => loop_filter_wavefront_superblock(wave, frame, sb_row, sb_col),
+                Err(error) => Err(*error),
+            };
+            if let Err(error) = result {
+                failure = Err(LoopFilterBandError {
+                    sb_index: sb_row * wave.sb_cols + sb_col,
+                    error,
+                });
+            }
+        }
+        // The row must end fully marked even when filtering failed, or
+        // participants waiting on it would never wake. Dependents of an
+        // abandoned row filter against unfiltered pixels; the error still
+        // fails the frame after join, so the output is never used.
+        pool::watermark_store(&wave.watermarks[sb_row], wave.sb_cols as u32);
+        sb_row += LOOP_FILTER_PARTICIPANTS;
+    }
+    failure
+}
+
+fn loop_filter_wavefront_superblock(
+    wave: &LoopFilterWave<'_>,
+    current_frame: &mut CurrentFrameMut<'_>,
+    sb_row: usize,
+    sb_col: usize,
+) -> Result<(), TileSyntaxError> {
+    if sb_row > 0 {
+        let target = core::cmp::min(
+            sb_col
+                .checked_add(2)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            wave.sb_cols,
+        );
+        pool::watermark_wait_at_least(
+            &wave.watermarks[sb_row - 1],
+            u32::try_from(target).map_err(|_| TileSyntaxError::InvalidBitstream)?,
+        );
+    }
+    let row = sb_row * MI_BLOCK_64;
+    let col = sb_col * MI_BLOCK_64;
+    current_frame.set_superblock_window(row, col)?;
+    loop_filter_superblock_all(current_frame, wave.config, wave.strengths, row, col)?;
+    pool::watermark_store(&wave.watermarks[sb_row], sb_col as u32 + 1);
     Ok(())
 }
 
@@ -611,6 +813,34 @@ pub(super) fn loop_filter_segment(
 ) -> Result<(), TileSyntaxError> {
     if len == 0 {
         return Ok(());
+    }
+
+    // Maximal touch rectangle of this segment, clipped to the plane: the
+    // widest filter reads 8 samples on each side of the edge, and the
+    // clamped fallback path reads 8 regardless of filter size. Checking it
+    // here makes every raw access below in-window; during wavefront
+    // filtering, simultaneously active windows are disjoint by the
+    // watermark lag, so an in-window access can never race.
+    let along_end = core::cmp::min(
+        if pass == 0 { y } else { x }
+            .checked_add(len)
+            .ok_or(TileSyntaxError::InvalidBitstream)?,
+        if pass == 0 { plane.height } else { plane.width },
+    );
+    if pass == 0 {
+        plane.check_window_rect(
+            x.saturating_sub(8),
+            core::cmp::min(x.saturating_add(8), plane.width),
+            y,
+            along_end,
+        )?;
+    } else {
+        plane.check_window_rect(
+            x,
+            along_end,
+            y.saturating_sub(8),
+            core::cmp::min(y.saturating_add(8), plane.height),
+        )?;
     }
 
     if pass == 0 {

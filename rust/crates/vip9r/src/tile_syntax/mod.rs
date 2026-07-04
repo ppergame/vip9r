@@ -27,6 +27,7 @@ use coef::*;
 use inter_predict::*;
 use intra_predict::*;
 use loop_filter::*;
+pub(crate) use loop_filter::{LoopFilterJob, run_loop_filter_job};
 use mode_info::ModeInfoViewMutRaw;
 #[cfg(any(test, feature = "wasm-tests"))]
 pub(crate) use mode_info::STORED_MODE_INFO_BYTES;
@@ -145,6 +146,62 @@ impl<'a> CurrentFrameMut<'a> {
         }
     }
 
+    /// Rebuild a full-frame view from raw parts for a loop-filter wavefront
+    /// participant. The view starts with an empty window; the participant
+    /// must move it onto a superblock via `set_superblock_window` before
+    /// filtering.
+    ///
+    /// # Safety
+    /// Same liveness contract as `from_band_raw`. Aliased full-plane views
+    /// may coexist across threads only under the wavefront protocol: every
+    /// access stays inside the current superblock window (checked in
+    /// `loop_filter_segment`), and the watermark lag keeps simultaneously
+    /// active superblock windows pairwise disjoint.
+    unsafe fn from_raw_windowed(raw: CurrentFrameRaw) -> Result<Self, TileSyntaxError> {
+        // SAFETY: Forwarded caller contract, see above.
+        let mut frame = unsafe { Self::from_band_raw(raw, 0, 0) }?;
+        frame.y.set_window(0, 0, 0, 0);
+        frame.u.set_window(0, 0, 0, 0);
+        frame.v.set_window(0, 0, 0, 0);
+        Ok(frame)
+    }
+
+    /// Move the access window onto the superblock at MI position
+    /// (`row`, `col`), with an 8-pixel margin on every side: edge-0 filters
+    /// reach up to 8 pixels into the left/above neighbors, and the clamped
+    /// fallback path reads up to 8 pixels past the last in-superblock edge.
+    fn set_superblock_window(&mut self, row: usize, col: usize) -> Result<(), TileSyntaxError> {
+        for plane in 0..PLANES {
+            let sub_x = subsampling_x(plane);
+            let sub_y = subsampling_y(plane);
+            let sb_w = 64usize >> sub_x;
+            let sb_h = 64usize >> sub_y;
+            let x0 = col
+                .checked_mul(8)
+                .ok_or(TileSyntaxError::InvalidBitstream)?
+                >> sub_x;
+            let y0 = row
+                .checked_mul(8)
+                .ok_or(TileSyntaxError::InvalidBitstream)?
+                >> sub_y;
+            let plane_view = self.plane_mut(plane)?;
+            let x_end = core::cmp::min(
+                x0.checked_add(sb_w)
+                    .and_then(|end| end.checked_add(8))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                plane_view.width,
+            );
+            let y_end = core::cmp::min(
+                y0.checked_add(sb_h)
+                    .and_then(|end| end.checked_add(8))
+                    .ok_or(TileSyntaxError::InvalidBitstream)?,
+                plane_view.height,
+            );
+            plane_view.set_window(x0.saturating_sub(8), x_end, y0.saturating_sub(8), y_end);
+        }
+        Ok(())
+    }
+
     unsafe fn from_band_raw(
         raw: CurrentFrameRaw,
         mi_col_start: usize,
@@ -179,6 +236,8 @@ pub(crate) struct CurrentPlaneMut<'a> {
     stride: usize,
     band_x_start: usize,
     band_x_end: usize,
+    band_y_start: usize,
+    band_y_end: usize,
 }
 
 impl<'a> CurrentPlaneMut<'a> {
@@ -204,6 +263,8 @@ impl<'a> CurrentPlaneMut<'a> {
             stride: shape.stride,
             band_x_start: 0,
             band_x_end: width,
+            band_y_start: 0,
+            band_y_end: height,
         })
     }
 
@@ -280,7 +341,37 @@ impl<'a> CurrentPlaneMut<'a> {
             stride: raw.stride,
             band_x_start: band.x_start,
             band_x_end,
+            band_y_start: 0,
+            band_y_end: raw.height,
         })
+    }
+
+    fn set_window(&mut self, x_start: usize, x_end: usize, y_start: usize, y_end: usize) {
+        self.band_x_start = x_start;
+        self.band_x_end = x_end;
+        self.band_y_start = y_start;
+        self.band_y_end = y_end;
+    }
+
+    /// Check that the half-open rectangle fits the view's window. The loop
+    /// filter calls this once per segment with the segment's maximal touch
+    /// rectangle, which makes each raw kernel access below it in-window by
+    /// construction.
+    pub(super) fn check_window_rect(
+        &self,
+        x_start: usize,
+        x_end: usize,
+        y_start: usize,
+        y_end: usize,
+    ) -> Result<(), TileSyntaxError> {
+        if x_start < self.band_x_start
+            || x_end > self.band_x_end
+            || y_start < self.band_y_start
+            || y_end > self.band_y_end
+        {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        Ok(())
     }
 
     fn check_band_x(&self, x: usize) -> Result<(), TileSyntaxError> {
@@ -4267,6 +4358,8 @@ mod test_support {
             stride: LOOP_FILTER_TEST_STRIDE,
             band_x_start: 0,
             band_x_end: LOOP_FILTER_TEST_WIDTH,
+            band_y_start: 0,
+            band_y_end: LOOP_FILTER_TEST_HEIGHT,
         };
         loop_filter_segment(
             &mut plane,

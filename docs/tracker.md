@@ -582,8 +582,15 @@ availability/MV search, no cross-tile pixel reads).
       (139.7→63.5 ms/f), BBB −59.7% (104.5→42.0), f247 flag=0 −53.4%
       (132.3→61.7); serial path noise; corpus 339/339 pooled, compliance
       307/307 both modes
-- [ ] loop filter SB-row wavefront: `loop_filter_frame` is the serial remainder
-      after tile parallelism (~10-19% A55); parallelize as its own measured pass
+- [x] loop filter SB-row wavefront: participant-per-SB-row (coordinator + 3
+      workers, rows p, p+4, ...), per-row atomic watermarks with the derived
+      lag rule (row r waits for row r-1 through column c+1), per-SB windowed
+      plane views with segment touch-rect checks; bit-exact by commutation.
+      2026-07-04: landed — A55 pooled jellyfish −28.3% (≈46 ms/f), BBB −14.3%
+      confirm (≈41, first realworld clip at its 40 ms budget), f247 −21.4%
+      (≈50); A55/X4 serial and host serial all noise; corpus 339/339 pooled,
+      compliance 307/307 both modes, wasm tests 100/100. Jellyfish now ~1.4x
+      over budget — matches the reshape-spike arithmetic
 - [x] demo: `VideoFrame` construction from SAB-backed views verified on Chrome
       and Cobalt (user-tested 2026-07-03; vite COOP/COEP headers landed with
       the ABI spike)

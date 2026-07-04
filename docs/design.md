@@ -513,7 +513,36 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     (`error_resilient || frame_parallel_decoding_mode` — the whole
     realworld perf corpus). Visibility rides the pool's Release/Acquire
     edges.
-- Spawn frontends (landed 2026-07-03): the stack-layout ABI constants live
+  - Loop filter SB-row wavefront (landed 2026-07-04). `loop_filter_frame`
+    crosses tile edges by spec, so it parallelizes on its own axis:
+    superblock rows. Filtering SB (r, c) touches only its own 64x64 extent
+    plus an 8-pixel apron into the left and above neighbors (edge-0 filters
+    write ≤7 and read ≤8 samples across the boundary; nothing reaches right
+    of or below the SB). In-row order makes the left apron safe; the above
+    apron overlaps the left apron of the above-right neighbor — the vertical
+    edge-0 filter of (r-1, c+1) writes the bottom-right corner pixels of
+    (r-1, c) that the horizontal edge-0 filter of (r, c) touches. Lag rule:
+    row r may filter column c once row r-1 has completed column c+1
+    (watermark `>= min(c+2, sb_cols)`). Under it, every reorderable SB pair
+    has disjoint touch windows — bit-exact vs serial raster order by
+    commutation, no cross-thread pixel race.
+  - Wavefront mechanics: one pool wave per filtered frame
+    (`Job::LoopFilter`). Participant p of 4 (coordinator = 0, so filtering
+    starts before workers finish waking) owns SB rows p, p+4, ...; per-row
+    `AtomicU32` watermarks (stack array, 1024 rows = the 2^16 dimension cap;
+    larger stays serial) count completed SBs. Producers Release-store +
+    notify per SB; consumers Acquire-load and `memory.atomic.wait32` — the
+    Acquire also publishes the row-above pixels. Containment mirrors the
+    tile bands: each participant's aliased full-plane view carries a per-SB
+    window (SB extent + 8px margin, `set_superblock_window`), and
+    `loop_filter_segment` checks each segment's maximal touch rectangle
+    against it before any raw kernel access, so a reach bug is an
+    `InvalidBitstream` failure instead of a race. A failing participant
+    marks its remaining rows complete without touching pixels (waiters
+    proceed against unfiltered pixels; the error still fails the frame after
+    join, lowest SB raster index wins to match serial reporting). Serial
+    path (pool off, or a single SB row) keeps the same per-SB traversal
+    with a full-plane window. the stack-layout ABI constants live
   in `js/src/wasm-driver/stack-layout.ts`, shared by both spawners. d8:
   `wasm-driver/pool.ts` (string-source worker, constants interpolated); the
   wasm-tests runner spawns + activates for `::pool::` tests. Web:

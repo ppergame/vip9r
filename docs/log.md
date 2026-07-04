@@ -1191,3 +1191,38 @@ streamer cpu0:
   fast-serial big.LITTLE device can be a real pessimization.
 - Suite: wasm tests 100/100 (band-view + pool coverage), compliance corpus
   307/307 pooled and serial, full corpus 339/339 pooled, vitest 43/43.
+
+## 2026-07-04 — M6 threads: loop filter SB-row wavefront
+
+- The loop filter — the serial remainder after tile-parallel decode — now
+  runs as a wavefront over superblock rows on the same worker pool: one wave
+  per filtered frame, participant p of 4 owns SB rows p, p+4, ..., and
+  per-row atomic watermarks order the front. The lag rule is derived from
+  filter reach, not copied: filtering SB (r, c) touches an 8-pixel apron
+  into its left and above neighbors, and the above apron overlaps the left
+  apron of the above-right neighbor, so row r may filter column c once row
+  r-1 has completed column c+1. Under that rule every reorderable pair of
+  superblocks has disjoint touch windows — bit-exact against serial raster
+  order by commutation, and corpus-verified.
+- Containment follows the tile-band philosophy: participants hold aliased
+  full-plane views, but each view carries a per-superblock window (SB extent
+  plus the 8px apron) and `loop_filter_segment` checks every segment's
+  maximal touch rectangle against it before the raw kernel accesses — a
+  reach bug becomes an `InvalidBitstream` failure instead of a data race. A
+  failing participant marks its remaining rows complete without touching
+  pixels, so errors aggregate after join (lowest SB raster index, matching
+  serial reporting) instead of deadlocking the front.
+- A55 streamer (`cpu:0-3`, 0:5 windows, corrected deltas vs tile-parallel
+  baseline f8d54a7): jellyfish −28.3% (≈64.7 → 46.4 ms/frame, spread 3.1%),
+  BBB −14.3% confirm run (47.6 → 40.8 warm, spread 1.8%; first read −11.2%
+  at 4.5% was heat-drifty), f247 flag=0 lane −21.4% (63.2 → 49.7, spread
+  2.3%). Deltas are Amdahl-consistent with the post-tile-parallel loop
+  filter share (~42% jellyfish, ~21% BBB). Host pooled jellyfish −40.9%.
+  Controls: A55 serial −1.6% at 2.3% spread, X4 serial +1.3% at 2.5%, host
+  serial +0.15% — all noise.
+- Budget position: BBB lands at its 40 ms budget — the first realworld 720p
+  clip at budget on the A55. Jellyfish sits ~1.4x over 33.3 ms, matching the
+  arithmetic that gates the decode_residual reshape spike (threads-era
+  profiles next).
+- Suite: wasm tests 100/100, compliance corpus 307/307 pooled and serial,
+  full corpus 339/339 pooled.

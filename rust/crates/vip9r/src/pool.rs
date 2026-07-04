@@ -21,6 +21,7 @@ pub(crate) const WORKER_COUNT: usize = 3;
 #[derive(Clone, Copy)]
 pub(crate) enum Job {
     Tile(crate::tile_syntax::TileJob),
+    LoopFilter(crate::tile_syntax::LoopFilterJob),
     #[cfg(feature = "wasm-tests")]
     Fill(FillJob),
 }
@@ -133,6 +134,36 @@ pub(crate) fn join(timeout_ns: i64) -> bool {
     }
 }
 
+/// Block until `watermark` reaches at least `target`. Loop-filter wavefront
+/// progress values are monotone within a wave, so a stale Acquire load only
+/// causes an extra wait iteration; the wait itself is race-free because
+/// wait32 rechecks the expected value atomically.
+pub(crate) fn watermark_wait_at_least(watermark: &AtomicU32, target: u32) {
+    loop {
+        let current = watermark.load(Ordering::Acquire);
+        if current >= target {
+            return;
+        }
+        unsafe {
+            core::arch::wasm32::memory_atomic_wait32(
+                watermark.as_ptr().cast(),
+                current as i32,
+                -1,
+            );
+        }
+    }
+}
+
+/// Publish a new watermark value and wake every waiter. The Release store
+/// carries the pixels filtered before it; waiters pair with the Acquire load
+/// in `watermark_wait_at_least`.
+pub(crate) fn watermark_store(watermark: &AtomicU32, value: u32) {
+    watermark.store(value, Ordering::Release);
+    unsafe {
+        core::arch::wasm32::memory_atomic_notify(watermark.as_ptr().cast(), u32::MAX);
+    }
+}
+
 /// Worker thread entry, reached via `vip9r_worker_main` on a fresh instance
 /// whose shadow stack JS already rebound. Parks on the epoch, runs this
 /// worker's slot when it changes. Never returns; teardown is JS
@@ -169,6 +200,7 @@ pub(crate) fn worker_main(worker_index: u32) -> ! {
 fn run_job(job: Job) {
     match job {
         Job::Tile(job) => crate::tile_syntax::run_tile_job(job),
+        Job::LoopFilter(job) => crate::tile_syntax::run_loop_filter_job(job),
         #[cfg(feature = "wasm-tests")]
         Job::Fill(job) => run_fill_job(job),
     }

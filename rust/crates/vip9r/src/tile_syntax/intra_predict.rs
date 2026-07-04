@@ -950,6 +950,8 @@ mod tests {
                                 stride: STRIDE,
                                 band_x_start: 0,
                                 band_x_end: 40,
+                                band_y_start: 0,
+                                band_y_end: HEIGHT,
                             };
                             write_prediction_block_scalar(
                                 &mut scalar_plane,
@@ -968,6 +970,8 @@ mod tests {
                                 stride: STRIDE,
                                 band_x_start: 0,
                                 band_x_end: 40,
+                                band_y_start: 0,
+                                band_y_end: HEIGHT,
                             };
                             assert!(
                                 write_common_intra_prediction_direct(

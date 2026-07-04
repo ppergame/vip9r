@@ -1270,6 +1270,8 @@ mod tests {
                                         stride: PLANE_STRIDE,
                                         band_x_start: 0,
                                         band_x_end: PLANE_STRIDE,
+                                        band_y_start: 0,
+                                        band_y_end: PLANE_HEIGHT,
                                     };
                                     let mut simd_plane = CurrentPlaneMut {
                                         data: &mut simd_data,
@@ -1278,6 +1280,8 @@ mod tests {
                                         stride: PLANE_STRIDE,
                                         band_x_start: 0,
                                         band_x_end: PLANE_STRIDE,
+                                        band_y_start: 0,
+                                        band_y_end: PLANE_HEIGHT,
                                     };
 
                                     inter_predict_subpel_unscaled_block_scalar(
