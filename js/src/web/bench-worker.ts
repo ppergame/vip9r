@@ -4,8 +4,8 @@
 // decodeNext time); VideoFrame construction cost is measured separately.
 import { Vp9Decoder } from "../wasm";
 import type { NativeFrame } from "../wasm";
-import { parseVp9Input } from "../wasm-driver/golden";
-import type { DemuxedVp9, Vp9Packet } from "../wasm-driver/golden";
+import { openMediaStream } from "./media-stream";
+import type { MediaHeader, MediaPacket } from "./media-stream";
 import { packetTimestampUs } from "./media-time";
 import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
@@ -13,7 +13,7 @@ import { instantiateVip9r } from "./vip9r-instance";
 export type BenchLane = "vip9r" | "wc-sw" | "wc-hw";
 
 export type BenchInit = {
-  media: ArrayBuffer;
+  url: string;
   // Packet-count prefix to bench; 0 benches the whole clip.
   packetLimit: number;
 };
@@ -49,17 +49,25 @@ self.onmessage = (event: MessageEvent<BenchInit>) => {
 };
 
 async function run(init: BenchInit): Promise<void> {
-  const input = parseVp9Input(new Uint8Array(init.media));
-  const packets =
-    init.packetLimit > 0 ? input.packets.slice(0, init.packetLimit) : input.packets;
-  const first = packetTimestampUs(input, packets[0].timestamp);
-  const last = packetTimestampUs(input, packets[packets.length - 1].timestamp);
+  const media = await openMediaStream(init.url);
+  const header = media.header;
+  // The lanes replay the packet list twice (warmup + timed), so bench
+  // retains it; a packet limit stops the download early.
+  const packets: MediaPacket[] = [];
+  for await (const packet of media.packets) {
+    packets.push(packet);
+    if (init.packetLimit > 0 && packets.length >= init.packetLimit) {
+      break;
+    }
+  }
+  const first = packetTimestampUs(header, packets[0].timestamp);
+  const last = packetTimestampUs(header, packets[packets.length - 1].timestamp);
   const budgetMs = packets.length < 2 ? 0 : (last - first) / 1000 / (packets.length - 1);
   post({
     type: "meta",
-    container: input.container,
-    width: input.width,
-    height: input.height,
+    container: header.container,
+    width: header.width,
+    height: header.height,
     packets: packets.length,
     budgetMs,
   });
@@ -68,10 +76,10 @@ async function run(init: BenchInit): Promise<void> {
     // Let the previous lane's frames and decoder teardown settle.
     await new Promise((resolve) => setTimeout(resolve, 50));
     if (lane === "vip9r") {
-      post({ type: "lane", result: await vip9rLane(input, packets) });
+      post({ type: "lane", result: await vip9rLane(header, packets) });
     } else {
       const mode = lane === "wc-sw" ? "prefer-software" : "prefer-hardware";
-      const result = await webCodecsLane(lane, mode, input, packets);
+      const result = await webCodecsLane(lane, mode, header, packets);
       if (typeof result === "string") {
         post({ type: "lane-skipped", lane, reason: result });
       } else {
@@ -88,7 +96,7 @@ type Vip9rPassStats = {
   videoFrameMs: number;
 };
 
-async function vip9rLane(input: DemuxedVp9, packets: Vp9Packet[]): Promise<LaneResult> {
+async function vip9rLane(input: MediaHeader, packets: MediaPacket[]): Promise<LaneResult> {
   const { instance, module, memory } = await instantiateVip9r(input, (message) =>
     post({ type: "log", message, error: true }),
   );
@@ -112,8 +120,8 @@ async function vip9rLane(input: DemuxedVp9, packets: Vp9Packet[]): Promise<LaneR
 function vip9rPass(
   decoder: Vp9Decoder,
   memory: WebAssembly.Memory,
-  input: DemuxedVp9,
-  packets: Vp9Packet[],
+  input: MediaHeader,
+  packets: MediaPacket[],
 ): Vip9rPassStats {
   const stats: Vip9rPassStats = { frames: 0, decodeMs: 0, videoFrameMs: 0 };
   for (const packet of packets) {
@@ -155,7 +163,7 @@ function makeVideoFrame(
   });
 }
 
-function vp9CodecString(input: DemuxedVp9): string {
+function vp9CodecString(input: MediaHeader): string {
   // Profile 0, 8-bit; level 3.1 covers up to 720p30, 5.1 covers the rest of
   // what this demo will see.
   const level = input.width * input.height <= 1280 * 720 ? "31" : "51";
@@ -165,8 +173,8 @@ function vp9CodecString(input: DemuxedVp9): string {
 async function webCodecsLane(
   lane: BenchLane,
   mode: HardwareAcceleration,
-  input: DemuxedVp9,
-  packets: Vp9Packet[],
+  input: MediaHeader,
+  packets: MediaPacket[],
 ): Promise<LaneResult | string> {
   if (typeof VideoDecoder === "undefined") {
     return "WebCodecs unavailable";

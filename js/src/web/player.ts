@@ -5,7 +5,7 @@ export type PlaybackHandle = {
 };
 
 export type PlaybackOptions = {
-  media: ArrayBuffer;
+  url: string;
   canvas: HTMLCanvasElement;
   log: (message: string, kind?: "info" | "error") => void;
   stats: (text: string) => void;
@@ -40,21 +40,19 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
   let presented = 0;
   let dropped = 0;
   let presentedDecodeMs = 0;
-  let done: { frames: number; totalDecodeMs: number } | undefined;
+  let done: { frames: number; packets: number; totalDecodeMs: number } | undefined;
   let decoded = 0;
   let firstTimestampUs = 0;
   let lastTimestampUs = 0;
 
-  const init: WorkerInit = { media: options.media, queueDepth: QUEUE_DEPTH };
-  worker.postMessage(init, { transfer: [options.media] });
+  const init: WorkerInit = { url: options.url, queueDepth: QUEUE_DEPTH };
+  worker.postMessage(init);
 
   worker.onmessage = (event: MessageEvent<WorkerEvent>) => {
     const message = event.data;
     switch (message.type) {
       case "meta":
-        options.log(
-          `demuxed: ${message.container} ${message.width}×${message.height}, ${message.packets} packets`,
-        );
+        options.log(`demuxed: ${message.container} ${message.width}×${message.height}`);
         break;
       case "frame":
         if (stopped) {
@@ -126,8 +124,8 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
     } else if (done !== undefined) {
       const avg = done.frames === 0 ? 0 : done.totalDecodeMs / done.frames;
       options.log(
-        `done: ${done.frames} frames decoded, avg ${avg.toFixed(2)} ms/frame; ` +
-          `${presented} presented, ${dropped} dropped`,
+        `done: ${done.frames} frames decoded from ${done.packets} packets, ` +
+          `avg ${avg.toFixed(2)} ms/frame; ${presented} presented, ${dropped} dropped`,
       );
       finish();
       options.onFinished?.();

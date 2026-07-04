@@ -155,28 +155,6 @@ function selectedMedia(): MediaChoice | undefined {
   return { label: clip.name, url: `/media/${clip.path}` };
 }
 
-async function fetchMedia(): Promise<
-  { choice: MediaChoice; bytes: ArrayBuffer } | undefined
-> {
-  const choice = selectedMedia();
-  if (choice === undefined) {
-    log("no media selected", "error");
-    return undefined;
-  }
-  log(`fetching ${choice.label}`);
-  const response = await fetch(choice.url);
-  if (!response.ok) {
-    log(
-      `media fetch failed: ${response.status} ${response.statusText}`,
-      "error",
-    );
-    return undefined;
-  }
-  const bytes = await response.arrayBuffer();
-  log(`media ready: ${choice.label}, ${bytes.byteLength} bytes`);
-  return { choice, bytes };
-}
-
 let playback: PlaybackHandle | undefined;
 let bench: BenchHandle | undefined;
 const playSpark = new Sparkline(el<HTMLCanvasElement>("play-spark"));
@@ -199,17 +177,23 @@ function switchMode(mode: Mode): void {
   }
   resetSessions();
   setMode(mode);
-  void (mode === "bench" ? startBenchRun() : startPlay());
+  if (mode === "bench") {
+    startBenchRun();
+  } else {
+    startPlay();
+  }
 }
 
-async function startPlay(): Promise<void> {
-  const media = await fetchMedia();
-  if (media === undefined) {
+function startPlay(): void {
+  const choice = selectedMedia();
+  if (choice === undefined) {
+    log("no media selected", "error");
     return;
   }
   resetSessions();
+  log(`streaming ${choice.label}`);
   playback = startPlayback({
-    media: media.bytes,
+    url: choice.url,
     canvas: el<HTMLCanvasElement>("play-canvas"),
     log,
     stats: (text) => {
@@ -219,14 +203,16 @@ async function startPlay(): Promise<void> {
   });
 }
 
-async function startBenchRun(): Promise<void> {
-  const media = await fetchMedia();
-  if (media === undefined) {
+function startBenchRun(): void {
+  const choice = selectedMedia();
+  if (choice === undefined) {
+    log("no media selected", "error");
     return;
   }
   resetSessions();
+  log(`streaming ${choice.label}`);
   bench = startBench({
-    media: media.bytes,
+    url: choice.url,
     packetLimit: Math.max(0, Number(framesInput.value) || 0),
     log,
     results: (text) => {
@@ -274,14 +260,8 @@ function initControls(): void {
   );
   tabs.play.addEventListener("click", () => switchMode("play"));
   tabs.bench.addEventListener("click", () => switchMode("bench"));
-  el<HTMLButtonElement>("play-start").addEventListener(
-    "click",
-    () => void startPlay(),
-  );
-  el<HTMLButtonElement>("bench-start").addEventListener(
-    "click",
-    () => void startBenchRun(),
-  );
+  el<HTMLButtonElement>("play-start").addEventListener("click", () => startPlay());
+  el<HTMLButtonElement>("bench-start").addEventListener("click", () => startBenchRun());
   copyLink.addEventListener("click", () => {
     void navigator.clipboard
       .writeText(location.href)
@@ -292,7 +272,11 @@ function initControls(): void {
 async function main(): Promise<void> {
   initControls();
   await bootWasmCheck();
-  await (getParam("mode") === "bench" ? startBenchRun() : startPlay());
+  if (getParam("mode") === "bench") {
+    startBenchRun();
+  } else {
+    startPlay();
+  }
 }
 
 void main();

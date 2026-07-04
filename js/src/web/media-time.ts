@@ -1,6 +1,11 @@
-import type { DemuxedVp9 } from "../wasm-driver/golden";
+export type MediaTimebase = {
+  container: "ivf" | "webm";
+  timestampScale?: number;
+  timebaseNumerator?: number;
+  timebaseDenominator?: number;
+};
 
-export function packetTimestampUs(input: DemuxedVp9, timestamp: bigint): number {
+export function packetTimestampUs(input: MediaTimebase, timestamp: bigint): number {
   if (input.container === "ivf") {
     const numerator = input.timebaseNumerator ?? 1;
     const denominator = input.timebaseDenominator ?? 30;

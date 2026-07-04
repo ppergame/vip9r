@@ -6,7 +6,7 @@ export type WebmPacket = {
   payload: Uint8Array;
 };
 
-export type WebmFile = {
+export type WebmHeader = {
   codecId: "V_VP9";
   width: number;
   height: number;
@@ -14,6 +14,9 @@ export type WebmFile = {
   trackNumber: number;
   flagLacing: number;
   defaultDuration?: number;
+};
+
+export type WebmFile = WebmHeader & {
   packets: WebmPacket[];
 };
 
@@ -30,13 +33,6 @@ type ElementHeader = {
   id: number;
   contentStart: number;
   contentEnd: number;
-  unknownSize: boolean;
-  truncatedContent: boolean;
-};
-
-type ReadElementOptions = {
-  allowUnknownSize?: boolean;
-  allowTruncatedContent?: boolean;
 };
 
 type WebmTrack = {
@@ -76,7 +72,11 @@ const ID = {
 } as const;
 
 export function parseWebm(data: Uint8Array): WebmFile {
-  return new WebmParser(data).parse();
+  const demuxer = new WebmDemuxer();
+  const packets = demuxer.push(data);
+  demuxer.finish();
+  // finish() rejects packet-less streams, and packets imply a built header.
+  return { ...demuxer.header!, packets };
 }
 
 export function readEbmlVint(data: Uint8Array, offset: number, kind: VintKind = "size"): EbmlVint {
@@ -116,52 +116,198 @@ export function readEbmlVint(data: Uint8Array, offset: number, kind: VintKind = 
   };
 }
 
-class WebmParser {
-  private readonly tracks: WebmTrack[] = [];
-  private readonly packets: WebmPacket[] = [];
-  private timestampScale = 1_000_000;
+// Incremental WebM demuxer. push() accepts stream chunks and returns the VP9
+// packets completed by them; memory is bounded by the largest buffered
+// element (in practice one Cluster). Elements other than EBML, Info, Tracks
+// and Cluster are discarded without buffering. `header` becomes available
+// once the first Cluster is fully buffered.
+export class WebmDemuxer {
+  private data: Uint8Array = new Uint8Array(0);
+  // Parse position within `data`; everything before it is consumed.
+  private cursor = 0;
+  // Absolute stream offset of data[0].
+  private streamOffset = 0;
+  // Bytes of a skipped element still to discard, and its id for errors.
+  private skipRemaining = 0;
+  private skipId = 0;
+  private inSegment = false;
+  // Absolute end of the current Segment content; Infinity when unknown-size.
+  private segmentEnd = Infinity;
   private sawSegment = false;
+  private timestampScale = 1_000_000;
+  private readonly tracks: WebmTrack[] = [];
+  private headerValue: WebmHeader | undefined;
+  private packetCount = 0;
 
-  constructor(private readonly data: Uint8Array) {}
+  get header(): WebmHeader | undefined {
+    return this.headerValue;
+  }
 
-  parse(): WebmFile {
-    let offset = 0;
-    while (offset < this.data.byteLength) {
-      const element = this.readElement(offset, this.data.byteLength, {
-        allowUnknownSize: true,
-        allowTruncatedContent: true,
-      });
-      if (element.unknownSize && element.id !== ID.Segment) {
-        throw new Error(`element ${hexId(element.id)} has unsupported unknown size`);
-      }
-      if (element.truncatedContent && element.id !== ID.Segment) {
-        throw new Error(`element ${hexId(element.id)} size exceeds parent`);
-      }
+  push(chunk: Uint8Array): WebmPacket[] {
+    this.append(chunk);
+    const packets: WebmPacket[] = [];
+    this.advance(packets, false);
+    return packets;
+  }
 
-      switch (element.id) {
-        case ID.EBML:
-          this.parseEbmlHeader(element.contentStart, element.contentEnd);
-          break;
-        case ID.Segment:
-          this.sawSegment = true;
-          this.parseSegment(element.contentStart, element.contentEnd);
-          break;
-        case ID.Void:
-        case ID.CRC32:
-          break;
-        default:
-          break;
-      }
-      offset = element.contentEnd;
-    }
-
+  finish(): void {
+    // In final mode a partial element is an error instead of a wait.
+    this.advance([], true);
     if (!this.sawSegment) {
       throw new Error("WebM Segment not found");
     }
-    if (this.timestampScale <= 0) {
-      throw new Error(`WebM TimestampScale must be non-zero: ${this.timestampScale}`);
+    if (this.headerValue === undefined) {
+      // No Cluster was seen; run the validation a Cluster would have triggered.
+      this.buildHeader();
     }
+    if (this.packetCount === 0) {
+      throw new Error("WebM contains no VP9 packets");
+    }
+  }
 
+  private append(chunk: Uint8Array): void {
+    if (this.cursor === this.data.byteLength) {
+      this.streamOffset += this.data.byteLength;
+      this.data = chunk;
+      this.cursor = 0;
+      return;
+    }
+    const tail = this.data.subarray(this.cursor);
+    const next = new Uint8Array(tail.byteLength + chunk.byteLength);
+    next.set(tail);
+    next.set(chunk, tail.byteLength);
+    this.streamOffset += this.cursor;
+    this.data = next;
+    this.cursor = 0;
+  }
+
+  private absCursor(): number {
+    return this.streamOffset + this.cursor;
+  }
+
+  private advance(out: WebmPacket[], final: boolean): void {
+    while (true) {
+      if (this.skipRemaining > 0) {
+        const take = Math.min(this.data.byteLength - this.cursor, this.skipRemaining);
+        this.cursor += take;
+        this.skipRemaining -= take;
+        if (this.skipRemaining > 0) {
+          if (final) {
+            throw new Error(`element ${hexId(this.skipId)} size exceeds parent`);
+          }
+          return;
+        }
+      }
+      if (this.inSegment && this.absCursor() >= this.segmentEnd) {
+        this.inSegment = false;
+      }
+      if (this.cursor >= this.data.byteLength) {
+        return;
+      }
+
+      const idVint = this.tryVint(this.cursor, "id", final);
+      if (idVint === undefined) {
+        return;
+      }
+      if (this.inSegment && this.streamOffset + idVint.nextOffset > this.segmentEnd) {
+        throw new Error(`element ID at offset ${this.cursor} exceeds parent`);
+      }
+      const sizeVint = this.tryVint(idVint.nextOffset, "size", final);
+      if (sizeVint === undefined) {
+        return;
+      }
+      const id = toSafeNumber(idVint.value, "EBML ID");
+      if (this.inSegment && this.streamOffset + sizeVint.nextOffset > this.segmentEnd) {
+        throw new Error(`element ${hexId(id)} size exceeds parent`);
+      }
+
+      const topLevelSegment = id === ID.Segment && !this.inSegment;
+      if (sizeVint.unknownSize && !topLevelSegment) {
+        throw new Error(`element ${hexId(id)} has unsupported unknown size`);
+      }
+      const contentStart = sizeVint.nextOffset;
+
+      if (topLevelSegment) {
+        this.sawSegment = true;
+        this.inSegment = true;
+        this.segmentEnd = sizeVint.unknownSize
+          ? Infinity
+          : checkedAdd(
+              this.streamOffset + contentStart,
+              toSafeNumber(sizeVint.value, "element size"),
+            );
+        this.cursor = contentStart;
+        continue;
+      }
+
+      const contentSize = toSafeNumber(sizeVint.value, "element size");
+      if (this.inSegment && this.streamOffset + contentStart + contentSize > this.segmentEnd) {
+        throw new Error(`element ${hexId(id)} size exceeds parent`);
+      }
+
+      const buffered = this.inSegment
+        ? id === ID.Info || id === ID.Tracks || id === ID.Cluster
+        : id === ID.EBML;
+      if (!buffered) {
+        this.cursor = contentStart;
+        this.skipId = id;
+        this.skipRemaining = contentSize;
+        continue;
+      }
+
+      const contentEnd = checkedAdd(contentStart, contentSize);
+      if (contentEnd > this.data.byteLength) {
+        if (final) {
+          throw new Error(`element ${hexId(id)} size exceeds parent`);
+        }
+        return;
+      }
+      switch (id) {
+        case ID.EBML:
+          this.parseEbmlHeader(contentStart, contentEnd);
+          break;
+        case ID.Info:
+          this.parseInfo(contentStart, contentEnd);
+          break;
+        case ID.Tracks:
+          this.parseTracks(contentStart, contentEnd);
+          break;
+        case ID.Cluster:
+          if (this.headerValue === undefined) {
+            this.buildHeader();
+          }
+          this.parseCluster(contentStart, contentEnd, out);
+          break;
+      }
+      this.cursor = contentEnd;
+    }
+  }
+
+  // Reads a VINT at `offset`, or returns undefined when the window is too
+  // short to contain it. In final mode short reads throw instead.
+  private tryVint(offset: number, kind: VintKind, final: boolean): EbmlVint | undefined {
+    if (!final) {
+      if (offset >= this.data.byteLength) {
+        return undefined;
+      }
+      const first = this.data[offset];
+      if (first !== 0) {
+        let marker = 0x80;
+        let width = 1;
+        while ((first & marker) === 0) {
+          marker >>= 1;
+          width += 1;
+        }
+        const invalidWideId = kind === "id" && width > 4;
+        if (!invalidWideId && offset + width > this.data.byteLength) {
+          return undefined;
+        }
+      }
+    }
+    return readEbmlVint(this.data, offset, kind);
+  }
+
+  private buildHeader(): void {
     const track = this.requireSelectedTrack();
     if (track.trackNumber === undefined || track.trackNumber <= 0) {
       throw new Error("VP9 track is missing TrackNumber");
@@ -175,11 +321,10 @@ class WebmParser {
     if (track.pixelWidth <= 0 || track.pixelHeight <= 0) {
       throw new Error(`WebM dimensions must be non-zero: ${track.pixelWidth}x${track.pixelHeight}`);
     }
-    if (this.packets.length === 0) {
-      throw new Error("WebM contains no VP9 packets");
+    if (this.timestampScale <= 0) {
+      throw new Error(`WebM TimestampScale must be non-zero: ${this.timestampScale}`);
     }
-
-    return {
+    this.headerValue = {
       codecId: "V_VP9",
       width: track.pixelWidth,
       height: track.pixelHeight,
@@ -187,7 +332,6 @@ class WebmParser {
       trackNumber: track.trackNumber,
       flagLacing: track.flagLacing,
       defaultDuration: track.defaultDuration,
-      packets: this.packets,
     };
   }
 
@@ -203,30 +347,6 @@ class WebmParser {
           }
           break;
         }
-        default:
-          break;
-      }
-      offset = element.contentEnd;
-    }
-  }
-
-  private parseSegment(start: number, end: number): void {
-    let offset = start;
-    while (offset < end) {
-      const element = this.readElement(offset, end);
-      switch (element.id) {
-        case ID.Info:
-          this.parseInfo(element.contentStart, element.contentEnd);
-          break;
-        case ID.Tracks:
-          this.parseTracks(element.contentStart, element.contentEnd);
-          break;
-        case ID.Cluster:
-          this.parseCluster(element.contentStart, element.contentEnd);
-          break;
-        case ID.Void:
-        case ID.CRC32:
-          break;
         default:
           break;
       }
@@ -314,11 +434,9 @@ class WebmParser {
     }
   }
 
-  private parseCluster(start: number, end: number): void {
-    const selectedTrack = this.requireSelectedTrack();
-    if (selectedTrack.trackNumber === undefined || selectedTrack.trackNumber <= 0) {
-      throw new Error("VP9 track is missing TrackNumber");
-    }
+  private parseCluster(start: number, end: number, out: WebmPacket[]): void {
+    // buildHeader() ran before the first cluster, so the track is validated.
+    const trackNumber = this.headerValue!.trackNumber;
 
     let clusterTimestamp = 0n;
     let offset = start;
@@ -337,10 +455,10 @@ class WebmParser {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.SimpleBlock:
-          this.parseBlock(element.contentStart, element.contentEnd, clusterTimestamp, selectedTrack.trackNumber);
+          this.parseBlock(element.contentStart, element.contentEnd, clusterTimestamp, trackNumber, out);
           break;
         case ID.BlockGroup:
-          this.parseBlockGroup(element.contentStart, element.contentEnd, clusterTimestamp, selectedTrack.trackNumber);
+          this.parseBlockGroup(element.contentStart, element.contentEnd, clusterTimestamp, trackNumber, out);
           break;
         default:
           break;
@@ -349,7 +467,13 @@ class WebmParser {
     }
   }
 
-  private parseBlockGroup(start: number, end: number, clusterTimestamp: bigint, selectedTrackNumber: number): void {
+  private parseBlockGroup(
+    start: number,
+    end: number,
+    clusterTimestamp: bigint,
+    selectedTrackNumber: number,
+    out: WebmPacket[],
+  ): void {
     const blocks: ElementHeader[] = [];
     let hasReferenceBlock = false;
     let offset = start;
@@ -369,7 +493,7 @@ class WebmParser {
     }
 
     for (const block of blocks) {
-      this.parseBlock(block.contentStart, block.contentEnd, clusterTimestamp, selectedTrackNumber, {
+      this.parseBlock(block.contentStart, block.contentEnd, clusterTimestamp, selectedTrackNumber, out, {
         keyframe: !hasReferenceBlock,
       });
     }
@@ -380,6 +504,7 @@ class WebmParser {
     end: number,
     clusterTimestamp: bigint,
     selectedTrackNumber: number,
+    out: WebmPacket[],
     options: { keyframe?: boolean } = {},
   ): void {
     const trackNumberVint = readEbmlVint(this.data, start);
@@ -400,13 +525,15 @@ class WebmParser {
       throw new Error(`laced VP9 block on track ${selectedTrackNumber} is not supported`);
     }
 
-    this.packets.push({
-      index: this.packets.length,
+    out.push({
+      index: this.packetCount,
       timestamp: clusterTimestamp + BigInt(relativeTimestamp),
       keyframe: options.keyframe ?? (flags & 0x80) !== 0,
       visible: (flags & 0x08) === 0,
-      payload: this.data.subarray(payloadStart, end),
+      // Copy out of the demux window so consumed input can be released.
+      payload: this.data.slice(payloadStart, end),
     });
+    this.packetCount += 1;
   }
 
   private requireSelectedTrack(): WebmTrack {
@@ -420,21 +547,12 @@ class WebmParser {
     return selected[0];
   }
 
-  private readElement(offset: number, parentEnd: number, options: ReadElementOptions = {}): ElementHeader {
-    const element = readElementHeader(this.data, offset, parentEnd, options.allowTruncatedContent ?? false);
-    if (element.unknownSize && !(options.allowUnknownSize ?? false)) {
-      throw new Error(`element ${hexId(element.id)} has unsupported unknown size`);
-    }
-    return element;
+  private readElement(offset: number, parentEnd: number): ElementHeader {
+    return readElementHeader(this.data, offset, parentEnd);
   }
 }
 
-function readElementHeader(
-  data: Uint8Array,
-  offset: number,
-  parentEnd: number,
-  allowTruncatedContent: boolean,
-): ElementHeader {
+function readElementHeader(data: Uint8Array, offset: number, parentEnd: number): ElementHeader {
   const id = readEbmlVint(data, offset, "id");
   if (id.nextOffset > parentEnd) {
     throw new Error(`element ID at offset ${offset} exceeds parent`);
@@ -446,14 +564,11 @@ function readElementHeader(
   }
 
   const numericId = toSafeNumber(id.value, "EBML ID");
-  const contentStart = size.nextOffset;
-  let contentEnd = size.unknownSize
-    ? parentEnd
-    : checkedAdd(contentStart, toSafeNumber(size.value, "element size"));
-  const truncatedContent = contentEnd > parentEnd;
-  if (truncatedContent && allowTruncatedContent) {
-    contentEnd = parentEnd;
+  if (size.unknownSize) {
+    throw new Error(`element ${hexId(numericId)} has unsupported unknown size`);
   }
+  const contentStart = size.nextOffset;
+  const contentEnd = checkedAdd(contentStart, toSafeNumber(size.value, "element size"));
   if (contentEnd > parentEnd) {
     throw new Error(`element ${hexId(numericId)} size exceeds parent`);
   }
@@ -462,8 +577,6 @@ function readElementHeader(
     id: numericId,
     contentStart,
     contentEnd,
-    unknownSize: size.unknownSize,
-    truncatedContent,
   };
 }
 

@@ -1,12 +1,12 @@
 import { Vp9Decoder } from "../wasm";
 import type { NativeFrame } from "../wasm";
-import { parseVp9Input } from "../wasm-driver/golden";
+import { openMediaStream } from "./media-stream";
 import { packetTimestampUs } from "./media-time";
 import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
 
 export type WorkerInit = {
-  media: ArrayBuffer;
+  url: string;
   queueDepth: number;
 };
 
@@ -16,10 +16,10 @@ export type WorkerAck = {
 };
 
 export type WorkerEvent =
-  | { type: "meta"; container: string; width: number; height: number; packets: number }
-  | { type: "frame"; frame: VideoFrame; decodeMs: number }
+  | { type: "meta"; container: string; width: number; height: number }
+  | { type: "frame"; frame: VideoFrame; decodeMs: number; packetBytes: number; keyframe: boolean }
   | { type: "log"; message: string; error: boolean }
-  | { type: "done"; frames: number; totalDecodeMs: number }
+  | { type: "done"; frames: number; packets: number; totalDecodeMs: number }
   | { type: "error"; message: string };
 
 function post(event: WorkerEvent, transfer: Transferable[] = []): void {
@@ -57,7 +57,7 @@ self.onmessage = (event: MessageEvent<WorkerInit | WorkerAck>) => {
   started = true;
   const init = data as WorkerInit;
   credits = init.queueDepth;
-  decodeAll(init.media).catch((error: unknown) => {
+  decodeAll(init.url).catch((error: unknown) => {
     post({ type: "error", message: String(error) });
   });
 };
@@ -77,30 +77,32 @@ function makeVideoFrame(memory: WebAssembly.Memory, native: NativeFrame, timesta
   });
 }
 
-async function decodeAll(media: ArrayBuffer): Promise<void> {
-  const input = parseVp9Input(new Uint8Array(media));
+async function decodeAll(url: string): Promise<void> {
+  const media = await openMediaStream(url);
+  const header = media.header;
   post({
     type: "meta",
-    container: input.container,
-    width: input.width,
-    height: input.height,
-    packets: input.packets.length,
+    container: header.container,
+    width: header.width,
+    height: header.height,
   });
 
-  const { instance, module, memory } = await instantiateVip9r(input, (message) =>
+  const { instance, module, memory } = await instantiateVip9r(header, (message) =>
     post({ type: "log", message, error: true }),
   );
   // The pool dies with this worker.
   await activateWorkerPool(instance, module, memory, (message) =>
     post({ type: "log", message, error: true }),
   );
-  const decoder = new Vp9Decoder(instance, input.width, input.height);
+  const decoder = new Vp9Decoder(instance, header.width, header.height);
 
   let frames = 0;
+  let packets = 0;
   let totalDecodeMs = 0;
   let pendingMs = 0;
-  for (const packet of input.packets) {
-    const timestamp = packetTimestampUs(input, packet.timestamp);
+  for await (const packet of media.packets) {
+    const timestamp = packetTimestampUs(header, packet.timestamp);
+    const keyframe = packet.keyframe ?? packets === 0;
     decoder.beginPacket(packet.payload);
     let packetDone = false;
     while (!packetDone) {
@@ -115,10 +117,20 @@ async function decodeAll(media: ArrayBuffer): Promise<void> {
       }
       await takeCredit();
       const frame = makeVideoFrame(memory, step.frame, timestamp);
-      post({ type: "frame", frame, decodeMs: pendingMs }, [frame]);
+      post(
+        {
+          type: "frame",
+          frame,
+          decodeMs: pendingMs,
+          packetBytes: packet.payload.byteLength,
+          keyframe,
+        },
+        [frame],
+      );
       frames += 1;
       pendingMs = 0;
     }
+    packets += 1;
   }
-  post({ type: "done", frames, totalDecodeMs });
+  post({ type: "done", frames, packets, totalDecodeMs });
 }

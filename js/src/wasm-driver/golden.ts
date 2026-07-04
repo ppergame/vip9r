@@ -2,6 +2,7 @@ import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 import { spawnWorkerPool } from "./pool";
 import type { WorkerPool } from "./pool";
+import { parseIvf as demuxIvf } from "../ivf";
 import { parseWebm } from "../webm";
 import {
   createScratchVip9rMemory,
@@ -992,70 +993,11 @@ export function parseVp9Input(data: Uint8Array): DemuxedVp9 {
 }
 
 export function parseIvf(data: Uint8Array): IvfFile {
-  if (data.byteLength < 32) {
-    throw new Error("IVF header is truncated");
-  }
-  if (ascii(data, 0, 4) !== "DKIF") {
-    throw new Error("IVF signature is not DKIF");
-  }
-
-  const version = le16(data, 4);
-  if (version !== 0) {
-    throw new Error(`unsupported IVF version: ${version}`);
-  }
-
-  const headerLength = le16(data, 6);
-  if (headerLength < 32) {
-    throw new Error(`IVF header length is too small: ${headerLength}`);
-  }
-  if (data.byteLength < headerLength) {
-    throw new Error(`IVF header length exceeds file size: ${headerLength}`);
-  }
-
-  const fourcc = ascii(data, 8, 12);
-  if (fourcc !== "VP90") {
-    throw new Error(`unsupported IVF fourcc: ${fourcc}`);
-  }
-
-  const width = le16(data, 12);
-  const height = le16(data, 14);
-
-  const packets: IvfPacket[] = [];
-  let offset = headerLength;
-  while (offset < data.byteLength) {
-    const index = packets.length;
-    if (data.byteLength - offset < 12) {
-      throw new Error(`packet ${index} header is truncated`);
-    }
-
-    const len = le32(data, offset);
-    const timestamp = le64(data, offset + 4);
-    const payloadStart = offset + 12;
-    const payloadEnd = payloadStart + len;
-    if (payloadEnd > data.byteLength) {
-      throw new Error(`packet ${index} payload is truncated`);
-    }
-    packets.push({
-      index,
-      timestamp,
-      payload: data.subarray(payloadStart, payloadEnd),
-    });
-    offset = payloadEnd;
-  }
-
-  if (packets.length === 0) {
-    throw new Error("IVF contains no packets");
-  }
-
+  const { packets, ...header } = demuxIvf(data);
   return {
     container: "ivf",
-    codec: "VP90",
-    fourcc,
-    width,
-    height,
-    timebaseDenominator: le32(data, 16),
-    timebaseNumerator: le32(data, 20),
-    declaredFrameCount: le32(data, 24),
+    codec: header.fourcc,
+    ...header,
     packets,
   };
 }
@@ -1425,10 +1367,6 @@ function ascii(data: Uint8Array, start: number, end: number): string {
   return out;
 }
 
-function le16(data: Uint8Array, offset: number): number {
-  return data[offset] | (data[offset + 1] << 8);
-}
-
 function le32(data: Uint8Array, offset: number): number {
   return (
     data[offset] |
@@ -1436,10 +1374,6 @@ function le32(data: Uint8Array, offset: number): number {
     (data[offset + 2] << 16) |
     (data[offset + 3] << 24)
   ) >>> 0;
-}
-
-function le64(data: Uint8Array, offset: number): bigint {
-  return BigInt(le32(data, offset)) | (BigInt(le32(data, offset + 4)) << 32n);
 }
 
 const MD5_S = [

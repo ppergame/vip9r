@@ -5,7 +5,7 @@ export type BenchHandle = {
 };
 
 export type BenchOptions = {
-  media: ArrayBuffer;
+  url: string;
   packetLimit: number;
   log: (message: string, kind?: "info" | "error") => void;
   results: (text: string) => void;
@@ -26,10 +26,10 @@ export function startBench(options: BenchOptions): BenchHandle {
   let stopped = false;
 
   const init: BenchInit = {
-    media: options.media,
+    url: options.url,
     packetLimit: options.packetLimit,
   };
-  worker.postMessage(init, { transfer: [options.media] });
+  worker.postMessage(init);
 
   function addLine(line: string): void {
     lines.push(line);
