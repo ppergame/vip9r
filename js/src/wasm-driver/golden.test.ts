@@ -158,10 +158,19 @@ describe("wasm golden runner helpers", () => {
   test("parses default and benchmark driver arguments", () => {
     expect(parseDriverArgs(["vip9r.wasm", "input.ivf"])).toMatchObject({
       allowMismatch: false,
+      pool: false,
       wasmPath: "vip9r.wasm",
       inputPath: "input.ivf",
       goldenPath: "input.ivf.md5",
       bench: undefined,
+    });
+    expect(parseDriverArgs(["--pool", "vip9r.wasm", "input.ivf"])).toMatchObject({
+      pool: true,
+      bench: undefined,
+    });
+    expect(parseDriverArgs(["--bench", "--pool", "vip9r.wasm", "input.ivf"])).toMatchObject({
+      pool: true,
+      bench: DEFAULT_BENCHMARK_OPTIONS,
     });
     expect(parseDriverArgs(["vip9r.wasm"])).toMatchObject({
       wasmPath: "vip9r.wasm",

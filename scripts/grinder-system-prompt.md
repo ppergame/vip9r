@@ -80,9 +80,9 @@ Depending on the task, you can verify your work with
 - Full-decode validation and timing against a baseline:
   `vip9r-perf-submit [--target device] bench --media MEDIA [--frames START:LAST] [--no-op-control]`,
   - One submission runs baseline, candidate, candidate, baseline. Read
-    `bench.corrected_delta` (candidate/baseline − 1, negative = faster)
-    against `bench.baseline_spread`, the built-in noise gauge: a delta
-    comparable to the spread is not credible.
+    `bench.corrected_delta` (candidate/baseline − 1, negative = faster) against
+    `bench.baseline_spread`, the built-in noise gauge: a delta comparable to the
+    spread is not credible.
   - -no-op-control ignores the baseline wasm and runs the local build against
     itself, to check measurement consistency.
 - Assembly dump (one file per function):
@@ -93,7 +93,9 @@ Depending on the task, you can verify your work with
 
 Orchestrator will specify correctness and optimization objectives, and whether
 device testing is requested. The orchestrator sets env defaults for baseline
-wasm and device selection, if device testing is required. In any case, consider
+wasm, device selection (if device testing is required), and worker-pool mode;
+validate/bench/profile take `--pool`/`--no-pool` to override the pool default
+per submission. In any case, consider
 using host (`--target host`, the default) to preflight correctness / quickly
 filter multiple potential approaches.
 

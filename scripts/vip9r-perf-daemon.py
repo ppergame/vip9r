@@ -38,7 +38,7 @@ CLIENT_SEND_TIMEOUT_SECONDS = 30
 RESPONSE_STRING_HEAD_BYTES = 8 * 1024
 RESPONSE_STRING_TAIL_BYTES = 8 * 1024
 U32_MAX = 2**32 - 1
-PIN_HELP = "any, all, cpu:N, or mask:HEX"
+PIN_HELP = "any, all, cpu:N[,N-M,...], or mask:HEX"
 HOST_D8_TIMEOUT_SECONDS = 180
 DEVICE_D8_TIMEOUT_SECONDS = 180
 ADB_D8_TIMEOUT_SECONDS = DEVICE_D8_TIMEOUT_SECONDS + 30
@@ -531,9 +531,15 @@ def handle_host_job(job: Job) -> dict[str, object]:
         try:
             media = media_from_request(request)
             validation = validation_from_request(request)
+            pool = pool_from_request(request)
         except ValueError as error:
             return {"ok": False, "kind": "validate", "target": "host", "error": str(error)}
-        return handle_host_validate_request(job.candidate_path, MEDIA_ROOT / media, validation)
+        return handle_host_validate_request(job.candidate_path, MEDIA_ROOT / media, validation, pool)
+    if kind in ("tests", "microbench", "asm"):
+        try:
+            reject_pool(request)
+        except ValueError as error:
+            return {"ok": False, "kind": kind, "target": "host", "error": str(error)}
     if kind == "tests":
         return handle_host_tests_request(request, job.candidate_path)
     if kind == "microbench":
@@ -552,9 +558,10 @@ def handle_host_job(job: Job) -> dict[str, object]:
     try:
         media = media_from_request(request)
         frame_range = frame_range_from_request(request)
+        pool = pool_from_request(request)
     except ValueError as error:
         return {"ok": False, "kind": "bench", "target": "host", "error": str(error)}
-    return handle_host_bench_request(job, MEDIA_ROOT / media, frame_range)
+    return handle_host_bench_request(job, MEDIA_ROOT / media, frame_range, pool)
 
 
 def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
@@ -571,12 +578,15 @@ def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
             media = media_from_request(request)
             validation = validation_from_request(request)
             pin_name = pin_from_request(request, required=False)
-            return handle_device_validate_request(lane, job, media, validation, pin_name)
+            pool = pool_from_request(request)
+            return handle_device_validate_request(lane, job, media, validation, pin_name, pool)
         if kind == "tests":
+            reject_pool(request)
             tests = tests_from_request(request)
             pin_name = pin_from_request(request, required=False)
             return handle_device_tests_request(lane, job, tests, pin_name)
         if kind == "microbench":
+            reject_pool(request)
             microbench = microbench_from_request(request)
             pin_name = pin_from_request(request, required=True)
             return handle_device_microbench_request(lane, job, microbench, pin_name)
@@ -587,8 +597,9 @@ def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
             frame_range = frame_range_from_request(request)
             freq = profile_freq_from_request(request)
             pin_name = pin_from_request(request, required=True)
+            pool = pool_from_request(request)
             return handle_device_profile_request(
-                lane, job, media, frame_range, freq, pin_name, job.fds[0]
+                lane, job, media, frame_range, freq, pin_name, pool, job.fds[0]
             )
         if kind == "asm":
             raise ValueError("asm runs on the daemon host")
@@ -597,7 +608,8 @@ def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
         media = media_from_request(request)
         frame_range = frame_range_from_request(request)
         pin_name = pin_from_request(request, required=True)
-        return handle_device_bench_request(lane, job, media, frame_range, pin_name)
+        pool = pool_from_request(request)
+        return handle_device_bench_request(lane, job, media, frame_range, pin_name, pool)
     except ValueError as error:
         return {**base, "ok": False, "error": str(error)}
 
@@ -671,11 +683,12 @@ def handle_host_bench_request(
     job: Job,
     media_path: Path,
     frame_range: tuple[int, int] | None,
+    pool: bool,
 ) -> dict[str, object]:
     assert job.baseline_path is not None
     runs: dict[str, dict[str, object]] = {}
     for name, wasm_path in bench_run_plan(job.baseline_path, job.candidate_path):
-        result = run_host_bench(wasm_path, media_path, frame_range)
+        result = run_host_bench(wasm_path, media_path, frame_range, pool)
         runs[name] = trim_bench_run(result)
         if result.get("ok") is not True:
             break
@@ -686,6 +699,7 @@ def handle_host_bench_request(
         "target": "host",
         "host": {
             "media": str(media_path),
+            "pool": pool,
             "no_op_control": job.baseline_sha256 == job.candidate_sha256,
             "bench": bench_summary(runs),
             "runs": runs,
@@ -697,14 +711,16 @@ def handle_host_validate_request(
     candidate_path: Path,
     media_path: Path,
     validation: dict[str, object],
+    pool: bool,
 ) -> dict[str, object]:
-    candidate_result = run_host_validation(candidate_path, media_path, validation)
+    candidate_result = run_host_validation(candidate_path, media_path, validation, pool)
     return {
         "ok": candidate_result.get("ok") is True,
         "kind": "validate",
         "target": "host",
         "host": {
             "media": str(media_path),
+            "pool": pool,
             "allow_mismatch": validation.get("allow_mismatch") is True,
             "candidate": candidate_result,
         },
@@ -817,6 +833,21 @@ def target_from_request(request: dict[str, object]) -> str:
     return target
 
 
+def pool_from_request(request: dict[str, object]) -> bool:
+    # Explicit per-request choice, never inferred from the pin set: pooled
+    # decode on a single core and serial decode on four cores both stay
+    # expressible.
+    pool = request.get("pool", False)
+    if not isinstance(pool, bool):
+        raise ValueError("pool must be boolean")
+    return pool
+
+
+def reject_pool(request: dict[str, object]) -> None:
+    if "pool" in request:
+        raise ValueError("pool applies to validate, bench, and profile requests")
+
+
 def pin_from_request(request: dict[str, object], *, required: bool) -> str:
     pin = request.get("pin")
     if pin is None:
@@ -846,6 +877,7 @@ def handle_device_bench_request(
     media: PurePosixPath,
     frame_range: tuple[int, int] | None,
     pin_name: str,
+    pool: bool,
 ) -> dict[str, object]:
     device, session = lane.device, lane.session
     base = device_response_base(lane, "bench")
@@ -866,6 +898,7 @@ def handle_device_bench_request(
                 media_path,
                 frame_range,
                 pin,
+                pool,
                 str(PurePosixPath(run_dir) / f"{name}-result.json"),
             )
             runs[name] = trim_bench_run(result)
@@ -880,6 +913,7 @@ def handle_device_bench_request(
         and all(run.get("ok") is True for run in runs.values()),
         "device_run": {
             "pin": pin_summary(pin),
+            "pool": pool,
             "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
@@ -972,6 +1006,7 @@ def handle_device_validate_request(
     media: PurePosixPath,
     validation: dict[str, object],
     pin_name: str,
+    pool: bool,
 ) -> dict[str, object]:
     device, session = lane.device, lane.session
     base = device_response_base(lane, "validate")
@@ -989,6 +1024,7 @@ def handle_device_validate_request(
             media_path,
             validation,
             pin,
+            pool,
             result_path,
         )
     except (DeviceError, ValueError) as error:
@@ -999,6 +1035,7 @@ def handle_device_validate_request(
         "ok": candidate_result.get("ok") is True,
         "device_run": {
             "pin": pin_summary(pin),
+            "pool": pool,
             "session_dir": session.path,
             "run_dir": run_dir,
             "media": media_path,
@@ -1016,6 +1053,7 @@ def handle_device_profile_request(
     frame_range: tuple[int, int] | None,
     freq: int,
     pin_name: str,
+    pool: bool,
     dir_fd: int,
 ) -> dict[str, object]:
     device, session = lane.device, lane.session
@@ -1043,6 +1081,8 @@ def handle_device_profile_request(
             candidate_wasm,
             "--bench",
         ]
+        if pool:
+            d8_args.append("--pool")
         if frame_range is not None:
             start, last = frame_range
             d8_args.extend(["--frames", f"{start}:{last}"])
@@ -1076,6 +1116,7 @@ def handle_device_profile_request(
         "ok": ok,
         "device_run": {
             "pin": pin_summary(pin),
+            "pool": pool,
             "run_dir": run_dir,
             "media": media_path,
             "freq": freq,
@@ -1354,6 +1395,7 @@ def run_device_bench(
     media_path: str,
     frame_range: tuple[int, int] | None,
     pin: PinSelection,
+    pool: bool,
     result_path: str,
 ) -> dict[str, object]:
     d8_args = [
@@ -1365,6 +1407,8 @@ def run_device_bench(
         wasm_path,
         "--bench",
     ]
+    if pool:
+        d8_args.append("--pool")
     if frame_range is not None:
         start, last = frame_range
         d8_args.extend(["--frames", f"{start}:{last}"])
@@ -1379,6 +1423,7 @@ def run_device_validation(
     media_path: str,
     validation: dict[str, object],
     pin: PinSelection,
+    pool: bool,
     result_path: str,
 ) -> dict[str, object]:
     d8_args = [
@@ -1389,6 +1434,8 @@ def run_device_validation(
         "--",
         wasm_path,
     ]
+    if pool:
+        d8_args.append("--pool")
     if validation.get("allow_mismatch") is True:
         d8_args.append("--allow-mismatch")
     frames = validation.get("frames")
@@ -1986,8 +2033,7 @@ def resolve_pin(device: DeviceContext, pin_name: str) -> PinSelection:
     if pin_name == "all":
         return pin_for_cpus(device, pin_name, device.online_cpus)
     if pin_name.startswith("cpu:"):
-        cpu = parse_pin_cpu(pin_name)
-        return pin_for_cpus(device, pin_name, [cpu])
+        return pin_for_cpus(device, pin_name, parse_pin_cpus(pin_name))
     if pin_name.startswith("mask:"):
         mask = parse_pin_mask(pin_name)
         cpus = cpus_from_mask(mask)
@@ -2010,11 +2056,20 @@ def pin_for_cpus(device: DeviceContext, request: str, cpus: list[int]) -> PinSel
     return PinSelection(request=request, mask=f"{mask_from_cpus(selected):x}", cpus=selected)
 
 
-def parse_pin_cpu(pin_name: str) -> int:
+def parse_pin_cpus(pin_name: str) -> list[int]:
+    # taskset -c style sets: cpu:N, cpu:0-3, cpu:0,2,4-5
     value = pin_name.removeprefix("cpu:")
-    if not re.fullmatch(r"0|[1-9]\d*", value):
-        raise ValueError("cpu pin must be cpu:N")
-    return int(value)
+    cpus: list[int] = []
+    for part in value.split(","):
+        match = re.fullmatch(r"(0|[1-9]\d*)(?:-(0|[1-9]\d*))?", part)
+        if match is None:
+            raise ValueError("cpu pin must be cpu:N[,N-M,...]")
+        first = int(match.group(1))
+        last = int(match.group(2)) if match.group(2) is not None else first
+        if last < first:
+            raise ValueError(f"cpu pin range {part} is reversed")
+        cpus.extend(range(first, last + 1))
+    return cpus
 
 
 def parse_pin_mask(pin_name: str) -> int:
@@ -2312,6 +2367,7 @@ def run_host_bench(
     wasm_path: Path,
     media_path: Path,
     frame_range: tuple[int, int] | None,
+    pool: bool,
 ) -> dict[str, object]:
     cmd = [
         host_d8_path(),
@@ -2322,6 +2378,8 @@ def run_host_bench(
         str(wasm_path),
         "--bench",
     ]
+    if pool:
+        cmd.append("--pool")
     if frame_range is not None:
         start, last = frame_range
         cmd.extend(["--frames", f"{start}:{last}"])
@@ -2343,6 +2401,7 @@ def run_host_validation(
     wasm_path: Path,
     media_path: Path,
     validation: dict[str, object],
+    pool: bool,
 ) -> dict[str, object]:
     cmd = [
         host_d8_path(),
@@ -2352,6 +2411,8 @@ def run_host_validation(
         "--",
         str(wasm_path),
     ]
+    if pool:
+        cmd.append("--pool")
     if validation.get("allow_mismatch") is True:
         cmd.append("--allow-mismatch")
     frames = validation.get("frames")

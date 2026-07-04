@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pin",
-        help="device CPU pin: any, all, cpu:N, or mask:HEX"
+        help="device CPU pin: any, all, cpu:N[,N-M,...], or mask:HEX"
         " (default: pin from VIP9R_PERF_DEVICE=INDEX:PIN)",
     )
 
@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_frame_range,
         help="output-frame selection as START:LAST",
     )
+    add_pool_argument(validate)
 
     bench = subparsers.add_parser("bench", help="run full-decode timing")
     bench.add_argument(
@@ -74,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_frame_range,
         help="output-frame selection as START:LAST",
     )
+    add_pool_argument(bench)
     bench_baseline = bench.add_mutually_exclusive_group()
     bench_baseline.add_argument(
         "--baseline",
@@ -125,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=1000,
         help="simpleperf sample frequency in Hz (default 1000)",
     )
+    add_pool_argument(profile)
 
     asm = subparsers.add_parser(
         "asm", help="dump native asm of every declared wasm function"
@@ -136,6 +139,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="native target architecture",
     )
     return parser
+
+
+def add_pool_argument(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--pool",
+        action=argparse.BooleanOptionalAction,
+        help="spawn the worker pool and activate tile-parallel decode"
+        " (default: VIP9R_PERF_POOL)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -151,6 +163,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("asm runs on the daemon host; pick the ISA with --arch")
     if args.command == "profile" and args.target != "device":
         parser.error("profile requires --target device")
+
+    if args.command in ("validate", "bench", "profile"):
+        try:
+            pool = args.pool if args.pool is not None else pool_env_default()
+        except RuntimeError as error:
+            print(f"submit: {error}", file=sys.stderr)
+            return 2
 
     request: dict[str, object] = {"target": args.target}
     if args.target == "device":
@@ -180,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.frames is not None:
             request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
         request["freq"] = args.freq
+        if pool:
+            request["pool"] = True
         tests = False
     elif args.command == "microbench":
         request["kind"] = "microbench"
@@ -197,12 +218,16 @@ def main(argv: list[str] | None = None) -> int:
             request["allow_mismatch"] = True
         if args.frames is not None:
             request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
+        if pool:
+            request["pool"] = True
         tests = False
     elif args.command == "bench":
         request["kind"] = "bench"
         request["media"] = str(args.media)
         if args.frames is not None:
             request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
+        if pool:
+            request["pool"] = True
         tests = False
     else:
         raise AssertionError(f"unknown command: {args.command!r}")
@@ -354,6 +379,15 @@ def git_root() -> Path:
     if completed.returncode != 0:
         raise RuntimeError("could not find git checkout")
     return Path(completed.stdout.strip())
+
+
+def pool_env_default() -> bool:
+    value = os.environ.get("VIP9R_PERF_POOL")
+    if value is None or value == "":
+        return False
+    if value == "1":
+        return True
+    raise RuntimeError(f"VIP9R_PERF_POOL must be 1 or unset: {value!r}")
 
 
 def device_env_default() -> tuple[int | None, str | None]:

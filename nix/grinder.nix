@@ -97,7 +97,7 @@ in
       usage() {
         printf '%s\n' \
           'usage:' \
-          '  grinder run TASK_FILE --baseline WASM [--device INDEX:PIN]' \
+          '  grinder run TASK_FILE --baseline WASM [--device INDEX:PIN] [--pool]' \
           '  grinder shell [COMMAND...]' \
           '  grinder inspect [OPTIONS] [SESSION_JSONL_OR_DIR]' >&2
       }
@@ -124,6 +124,7 @@ in
       task_file=""
       baseline_file=""
       device_default=""
+      pool_default=""
       command=()
       case "$mode" in
         run)
@@ -142,6 +143,10 @@ in
               --device)
                 device_default="''${2:-}"
                 shift 2 || { usage; exit 2; }
+                ;;
+              --pool)
+                pool_default=1
+                shift
                 ;;
               *)
                 usage
@@ -244,6 +249,9 @@ in
       fi
       if [[ -n "$device_default" ]]; then
         podman_args+=(--env VIP9R_PERF_DEVICE="$device_default")
+      fi
+      if [[ -n "$pool_default" ]]; then
+        podman_args+=(--env VIP9R_PERF_POOL=1)
       fi
       # Name the container after the sandbox so it can be stopped by name;
       # TaskStop/SIGTERM on this wrapper must not orphan a running codex.

@@ -1,5 +1,7 @@
 import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
+import { spawnWorkerPool } from "./pool";
+import type { WorkerPool } from "./pool";
 import { parseWebm } from "../webm";
 import {
   createScratchVip9rMemory,
@@ -66,6 +68,7 @@ const DEFAULT_BENCHMARK_INPUT = "/bulk/vip9r/chromium/bear-vp9.ivf";
 
 export type DriverArgs = {
   allowMismatch: boolean;
+  pool: boolean;
   wasmPath: string;
   inputPath: string;
   goldenPath: string;
@@ -185,6 +188,7 @@ export type BenchmarkReport = {
   width: number;
   height: number;
   packetCount: number;
+  pool: boolean;
   outputOffset: number;
   outputFrames: number;
   validation: {
@@ -210,6 +214,7 @@ export class DriverUsageError extends Error {
 
 export function parseDriverArgs(args: string[]): DriverArgs {
   let allowMismatch = false;
+  let pool = false;
   let progressFrames: number | undefined;
   let frames: DecodeWindow | undefined;
   let bench = false;
@@ -224,6 +229,10 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     }
     if (arg === "--bench") {
       bench = true;
+      continue;
+    }
+    if (arg === "--pool") {
+      pool = true;
       continue;
     }
     if (arg.startsWith("--progress-frames=")) {
@@ -267,6 +276,7 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   const goldenPath = `${inputPath}.md5`;
   return {
     allowMismatch,
+    pool,
     wasmPath,
     inputPath,
     goldenPath,
@@ -279,7 +289,9 @@ export function parseDriverArgs(args: string[]): DriverArgs {
 export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonReport {
   const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
-  const decoder = instantiateVp9Decoder(wasm, decoderDimensions, io.log);
+  // The single pool (if any) lives for the whole comparison; workers die with
+  // the process (Worker.terminate at exit is the pinned shutdown story).
+  const { decoder } = instantiateVp9Decoder(wasm, decoderDimensions, io.log, args.pool);
 
   const report =
     args.frames !== undefined
@@ -304,7 +316,16 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   const targetMs = validPositiveIntegerValue("benchmark target ms", args.bench.targetMs);
   validateGoldenWindow(golden, window);
   const plan = planBenchmarkDecode(input, window);
-  const makeDecoder = () => instantiateVp9Decoder(wasm, decoderDimensions, io.log);
+  // Each pass gets a fresh decoder over a fresh shared memory; parked pool
+  // workers would keep every retired pass's memory reservation alive, so the
+  // previous pool is terminated before the next decoder spawns its own.
+  let livePool: WorkerPool | undefined;
+  const makeDecoder = () => {
+    livePool?.terminate();
+    const made = instantiateVp9Decoder(wasm, decoderDimensions, io.log, args.pool);
+    livePool = made.pool;
+    return made.decoder;
+  };
   const now = io.now ?? monotonicNow;
 
   const { validation, warmup } = runTimedWarmupValidation(
@@ -342,6 +363,7 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
     width: input.width,
     height: input.height,
     packetCount: input.packets.length,
+    pool: args.pool,
     outputOffset: window.outputOffset,
     outputFrames: window.outputFrames,
     validation: {
@@ -1468,14 +1490,26 @@ function instantiateVp9Decoder(
   wasm: WebAssembly.Module,
   decoderDimensions: { width: number; height: number },
   log: WasmLogSink,
-): Vp9Decoder {
+  pool: boolean,
+): { decoder: Vp9Decoder; pool?: WorkerPool } {
   const scratch = new WebAssembly.Instance(
     wasm,
     makeVip9rImports(createScratchVip9rMemory(), log),
   );
   const memory = createVip9rMemory(sessionMaxPages(scratch.exports, decoderDimensions));
   const instance = new WebAssembly.Instance(wasm, makeVip9rImports(memory, log));
-  return new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
+  const decoder = new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
+  if (!pool) {
+    return { decoder };
+  }
+  const workers = spawnWorkerPool(wasm, memory);
+  const activate = instance.exports.vip9r_pool_activate;
+  if (typeof activate !== "function") {
+    workers.terminate();
+    throw new Error("missing wasm export: vip9r_pool_activate");
+  }
+  activate();
+  return { decoder, pool: workers };
 }
 
 function monotonicNow(): number {

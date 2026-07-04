@@ -30,6 +30,7 @@ type GoldenJsonReport = {
   input: string;
   golden: string;
   allowMismatch: boolean;
+  pool: boolean;
   container: "ivf" | "webm";
   codec: "VP90" | "V_VP9";
   width: number;
@@ -108,6 +109,7 @@ function makeGoldenJsonReport(
     input: report.inputPath,
     golden: report.goldenPath,
     allowMismatch: args.allowMismatch,
+    pool: args.pool,
     container: report.container,
     codec: report.codec,
     width: report.width,
@@ -149,10 +151,10 @@ function makeGoldenJsonReport(
 
 function printUsage(out: (...values: unknown[]) => void = print): void {
   out(
-    "usage: wasm-golden [--allow-mismatch] [--frames START:LAST] [--progress-frames=N] [input.ivf|input.webm]",
+    "usage: wasm-golden [--allow-mismatch] [--pool] [--frames START:LAST] [--progress-frames=N] [input.ivf|input.webm]",
   );
   out(
-    "       wasm-golden --bench [--frames START:LAST] [input.ivf|input.webm]",
+    "       wasm-golden --bench [--pool] [--frames START:LAST] [input.ivf|input.webm]",
   );
 }
 

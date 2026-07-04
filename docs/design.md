@@ -258,6 +258,13 @@ Empirical behavior that shapes the protocol:
   works on the streamer too (its sysfs thermal zones are what shell can't
   read); its HAL section has no `BIG`, but reports a CPU-type `soc_max`
   sensor. The streamer showed flat timings under 3.5 min of sustained load.
+  Sustained 4-core load (2026-07-04, 10 min of pinned decode on all four
+  cores): no frequency derating — policy0 `scaling_cur_freq` held 2.0 GHz
+  throughout; `soc_max` rose 28 → 47 °C and was still flattening, thermal
+  status 0. Cross-core contention costs ~5% on a measured core (jellyfish
+  bench on cpu:0 with independent decode loops on cpus 1-3: 193.8 vs 184.6
+  ms/frame solo) and roughly 1% of extra spread, so 4-core scaling on this
+  device is compute-bound, not bandwidth- or thermally-bound.
 - Confidence instrumentation (in every daemon device response and bench
   report): the daemon brackets each device d8 run with pinned-CPU
   `scaling_cur_freq` and the HAL temperature (`BIG`, else first CPU-type
@@ -290,7 +297,18 @@ stays serialized. `serve` sorts device serials, so indices are stable for a
 given set of connected devices. Submissions address a device by index (`--device N`, or
 `VIP9R_PERF_DEVICE` inside grinder sandboxes) and state the CPU pin per
 request; timed kinds (bench, microbench, profile) require an explicit pin,
-validate/tests default to `any`. Bench submissions carry their own baseline
+validate/tests default to `any`. Pins take sets — `cpu:N`, `cpu:0-3`,
+`cpu:0,2,4-5`, or `mask:HEX` — verified against the taskset's actual
+`Cpus_allowed_list`; freq telemetry reads the first pinned CPU (both target
+clusters share one cpufreq policy). Validate, bench, and profile requests
+take a `pool` boolean (`--pool`/`--no-pool` on `vip9r-perf-submit`, defaulted
+from `VIP9R_PERF_POOL` set by `grinder run --pool`; `--pool` on
+`vip9r-corpus-golden.py` and on the wasm-golden runner itself), which
+spawns the 3-worker pool and calls `vip9r_pool_activate` per decoder
+instance; bench mode terminates each pass's pool before the next pass's
+decoder so retired shared-memory reservations are released. Pool is never
+inferred from the pin set and is rejected on other request kinds; responses
+echo `pool` at the run summary and runner-report levels. Bench submissions carry their own baseline
 wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE` (always set inside grinder
 sandboxes; `grinder run` requires `--baseline`) — or say `--no-op-control` to A/B the
 candidate against itself for a harness-noise reading. There are no quiet

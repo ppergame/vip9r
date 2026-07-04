@@ -443,29 +443,6 @@ with M6 threads for effort.
   `v128.load64_zero` lowered as two `ldr` + lane `vmov`s, vector constant
   rematerialization in loop-filter kernels
 
-### decode_residual structural reshape — gated spike (2026-07-04)
-
-The last named single-CPU lever of campaign scale. Evidence: current-tree
-profiles put the fused decode_residual monolith at 53-60% on all three 720p
-clips (jellyfish/BBB/citygen, temp/vip9r-profiles/d70a1394-*) — TurboFan's wasm
-inliner absorbs the `#[inline(never)]` inter_predict helpers (LLVM-only
-attribute), so the row is entropy + dequant + prediction + recon and its code
-layout is not under source control today. P5 PMU data (frontend stalls 13.1%,
-L1I:L1D refills 5:1) says the monolith's *shape\* taxes the in-order fetch
-engine. Arithmetic: threads at the ffvp9 ~2.9x anchor leaves jellyfish-class
-~1.4x over the A55 budget, needing ~−28% single-CPU on top — nothing else in the
-profiles is that size. Prior adjacent probes measured null/negative (branchless
-read_bool, icache cold-outlining, P1b traversal), so treat as a research bet,
-not an expected harvest.
-
-- [ ] time-boxed spike: probe whether any source-level shape (phase batching,
-      split/merge of the monolith, inlining barriers V8 respects) moves the L1I
-      phase-cycling cost or the frontend-stall share on the A55; asm + PMU
-      evidence first, counterbalanced bench to confirm any signal
-- [ ] decision point: escalate to a campaign only on a measured double-digit
-      seam; otherwise close single-CPU work and let M6 threads own the remaining
-      A55 gap
-
 ### M5 — demo page: play + bench
 
 Decode-and-play demo in desktop/device Chrome. Gated on M2 only; independent of
@@ -577,14 +554,18 @@ availability/MV search, no cross-tile pixel reads).
       activation settled with it: all-or-nothing 0/3, `vip9r_pool_activate`
       export, dispatch asserts, default-off serial. Verified on Chrome —
       three parked pool-worker targets during playback
-- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`) and an
+- [x] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`) and an
       explicit pool flag on the wasm runner / request config (never inferred
       from the pin set — serial-on-4-cores and oversubscribed-on-3-cores
       runs, e.g. the Pixel A720 cluster, stay expressible); characterize
       streamer thermals/frequency under sustained 4-core load.
       (Shared-vs-plain artifact detection dropped: the ABI break is accepted,
       old-ABI baselines are dead, cross-ABI A/B replaced by the logged-numbers
-      eyeball at the spike boundary)
+      eyeball at the spike boundary.) 2026-07-04: landed — `cpu:` pin sets
+      verified via Cpus_allowed_list; `pool` on validate/bench/profile
+      (`--pool` on submit, corpus-golden, runner), rejected elsewhere, echoed
+      in responses; streamer 10-min 4-core soak: 2.0 GHz held, soc_max
+      28→47°C flattening, ~5% cross-core contention — compute-bound scaling
 - [x] degrade story for the hardcoded-4-threads layout (2026-07-03): pool is
       all-or-nothing 0/3 — fewer-core clients run all 3 workers
       oversubscribed (correct, slow) or activate nothing and decode serially;
@@ -607,6 +588,32 @@ availability/MV search, no cross-tile pixel reads).
       gating, double-buffered input and workspaces), and it is inert on flag=0
       content — every probed YouTube track has `frame_parallel=0`. A
       jellyfish-class gap surviving tile + loop-filter parallelism is accepted
+
+### decode_residual structural reshape — gated spike (2026-07-04)
+
+Deferred behind M6 threads (2026-07-04): finish tile-parallel + loop-filter
+wavefront first, then revisit with threads-era profiles.
+
+The last named single-CPU lever of campaign scale. Evidence: current-tree
+profiles put the fused decode_residual monolith at 53-60% on all three 720p
+clips (jellyfish/BBB/citygen, temp/vip9r-profiles/d70a1394-*) — TurboFan's wasm
+inliner absorbs the `#[inline(never)]` inter_predict helpers (LLVM-only
+attribute), so the row is entropy + dequant + prediction + recon and its code
+layout is not under source control today. P5 PMU data (frontend stalls 13.1%,
+L1I:L1D refills 5:1) says the monolith's *shape\* taxes the in-order fetch
+engine. Arithmetic: threads at the ffvp9 ~2.9x anchor leaves jellyfish-class
+~1.4x over the A55 budget, needing ~−28% single-CPU on top — nothing else in the
+profiles is that size. Prior adjacent probes measured null/negative (branchless
+read_bool, icache cold-outlining, P1b traversal), so treat as a research bet,
+not an expected harvest.
+
+- [ ] time-boxed spike: probe whether any source-level shape (phase batching,
+      split/merge of the monolith, inlining barriers V8 respects) moves the L1I
+      phase-cycling cost or the frontend-stall share on the A55; asm + PMU
+      evidence first, counterbalanced bench to confirm any signal
+- [ ] decision point: escalate to a campaign only on a measured double-digit
+      seam; otherwise close single-CPU work and let M6 threads own the remaining
+      A55 gap
 
 ## M7 — Stretch
 

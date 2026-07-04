@@ -382,9 +382,13 @@ def build_wasm() -> None:
     )
 
 
-def run_one(d8: str, media: Path) -> tuple[Path, bool, str]:
+def run_one(d8: str, media: Path, pool_flag: bool) -> tuple[Path, bool, str]:
+    args = [d8, "--no-liftoff", "--module", str(RUNNER), "--", str(WASM)]
+    if pool_flag:
+        args.append("--pool")
+    args.append(str(media))
     proc = subprocess.run(
-        [d8, "--no-liftoff", "--module", str(RUNNER), "--", str(WASM), str(media)],
+        args,
         capture_output=True,
         text=True,
     )
@@ -433,6 +437,11 @@ def main() -> int:
         default=os.cpu_count(),
         help="concurrent d8 processes (default: all cores)",
     )
+    parser.add_argument(
+        "--pool",
+        action="store_true",
+        help="spawn the worker pool and activate tile-parallel decode",
+    )
     args = parser.parse_args()
 
     d8 = os.environ.get("D8_LINUX64")
@@ -458,7 +467,7 @@ def main() -> int:
     done = 0
     midline = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = [pool.submit(run_one, d8, path) for path in media]
+        futures = [pool.submit(run_one, d8, path, args.pool) for path in media]
         for future in concurrent.futures.as_completed(futures):
             path, ok, detail = future.result()
             done += 1

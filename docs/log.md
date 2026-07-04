@@ -1127,3 +1127,26 @@ streamer cpu0:
   mid-wait and at process exit, so no wasm-side shutdown path exists.
 - Suite: wasm tests 97/97 (95 + 2 pool), compliance corpus 307/307, vitest
   green. Decode path untouched.
+
+## 2026-07-04 — M6 threads: harness pool flag, pin sets, 4-core thermals
+
+- The perf harness now speaks threads. Pins take sets (`cpu:0-3`,
+  `cpu:0,2,4-5`), verified against the taskset's actual `Cpus_allowed_list`
+  like single pins always were. Validate, bench, and profile requests take an
+  explicit `pool` flag (`--pool` on `vip9r-perf-submit`,
+  `vip9r-corpus-golden.py`, and the wasm-golden runner itself): spawn the
+  3-worker pool, `vip9r_pool_activate`, per decoder instance. Never inferred
+  from the pin set — serial-on-4-cores and oversubscribed-on-3-cores stay
+  expressible; other request kinds reject it. Responses echo `pool` so a run
+  can't be misread. Bench mode terminates each pass's pool before the next
+  pass instantiates: parked workers would pin every retired pass's
+  shared-memory reservation, which arm32 address space cannot afford.
+- Verified end-to-end with today's (pool-inert) decoder: pooled golden and
+  bench on host d8, pooled validate through the daemon on the streamer under
+  `--pin cpu:0-3` (mask f, verified 0-3), pool wasm tests green, vitest green.
+- Streamer 4-core sustained-load characterization (10 min, one pinned decode
+  loop per core): no frequency derating — 2.0 GHz held throughout; `soc_max`
+  28 → 47 °C, still flattening, thermal status 0. Cross-core contention on a
+  measured core is ~5% (jellyfish on cpu:0 vs three-core load: 193.8 vs 184.6
+  ms/frame) plus ~1% extra spread. The M6 scaling budget is compute-bound:
+  neither thermals nor DRAM bandwidth will eat the multiplier.
