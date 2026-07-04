@@ -15,9 +15,11 @@ const utf8Decoder = typeof TextDecoder === "function" ? new TextDecoder("utf-8")
 
 export const WASM_PAGE_BYTES = 65536;
 
-// Must cover the module's declared import minimum (data + shadow stack, ~1.1
-// MiB today); instantiation fails loudly if the module ever outgrows it.
-const INITIAL_PAGES = 64;
+// Must cover the module's declared import minimum (shadow stacks 0..4 MiB —
+// coordinator + 3 fixed worker regions — then data pushed to 4 MiB by
+// --global-base, ~4.05 MiB total today); instantiation fails loudly if the
+// module ever outgrows it.
+const INITIAL_PAGES = 80;
 
 // The module decodes into an imported shared memory (threaded build). The
 // provided maximum must not exceed the module's declared --max-memory (4 GiB).

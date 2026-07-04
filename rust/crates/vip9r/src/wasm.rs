@@ -13,6 +13,16 @@ const INVALID_STATE: i32 = -9;
 const RESOURCE_LIMIT: i32 = -3;
 const WASM_PAGE: usize = 64 * 1024;
 const ARENA_ALIGN: usize = 16;
+// Threads (M6): 4 threads total, fixed-address shadow stacks. The coordinator
+// keeps the linker-default stack-first stack (0..1 MiB, size pinned by
+// -zstack-size in rust/.cargo/config.toml; overflow wraps below zero and
+// traps). The three workers bind the fixed 1 MiB regions at 1..4 MiB — tops
+// 0x200000 / 0x300000 / 0x400000 are ABI constants JS writes to a fresh
+// instance's exported `__stack_pointer` global, executing no wasm —
+// and --global-base pushes the data section to 4 MiB to keep the region
+// clear. Worker stacks have no overflow trap: overflow walks down into the
+// neighboring stack. arena_bounds asserts the linker honored the layout.
+const WORKER_STACKS_END: usize = 4 << 20;
 const MAX_CODED_FRAMES: usize = crate::MAX_CODED_FRAMES_PER_PACKET;
 const LOG_BUFFER_LEN: usize = 1024;
 
@@ -406,7 +416,7 @@ pub extern "C" fn vip9r_decode_next() -> i32 {
     status(session().decode_next())
 }
 
-// Exact static requirement in wasm pages (data + shadow stack + workspace
+// Exact static requirement in wasm pages (shadow stacks + data + workspace
 // arena) for a session with the given max dimensions; the growable packet
 // tail sits above it, so a memory maximum must add packet capacity on top.
 // Pure — callable on a throwaway instance so JS can size the real memory
@@ -426,6 +436,10 @@ fn required_pages(max_width: u32, max_height: u32) -> Result<i32, i32> {
 }
 
 fn arena_bounds(layout: WorkspaceLayout) -> Result<(usize, usize), i32> {
+    assert!(
+        heap_base() >= WORKER_STACKS_END,
+        "data section overlaps the worker stack region: --global-base flag missing"
+    );
     let workspace_base = align_up(heap_base(), ARENA_ALIGN)?;
     let workspace_end = workspace_base
         .checked_add(layout.total_bytes())

@@ -12,6 +12,17 @@
 # shared WebAssembly.Memory and picks a real maximum for its workload (the
 # provided maximum must be <= the declared one; V8 reserves the provided
 # maximum upfront for shared memories, which matters on arm32).
+#
+# Shadow stacks (threads), fixed-address layout: coordinator stack 0..1MiB
+# (rustc's default --stack-first; -zstack-size pins the size explicitly),
+# worker stacks fixed at 1..4MiB, and --global-base pushes the data section to
+# 4MiB to keep that region clear. Worker stack tops (0x200000 / 0x300000 /
+# 0x400000) are therefore ABI constants: JS rebinds each worker instance right
+# after instantiation via the exported __stack_pointer global
+# (instance.exports.__stack_pointer.value = top) without executing any wasm —
+# the only code that runs earlier is lld's stack-free __wasm_init_memory.
+# arena_bounds in wasm.rs asserts __heap_base >= 4MiB, so dropping
+# --global-base fails loudly at init.
 
 [build]
 target = "wasm32-unknown-unknown"
@@ -27,4 +38,7 @@ rustflags = [
   "-C", "link-arg=--import-memory",
   "-C", "link-arg=--export-memory",
   "-C", "link-arg=--max-memory=4294967296",
+  "-C", "link-arg=-zstack-size=1048576",
+  "-C", "link-arg=--global-base=4194304",
+  "-C", "link-arg=--export=__stack_pointer",
 ]

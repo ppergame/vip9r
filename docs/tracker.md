@@ -538,26 +538,39 @@ availability/MV search, no cross-tile pixel reads).
       `--frames` windows as the campaign did. build-std rebuild cost: core
       adds ~2-3s to a cold build (7s total on the workstation); grinder
       sandboxes always cold-build anyway — non-issue
-- [ ] shadow-stack binding: every instance initializes `__stack_pointer` to the
-      same linker address, so N instances over one shared memory alias one
-      shadow stack. Reserve per-worker stack regions in the arena; export a raw
-      `global.set __stack_pointer` shim (asm, `nostack` — it must not touch the
-      stack it is replacing) called as the worker's first export; coordinator
-      keeps the linker-default stack (`--stack-first` for overflow trapping);
-      only the coordinator instance touches static `SESSION`; verify lld's
-      `__wasm_init_memory` once-guard for passive segments
+- [x] shadow-stack binding (2026-07-03): `__stack_pointer` is a per-instance
+      mutable wasm global initialized to the same linker address, so N
+      instances over one shared memory alias one shadow stack. Landed as a
+      fixed-address layout: coordinator stack 0..1 MiB (stack-first, size
+      pinned via `-zstack-size`), three 1 MiB worker regions at 1..4 MiB with
+      ABI-constant tops (4 threads hardcoded), data pushed to 4 MiB via
+      `--global-base` (init-time assert fails loudly if the flag is dropped).
+      JS rebinds each worker via `--export=__stack_pointer` and the global's
+      `.value` setter right after instantiation — no asm shim and no wasm
+      executed pre-rebind (lld's `__wasm_init_memory` is stack-free by ABI
+      construction). Import-not-export is PIC-ABI-only and a stack-top
+      exported fn must run on an unbound instance; both rejected. Once-guard
+      and no-TLS verified by disassembly; mechanics and the main-thread-wait
+      caveat in `docs/design.md`. `SESSION` stays coordinator-only — enforced
+      by the worker pool item
 - [ ] worker pool runtime: JS spawns N−1 workers (d8 `Worker` / web `Worker`)
       over the shared memory; job dispatch via atomics +
       `memory.atomic.wait32`/`notify`; coordinator blocks only in its dedicated
       worker (blocking waits are illegal on the browser main thread; d8 allows
-      them anywhere); per-worker stacks and scratch land in the same memory —
-      once they enter `WorkspaceLayout`, `vip9r_required_pages` covers them
-      automatically
+      them anywhere); per-worker scratch lands in the same memory — once it
+      enters `WorkspaceLayout`, `vip9r_required_pages` covers it automatically;
+      spawn-time asserts on each fresh instance before rebinding, both pure
+      data reads: `__stack_pointer.value === 0x100000` (catches `-zstack-size`
+      drift, which the init-time `__heap_base` assert is blind to) and
+      `__heap_base.value >= 0x400000`
 - [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`);
       characterize streamer thermals/frequency under sustained 4-core load.
       (Shared-vs-plain artifact detection dropped: the ABI break is accepted,
       old-ABI baselines are dead, cross-ABI A/B replaced by the logged-numbers
       eyeball at the spike boundary)
+- [ ] decide the degrade story for the hardcoded-4-threads layout: clips with
+      more tile columns than threads and clients with fewer cores (minimum
+      correctness, not performance)
 - [ ] tile-parallel tile decode: per-thread `SyntaxCounts` (merge after join;
       skip accumulation entirely when adaptation is off — the `frame_parallel=1`
       corpus makes it dead work even single-threaded), per-thread

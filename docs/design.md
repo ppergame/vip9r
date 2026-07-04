@@ -372,18 +372,45 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
   no constant-folding of shared size). A55 first-pass TurboFan compile is
   ~3.7s, so full-window bench warmup validation trips its 5s deadline —
   A55 benches use `--frames` windows (campaign protocol anyway).
-- Still ahead for the worker pool: shadow-stack hazard — each instance
-  initializes `__stack_pointer` to the same linker-chosen address, so N
-  instances over one shared memory alias one shadow stack; each worker must
-  bind a distinct arena-reserved stack region via a raw
-  `global.set __stack_pointer` shim (asm, `nostack`) before any Rust frame
-  runs. Only the coordinator instance may touch the static `SESSION`. lld
-  guards passive-segment init (`__wasm_init_memory`) with a once-flag at a
-  fixed memory address — the spike only exercised fresh-memory-per-instance
-  (flag always zero); verify the multi-instance-one-memory path. Blocking
-  waits are illegal on the browser main thread — the coordinator lives in a
-  dedicated worker (the demo already decodes in one; d8 `Worker`s allow
-  blocking).
+- Shadow-stack binding (landed 2026-07-03). `__stack_pointer` is a
+  per-instance mutable i32 wasm *global* (out-of-band, not a memory word)
+  whose init value is baked at link time, so every instance over one shared
+  memory starts aliasing the coordinator's stack-first 0..1 MiB region. The
+  link exports the global (`--export=__stack_pointer`); JS rebinds a worker
+  instance with `instance.exports.__stack_pointer.value = top` immediately
+  after instantiation — no asm shim, and no wasm executes before the write:
+  the only pre-rebind code is lld's `__wasm_init_memory` start function,
+  stack-free by ABI construction (verified by disassembly). No TLS in the
+  module (`__tls_base` init-0, no `__wasm_init_tls`), so the stack pointer is
+  the only per-instance binding.
+- Layout: fixed addresses so the worker stack tops are ABI constants and no
+  code runs to learn them. Coordinator stack 0..1 MiB (linker stack-first;
+  overflow wraps below zero and traps; size pinned by `-zstack-size=1048576`,
+  the rustc default), three 1 MiB worker regions fixed at 1..4 MiB (tops
+  0x200000 / 0x300000 / 0x400000; 4 threads hardcoded), data pushed to 4 MiB
+  by `--global-base=4194304`. `arena_bounds` asserts `__heap_base` cleared
+  4 MiB so a dropped flag fails loudly at init; `vip9r_required_pages` covers
+  the stacks since they sit below the data + arena it already reports, and
+  `INITIAL_PAGES` in wasm-env.ts covers the grown declared minimum
+  (~4.05 MiB). Worker stacks have no overflow trap: overflow walks down into
+  the neighboring stack; accepted, 1 MiB is the stack the whole decoder
+  already fits in. Rejected alternatives: importing the global (value fixed
+  before instantiation) is PIC-ABI-only — recompile-the-world plus per-access
+  `__memory_base` indirection on a table-heavy decoder; a pure
+  `vip9r_worker_stack_top()` export either executes compiler-generated code
+  on a not-yet-rebound instance or relays the value through the coordinator's
+  spawn message; lld cannot synthesize custom exported const globals.
+- `__wasm_init_memory` once-guard mechanics (verified by disassembly): atomic
+  cmpxchg on a flag word linker-placed below `__data_end`; the winner
+  memory.inits the passive `.rodata`/`.data` segments, stores 2, notifies; a
+  racer that observes 1 blocks in `memory.atomic.wait32` (traps on the
+  browser main thread — instantiate the coordinator to completion before
+  spawning workers, after which they hit the flag=2 skip path); latecomers
+  skip straight to `data.drop`.
+- Still ahead for the worker pool: only the coordinator instance may touch
+  the static `SESSION`. Blocking waits are illegal on the browser main
+  thread — the coordinator lives in a dedicated worker (the demo already
+  decodes in one; d8 `Worker`s allow blocking).
 
 Expectations: ffvp9 frame threading measured ~2.9x on the A55 quad (one
 cpufreq policy, in-order cores) — treat that as the realistic scaling anchor.
