@@ -416,6 +416,13 @@ pub extern "C" fn vip9r_decode_next() -> i32 {
     status(session().decode_next())
 }
 
+// Worker thread entry (M6): a fresh instance over the shared memory parks
+// here after JS rebinds its shadow stack. Workers never touch SESSION.
+#[unsafe(no_mangle)]
+pub extern "C" fn vip9r_worker_main(worker_index: u32) -> ! {
+    crate::pool::worker_main(worker_index)
+}
+
 // Exact static requirement in wasm pages (shadow stacks + data + workspace
 // arena) for a session with the given max dimensions; the growable packet
 // tail sits above it, so a memory maximum must add packet capacity on top.

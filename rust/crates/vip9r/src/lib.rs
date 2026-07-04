@@ -1,5 +1,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
+// wasm atomic wait/notify are still feature-gated in stdarch; the build
+// already requires RUSTC_BOOTSTRAP=1 for build-std (rust/.cargo/config.toml),
+// which also unlocks this gate.
+#![feature(stdarch_wasm_atomic_wait)]
 
 #[macro_export]
 macro_rules! diag {
@@ -13,6 +17,10 @@ mod boolcoder;
 mod compressed_header;
 mod error;
 mod header;
+// dispatch/join are consumed only by the pool smoke tests until
+// tile-parallel decode lands; the expect flags when that's no longer true.
+#[cfg_attr(not(feature = "wasm-tests"), expect(dead_code))]
+mod pool;
 mod probability;
 mod superframe;
 mod tile;

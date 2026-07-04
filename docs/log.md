@@ -1105,3 +1105,25 @@ streamer cpu0:
   A non-growable memory (initial == maximum) measured null — V8 does not
   constant-fold the size for shared memories regardless. A55 first-pass
   compile grew to ~3.7s; A55 benches keep using `--frames` windows.
+
+## 2026-07-03 — M6 threads: worker pool runtime
+
+- First live multi-threaded wasm execution: three d8 workers instantiate the
+  module over the coordinator's shared memory, rebind their fixed shadow
+  stacks, and park in `memory.atomic.wait32` on a static control block.
+  Dispatch is an initial wave plus coordinator mop-up — no job queue; one
+  Release epoch bump publishes the job slots, one Acquire join load brings
+  worker writes back.
+- One protocol decision was load-bearing in review: the join counter counts
+  worker *acknowledgements* (always 3), not assigned jobs. Counting jobs
+  lets a join complete while an idle worker is still on its way to read its
+  empty slot — racing the next wave's slot rewrite with a torn read.
+- Smoke coverage runs as ordinary wasm tests: the d8 runner spawns live
+  workers for tests under the pool module; 50 back-to-back waves with
+  coordinator-side work between dispatch and join, plus a partial wave, all
+  writing through job-slot pointers into the coordinator's stack region.
+  The bounded test join turns missing or miswired workers into a failure
+  instead of a hang. Worker teardown is `Worker.terminate()` — probed safe
+  mid-wait and at process exit, so no wasm-side shutdown path exists.
+- Suite: wasm tests 97/97 (95 + 2 pool), compliance corpus 307/307, vitest
+  green. Decode path untouched.

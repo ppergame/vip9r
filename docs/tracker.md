@@ -556,16 +556,22 @@ availability/MV search, no cross-tile pixel reads).
       and no-TLS verified by disassembly; mechanics and the main-thread-wait
       caveat in `docs/design.md`. `SESSION` stays coordinator-only — enforced
       by the worker pool item
-- [ ] worker pool runtime: JS spawns N−1 workers (d8 `Worker` / web `Worker`)
-      over the shared memory; job dispatch via atomics +
-      `memory.atomic.wait32`/`notify`; coordinator blocks only in its dedicated
-      worker (blocking waits are illegal on the browser main thread; d8 allows
-      them anywhere); per-worker scratch lands in the same memory — once it
-      enters `WorkspaceLayout`, `vip9r_required_pages` covers it automatically;
-      spawn-time asserts on each fresh instance before rebinding, both pure
-      data reads: `__stack_pointer.value === 0x100000` (catches `-zstack-size`
-      drift, which the init-time `__heap_base` assert is blind to) and
-      `__heap_base.value >= 0x400000`
+- [x] worker pool runtime (2026-07-03): `pool.rs` static control block +
+      `vip9r_worker_main`, d8 spawn helper with the pure-data spawn asserts
+      (`__stack_pointer.value === 0x100000`, `__heap_base.value >= 0x400000`),
+      wasm-tests runner spawns live workers for `::pool::` tests. Protocol
+      detail settled in review: `remaining` counts worker *acknowledgements*
+      (always 3), not assigned jobs — job-count joins race the next wave's
+      slot rewrite against an idle worker's late slot read. Smoke tests:
+      50 full waves with coordinator mop-up work, partial wave with idle
+      workers; bounded test join turns missing/miswired workers into a
+      failure instead of a hang (no-workers path probed). Shutdown story
+      pinned: `Worker.terminate()`, safe mid-`wait32` and at process exit
+      (d8-probed); no wasm-side shutdown path. Per-worker scratch pointers
+      flow through job slots once tile-parallel decode defines them
+- [ ] web pool frontend: spawn the 3 workers from the demo's decode worker
+      (nested workers) over the shared memory, same rebind/asserts as the d8
+      helper; lands with tile-parallel demo integration
 - [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`);
       characterize streamer thermals/frequency under sustained 4-core load.
       (Shared-vs-plain artifact detection dropped: the ABI break is accepted,
@@ -582,9 +588,9 @@ availability/MV search, no cross-tile pixel reads).
       golden gates the merge as usual
 - [ ] loop filter SB-row wavefront: `loop_filter_frame` is the serial remainder
       after tile parallelism (~10-19% A55); parallelize as its own measured pass
-- [ ] demo: verify `VideoFrame` construction from SAB-backed views in Chrome;
-      the Cobalt spike gains a SAB/cross-origin-isolation probe. (vite
-      COOP/COEP headers landed with the ABI spike)
+- [x] demo: `VideoFrame` construction from SAB-backed views verified on Chrome
+      and Cobalt (user-tested 2026-07-03; vite COOP/COEP headers landed with
+      the ABI spike)
 - [x] frame-parallel decode: out of scope (2026-07-03) — complexity. It breaks
       the one-frame-owns-all-mutable-state invariant (per-frame
       probability/segmentation/mode-grid snapshots, per-row reference progress

@@ -4,6 +4,8 @@ declare const quit: (code?: number) => never;
 
 import { createVip9rMemory, formatWasmLog, makeVip9rImports, WasmLogKind } from "../wasm-driver/wasm-env";
 import type { WasmLog } from "../wasm-driver/wasm-env";
+import { spawnWorkerPool } from "../wasm-driver/pool";
+import type { WorkerPool } from "../wasm-driver/pool";
 
 export {};
 
@@ -43,6 +45,9 @@ type TestReport = {
 
 const TEST_PREFIX = "vip9r_test__";
 const TEST_FAILURE = 1;
+// Tests under the Rust pool module run against live workers; the runner owns
+// spawn and teardown so the wasm side stays a pure protocol.
+const POOL_TEST_MARKER = "::pool::";
 
 function main(args: string[]): void {
   const { wasmPath, json, testFilter } = parseArgs(args);
@@ -196,6 +201,7 @@ function emptyFilteredReport(testFilter: string, discovered: number): TestReport
 
 function runTest(module: WebAssembly.Module, testName: string): TestResult {
   const logs: WasmLog[] = [];
+  let pool: WorkerPool | undefined;
   try {
     // Unit tests init small decoder shapes; 64 MiB is plenty, and each test
     // gets a fresh memory alongside its fresh instance.
@@ -204,6 +210,9 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
     const test = instance.exports[testName];
     if (typeof test !== "function") {
       return fail("export is not callable", logs);
+    }
+    if (testName.includes(POOL_TEST_MARKER)) {
+      pool = spawnWorkerPool(module, memory);
     }
 
     const value = test();
@@ -219,6 +228,8 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
     return fail(`returned ${String(value)}`, logs);
   } catch (error) {
     return fail(errorMessage(error), logs);
+  } finally {
+    pool?.terminate();
   }
 }
 

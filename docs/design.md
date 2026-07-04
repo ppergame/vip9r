@@ -407,10 +407,44 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
   browser main thread — instantiate the coordinator to completion before
   spawning workers, after which they hit the flag=2 skip path); latecomers
   skip straight to `data.drop`.
-- Still ahead for the worker pool: only the coordinator instance may touch
-  the static `SESSION`. Blocking waits are illegal on the browser main
-  thread — the coordinator lives in a dedicated worker (the demo already
-  decodes in one; d8 `Worker`s allow blocking).
+- Worker pool mechanics (settled 2026-07-03, pre-implementation):
+  - Only the coordinator instance may touch the static `SESSION`. Blocking
+    waits are illegal on the browser main thread — the coordinator lives in
+    a dedicated worker (the demo already decodes in one; d8 `Worker`s allow
+    blocking).
+  - Control block is an ordinary Rust `static` — statics land in `.data`
+    above the worker stacks and below `__heap_base`, so workers reference it
+    symbolically at its link-time address and `WorkspaceLayout` is untouched
+    (it exists only for variable-size state). It is the only shared-mutable
+    static. Contents: `epoch` AtomicU32 go-word, `remaining` AtomicU32 join
+    counter, three per-worker job slots (tile descriptor/index;
+    `TileParserConfig` is identical across tiles so one shared field), and
+    per-worker scratch *pointers* carved by the coordinator from its
+    `WorkspaceLayout` — workers consume regions, never layout math (and the
+    arena keeps paying for scratch via `vip9r_required_pages`).
+  - Protocol: coordinator fills job slots, sets `remaining` to
+    WORKER_COUNT, bumps `epoch` with Release, notifies; workers
+    Acquire-load `epoch` and `memory.atomic.wait32` on the seen value (the
+    compare-and-block closes the lost-wakeup race; spurious wakes re-loop).
+    Every worker acknowledges every wave — `fetch_sub(1, Release)` on
+    `remaining` after it is done reading its slot, job or not — and the one
+    reaching zero notifies; the coordinator Acquire-waits after decoding
+    its own share. Counting acknowledgements rather than jobs is
+    load-bearing: a join that returned while an idle worker was still on
+    its way to read a None slot would race the next dispatch's slot
+    rewrite (torn `Option<Job>` read). All cross-thread pixel / mode-grid
+    handoff rides those two Release/Acquire edges — no per-field atomics.
+  - Teardown is JS `Worker.terminate()`: safe while the worker is parked in
+    `memory.atomic.wait32` and at process exit (d8-probed 2026-07-03); no
+    wasm-side shutdown path exists.
+  - Dispatch: no job queue. Coordinator dispatches an initial wave of one
+    tile per worker, decodes one tile itself, serially mops up any
+    remainder, then joins. Modal cases degrade cleanly: 4 tiles = wave of 3
+    + own tile + empty remainder; 2 tiles = wave of 1 with two None slots;
+    single-tile clips skip dispatch/join entirely. >4-tile clips serialize
+    the excess on the coordinator — accepted until content demands a queue.
+- `VideoFrame` construction from SAB-backed views verified on Chrome and
+  Cobalt (user-tested, 2026-07-03).
 
 Expectations: ffvp9 frame threading measured ~2.9x on the A55 quad (one
 cpufreq policy, in-order cores) — treat that as the realistic scaling anchor.
