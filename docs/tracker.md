@@ -507,8 +507,11 @@ ms/frame (4.3x over 33.3), BBB 109 (2.7x over 40); the post-wrap fusion pass
 trimmed a few percent more, and the single-thread entropy levers are now
 exhausted (fusion merged, branchless bool decision null). ffvp9 frame threading
 measured ~2.9x on the A55 quad — the realistic scaling anchor. At ~2.7-3x, BBB
-lands under budget; jellyfish lands ~1.5x over, so a residual gap likely
-survives and feeds the frame-parallel decision at the end.
+lands under budget; jellyfish lands ~1.5x over. Frame-parallel decode is out of
+scope (2026-07-03, complexity); any residual jellyfish-class gap is accepted.
+Perf benches gain a flag=0 lane — `youtube/mN9_buCmKLE` f247 720p30 (probed
+`frame_parallel=0`, `refresh_frame_context=1`) — so threads-era measurements
+cover both flag classes and counts/adaptation work stays measured.
 
 Content evidence: the entire 720p perf corpus is coded with 4 tile columns and
 `frame_parallel_decoding_mode=1`; youtube 720p tracks are 4 columns
@@ -582,9 +585,12 @@ availability/MV search, no cross-tile pixel reads).
 - [ ] demo: verify `VideoFrame` construction from SAB-backed views in Chrome;
       the Cobalt spike gains a SAB/cross-origin-isolation probe. (vite
       COOP/COEP headers landed with the ABI spike)
-- [ ] decision point: frame-parallel decode (per-row reference progress,
-      per-frame state snapshots, +1 frame latency) only if the A55 gap survives
-      tile + loop-filter parallelism
+- [x] frame-parallel decode: out of scope (2026-07-03) — complexity. It breaks
+      the one-frame-owns-all-mutable-state invariant (per-frame
+      probability/segmentation/mode-grid snapshots, per-row reference progress
+      gating, double-buffered input and workspaces), and it is inert on flag=0
+      content — every probed YouTube track has `frame_parallel=0`. A
+      jellyfish-class gap surviving tile + loop-filter parallelism is accepted
 
 ## M7 — Stretch
 

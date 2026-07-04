@@ -417,10 +417,27 @@ cpufreq policy, in-order cores) — treat that as the realistic scaling anchor.
 At ~2.7-3x, BBB (109 ms/frame at campaign wrap) lands under its 40 ms budget;
 jellyfish (144 ms/frame) lands ~1.5x over 33.3 ms. The single-thread entropy
 levers are exhausted (2026-07-03: parse→dequant fusion merged, branchless
-bool decision measured null), so the residual jellyfish gap points at
-stacking frame-parallel decode (per-row reference progress, per-frame state
-snapshots, +1 frame latency) — a separate later decision, taken only if the
-gap survives tile + loop-filter parallelism.
+bool decision measured null).
+
+Frame-parallel decode is out of scope (decided 2026-07-03, complexity). It
+would break the one-frame-owns-all-mutable-state invariant: per-frame
+snapshots of probability contexts / segmentation map / mode-MV grid, per-row
+reconstruction-progress gating on reference reads, two live current-frame
+workspaces, double-buffered packet input, +1 frame latency in the ABI. It is
+also inert on flag=0 content: with backward adaptation on, frame N+1's
+entropy state needs frame N's counts, which the fused parse produces only at
+frame completion — and every probed YouTube track (all four IDs, 480p and
+720p) codes `frame_parallel_decoding_mode=0` with `refresh_frame_context=1`
+(per-file header probe, 2026-07-03). A jellyfish-class gap that survives tile
++ loop-filter parallelism is accepted rather than chased.
+
+To keep flag=0 content honest in threads-era measurement, the perf bench set
+gains `youtube/mN9_buCmKLE` f247 720p30 (1280x720, ~1.5 Mbps, 36k frames,
+corpus-golden green) as the flag=0 lane. Counts accumulation and probability
+adaptation are live on this clip — unlike the `frame_parallel=1` realworld
+clips, where adaptation never runs — so "skip counts when adaptation is off"
+and per-thread counts merge both stay measured instead of optimized against
+a corpus that cannot see them.
 
 ## Work shape
 
@@ -467,7 +484,10 @@ Each vector has a `.md5` golden.
 - **Correctness:** `libvpx/` conformance vectors (profile 0 / 8-bit subset, IVF
   and WebM) plus `chromium/bear-vp9.ivf` as the default IVF smoke target.
 - **Performance:** `realworld/` 720p clips with distinct character (high-motion,
-  film grain, screen content, talking head).
+  film grain, screen content, talking head) — all `frame_parallel=1` — plus
+  `youtube/mN9_buCmKLE` f247 720p30 as the flag=0 lane (`frame_parallel=0`,
+  `refresh_frame_context=1`: probability adaptation runs on this clip and on
+  no other perf clip).
 
 ## Open design questions
 
