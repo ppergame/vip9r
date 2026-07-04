@@ -1,5 +1,30 @@
+# Threaded-wasm build (M6). Stable cargo honors [unstable] only when
+# RUSTC_BOOTSTRAP=1 is in cargo's own environment (devshell, wrappers, and
+# harness scripts all export it). Without it the build fails loudly at link
+# time: prebuilt core objects reject --shared-memory.
+#
+# build-std=core: core must be compiled with +atomics,+bulk-memory for the
+# shared-memory link. compiler-builtins-mem is not needed: with +bulk-memory
+# LLVM lowers memcpy/memset intrinsics to memory.copy/memory.fill, and the
+# linked module has no memcpy import (verified 2026-07-03, rustc 1.96.0).
+#
+# --max-memory=4GiB is the declared ceiling only; each JS frontend creates the
+# shared WebAssembly.Memory and picks a real maximum for its workload (the
+# provided maximum must be <= the declared one; V8 reserves the provided
+# maximum upfront for shared memories, which matters on arm32).
+
 [build]
 target = "wasm32-unknown-unknown"
 
+[unstable]
+build-std = ["core"]
+
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "panic=abort", "-C", "target-feature=+simd128"]
+rustflags = [
+  "-C", "panic=abort",
+  "-C", "target-feature=+simd128,+atomics,+bulk-memory",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--export-memory",
+  "-C", "link-arg=--max-memory=4294967296",
+]

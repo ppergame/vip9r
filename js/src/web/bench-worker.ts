@@ -88,7 +88,7 @@ type Vip9rPassStats = {
 };
 
 async function vip9rLane(input: DemuxedVp9, packets: Vp9Packet[]): Promise<LaneResult> {
-  const { instance, memory } = await instantiateVip9r((message) =>
+  const { instance, memory } = await instantiateVip9r(input, (message) =>
     post({ type: "log", message, error: true }),
   );
   const decoder = new Vp9Decoder(instance, input.width, input.height);

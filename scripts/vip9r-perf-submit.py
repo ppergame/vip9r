@@ -298,7 +298,7 @@ def build_release_candidate() -> Path:
     ]
     # cwd must be the workspace: cargo resolves .cargo/config.toml (which
     # carries target-feature flags) from cwd, not --manifest-path.
-    completed = subprocess.run(cmd, check=False, cwd=rust_root)
+    completed = subprocess.run(cmd, check=False, cwd=rust_root, env=cargo_env())
     if completed.returncode != 0:
         raise RuntimeError(f"release wasm build exited {completed.returncode}")
     return wasm_path
@@ -323,10 +323,16 @@ def build_wasm_tests_candidate() -> Path:
         "--features",
         "wasm-tests",
     ]
-    completed = subprocess.run(cmd, check=False, cwd=rust_root)
+    completed = subprocess.run(cmd, check=False, cwd=rust_root, env=cargo_env())
     if completed.returncode != 0:
         raise RuntimeError(f"wasm-tests build exited {completed.returncode}")
     return wasm_path
+
+
+def cargo_env() -> dict[str, str]:
+    # Threaded-wasm build: stable cargo honors the [unstable] build-std table
+    # in .cargo/config.toml only with this in its environment.
+    return {**os.environ, "RUSTC_BOOTSTRAP": "1"}
 
 
 def locate_rust_workspace() -> Path:

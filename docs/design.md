@@ -164,10 +164,20 @@ or decode errors.
 ### Wasm boundary
 
 The `vip9r` wasm module exposes the manual integer ABI used by the paired JS
-binding: `vip9r_result_ptr`, `vip9r_init`, `vip9r_reserve_input`,
-`vip9r_begin_packet`, and `vip9r_decode_next`. Mutating exports return `0` for
-success or a negative error code; those codes are binding details, not a stable
-external API.
+binding: `vip9r_result_ptr`, `vip9r_required_pages`, `vip9r_init`,
+`vip9r_reserve_input`, `vip9r_begin_packet`, and `vip9r_decode_next`. Mutating
+exports return `0` for success or a negative error code; those codes are
+binding details, not a stable external API.
+
+`vip9r_required_pages(max_width, max_height)` is pure: it returns the exact
+static requirement in wasm pages (data + shadow stack + workspace arena) or a
+negative error code. Memory is imported, so JS must fix the real memory's
+maximum before instantiation: it instantiates a throwaway instance over a
+minimal scratch memory, queries `vip9r_required_pages`, and sizes the real
+memory as required pages plus a flat 8 MiB packet-tail budget
+(`sessionMaxPages` in wasm-env.ts; anchors: largest 1080p corpus packet
+504 KiB, level 4.1 CPB 3 MiB, lossless keyframe ~3.1 MiB — a multi-frame
+lossless superframe is the accepted fail-loud RESOURCE_LIMIT case).
 
 The result block is a `u32` table in wasm memory. `reserve_input` publishes the
 packet-tail pointer and capacity; JS copies one complete demuxed VP9
@@ -175,13 +185,14 @@ packet/superframe there; `begin_packet(len)` splits it into up to 8 coded-frame
 ranges; `decode_next` consumes exactly one range and records `has_output`,
 `packet_done`, dimensions, and native Y/U/V plane descriptors.
 
-Wasm lays out the fixed workspace once from the instance max dimensions,
-currently one current I420 frame slot plus 8 reference slots, followed by the
-growable packet tail. The packet tail is the only region `reserve_input` may
-grow. Persistent wasm state stores offsets, ranges, and layout descriptors, not
-long-lived Rust slices; slices are formed only inside exports after bounds
-checks. JS must refresh `memory.buffer` views after `reserve_input`, and output
-plane descriptors are ephemeral until the next wasm decoder call.
+Wasm lays out the fixed workspace once from the instance max dimensions:
+currently one current I420 frame slot plus 8 reference slots, followed by two
+packed mode-history slots, then the growable packet tail. The packet tail is the
+only region `reserve_input` may grow. Persistent wasm state stores offsets,
+ranges, and layout descriptors, not long-lived Rust slices; slices are formed
+only inside exports after bounds checks. JS must refresh `memory.buffer` views
+after `reserve_input`, and output plane descriptors are ephemeral until the next
+wasm decoder call.
 
 ## Measurement
 
@@ -321,23 +332,58 @@ parallel tiles need contained-unsafe disjoint views. `loop_filter_frame` runs
 frame-wide after the tiles and crosses tile edges by spec; it parallelizes
 separately as an SB-row wavefront.
 
-Platform mechanics: `+atomics,+bulk-memory` requires `core` built with the
-same features. The flake is hermetic, so bootstrap the pinned stable
-toolchain: `RUSTC_BOOTSTRAP=1` plus `-Zbuild-std=core`
-`-Zbuild-std-features=compiler-builtins-mem` (`rust-src` is already a pinned
-component; without the mem feature, build-std drops memcpy/memset). Link with
-`--shared-memory --import-memory --max-memory=N`; JS creates the shared
-`WebAssembly.Memory` and every frontend's instantiation changes. Shadow-stack
-hazard: each instance of the module initializes `__stack_pointer` to the same
-linker-chosen address, so N instances over one shared memory alias one shadow
-stack — each worker must bind a distinct arena-reserved stack region via a raw
-`global.set __stack_pointer` shim (asm, `nostack`; it must not touch the stack
-it is replacing) before any Rust frame runs. Only the coordinator instance may
-touch the static `SESSION`. lld guards passive-segment init
-(`__wasm_init_memory`) with a once-flag; verify rather than assume. Blocking
-waits (`memory.atomic.wait32`) are illegal on the browser main thread — the
-coordinator lives in a dedicated worker (the demo already decodes in one; d8
-`Worker`s allow blocking).
+Platform mechanics (verified by the 2026-07-03 ABI spike; the build is
+threaded unconditionally, single ABI, old-ABI baselines retired):
+
+- `+atomics,+bulk-memory` requires `core` built with the same features —
+  prebuilt core objects make lld reject `--shared-memory`. Wiring:
+  `rust/.cargo/config.toml` carries `[unstable] build-std = ["core"]` plus the
+  target features and link args; stable cargo honors `[unstable]` only when
+  `RUSTC_BOOTSTRAP=1` is in cargo's own environment (config `[env]` does not
+  reach cargo itself), so the devshell, the wasm-tool wrappers, the harness
+  scripts, and the grinder podman env all export it. A missing export fails
+  loudly at link time. `compiler-builtins-mem` is NOT needed: with
+  +bulk-memory LLVM lowers memcpy/memset intrinsics to memory.copy/fill and
+  the linked module has no memcpy import (rustc 1.96.0). build-std adds ~2-3s
+  of core compile to a cold build; grinder sandboxes always cold-build.
+- Link `--shared-memory --import-memory --export-memory --max-memory=4GiB`.
+  Re-exporting the imported memory keeps `exports.memory` and the whole wasm
+  ABI intact; only instantiation sites changed. The 4GiB declared max is a
+  ceiling only — each JS frontend creates the shared `WebAssembly.Memory`
+  (`createVip9rMemory` in wasm-env.ts) and provides a workload-sized maximum
+  (exact static requirement from `vip9r_required_pages` + 8 MiB packet tail;
+  see the wasm boundary section), because V8 reserves the provided maximum
+  upfront for shared memories — address space that must actually fit on
+  arm32. TextDecoder rejects SAB-backed views; wasm-env copies before
+  decoding logs.
+- Measured cost of the shared-memory build, single-threaded (counterbalanced
+  no-op benches vs logged numbers): X4/arm64 none (jelly 9.4 ms/f vs ~10.4
+  logged); A55/arm32 +5% jelly / +8.5% BBB. Mechanism (profile + asm diff):
+  V8 disables its memory-size instance cache for shared memories, so every
+  bounds-check region reloads the size — decode_block `ldr [instance,#size]`
+  65 → 556, +19% trap branches, +8.8% bytes; decode_residual 219 → 999 —
+  a serialized load→sub→cmp→bcs chain per guarded access that the in-order
+  core can't hide (X4 hides it entirely). Regression is concentrated in
+  scalar entropy code (decode_block +32% absolute, mode-info +18%); simd
+  kernels and libc copy cost are flat (relaxed-memcpy theory falsified;
+  memory *base* is now a hoisted constant, 82 reloads → 1). No atomics
+  emitted. Not source-fixable; size is monotonic so a future V8 could
+  legally re-cache it. initial == maximum does not help (measured null —
+  no constant-folding of shared size). A55 first-pass TurboFan compile is
+  ~3.7s, so full-window bench warmup validation trips its 5s deadline —
+  A55 benches use `--frames` windows (campaign protocol anyway).
+- Still ahead for the worker pool: shadow-stack hazard — each instance
+  initializes `__stack_pointer` to the same linker-chosen address, so N
+  instances over one shared memory alias one shadow stack; each worker must
+  bind a distinct arena-reserved stack region via a raw
+  `global.set __stack_pointer` shim (asm, `nostack`) before any Rust frame
+  runs. Only the coordinator instance may touch the static `SESSION`. lld
+  guards passive-segment init (`__wasm_init_memory`) with a once-flag at a
+  fixed memory address — the spike only exercised fresh-memory-per-instance
+  (flag always zero); verify the multi-instance-one-memory path. Blocking
+  waits are illegal on the browser main thread — the coordinator lives in a
+  dedicated worker (the demo already decodes in one; d8 `Worker`s allow
+  blocking).
 
 Expectations: ffvp9 frame threading measured ~2.9x on the A55 quad (one
 cpufreq policy, in-order cores) — treat that as the realistic scaling anchor.

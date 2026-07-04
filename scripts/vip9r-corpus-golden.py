@@ -376,6 +376,9 @@ def build_wasm() -> None:
         # cwd must be the workspace: cargo resolves .cargo/config.toml (which
         # carries target-feature flags) from cwd, not --manifest-path.
         cwd=REPO_ROOT / "rust",
+        # Threaded-wasm build: stable cargo honors the [unstable] build-std
+        # table in .cargo/config.toml only with this in its environment.
+        env={**os.environ, "RUSTC_BOOTSTRAP": "1"},
     )
 
 

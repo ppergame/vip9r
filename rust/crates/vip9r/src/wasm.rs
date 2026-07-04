@@ -228,12 +228,8 @@ impl Session {
         let layout = WorkspaceLayout::new(max_width, max_height).map_err(|err| err.code())?;
         let decoder = Decoder::new(layout);
 
-        let workspace_base = align_up(heap_base(), ARENA_ALIGN)?;
+        let (workspace_base, input_base) = arena_bounds(layout)?;
         let workspace_len = layout.total_bytes();
-        let workspace_end = workspace_base
-            .checked_add(workspace_len)
-            .ok_or(RESOURCE_LIMIT)?;
-        let input_base = align_up(workspace_end, ARENA_ALIGN)?;
         ensure_memory(input_base)?;
         let memory_len = memory_len()?;
         if input_base > memory_len {
@@ -408,6 +404,34 @@ pub extern "C" fn vip9r_begin_packet(len: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn vip9r_decode_next() -> i32 {
     status(session().decode_next())
+}
+
+// Exact static requirement in wasm pages (data + shadow stack + workspace
+// arena) for a session with the given max dimensions; the growable packet
+// tail sits above it, so a memory maximum must add packet capacity on top.
+// Pure — callable on a throwaway instance so JS can size the real memory
+// before instantiation. Negative error code if the dimensions are rejected.
+#[unsafe(no_mangle)]
+pub extern "C" fn vip9r_required_pages(max_width: u32, max_height: u32) -> i32 {
+    match required_pages(max_width, max_height) {
+        Ok(pages) => pages,
+        Err(code) => code,
+    }
+}
+
+fn required_pages(max_width: u32, max_height: u32) -> Result<i32, i32> {
+    let layout = WorkspaceLayout::new(max_width, max_height).map_err(|err| err.code())?;
+    let (_, input_base) = arena_bounds(layout)?;
+    i32::try_from(input_base.div_ceil(WASM_PAGE)).map_err(|_| RESOURCE_LIMIT)
+}
+
+fn arena_bounds(layout: WorkspaceLayout) -> Result<(usize, usize), i32> {
+    let workspace_base = align_up(heap_base(), ARENA_ALIGN)?;
+    let workspace_end = workspace_base
+        .checked_add(layout.total_bytes())
+        .ok_or(RESOURCE_LIMIT)?;
+    let input_base = align_up(workspace_end, ARENA_ALIGN)?;
+    Ok((workspace_base, input_base))
 }
 
 fn status(result: Result<(), i32>) -> i32 {

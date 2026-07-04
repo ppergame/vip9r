@@ -3,7 +3,7 @@ declare const print: (...values: unknown[]) => void;
 declare const printErr: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
-import { instanceMemory, makeVip9rImports } from "./wasm-env";
+import { createVip9rMemory, makeVip9rImports } from "./wasm-env";
 import type { WasmLog } from "./wasm-env";
 
 export {};
@@ -49,14 +49,9 @@ function main(args: string[]): void {
   const parsed = parseArgs(args);
   const logs: WasmLog[] = [];
   const module = new WebAssembly.Module(readbuffer(parsed.wasmPath));
-  let instance: WebAssembly.Instance | undefined;
-  const imports = makeVip9rImports(() => {
-    if (instance === undefined) {
-      throw new Error("vip9r_log called before wasm instance was assigned");
-    }
-    return instanceMemory(instance);
-  }, (log) => logs.push(log));
-  instance = new WebAssembly.Instance(module, imports);
+  // Microbench kernels run on small fixed scratch; 64 MiB is plenty.
+  const memory = createVip9rMemory(1024);
+  const instance = new WebAssembly.Instance(module, makeVip9rImports(memory, (log) => logs.push(log)));
   const bench = benchExport(instance);
 
   const now = nowMs;

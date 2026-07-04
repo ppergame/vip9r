@@ -517,12 +517,27 @@ entropy decode — the cost share nothing else touches — and the tile loop is
 already parallel-shaped (per-tile BoolDecoder and scratch, tile-scoped
 availability/MV search, no cross-tile pixel reads).
 
-- [ ] toolchain + ABI spike: `RUSTC_BOOTSTRAP=1` on the pinned stable toolchain,
-      `-Zbuild-std=core` `-Zbuild-std-features=compiler-builtins-mem`, target
-      features `+atomics,+bulk-memory`, link
-      `--shared-memory --import-memory     --max-memory=N`; JS frontends create
-      and import the shared `WebAssembly.Memory`; golden stays green running
-      single-threaded on the threaded build
+- [x] toolchain + ABI spike (2026-07-03): SAB unconditional, single ABI, old
+      baselines retired — perf compares against logged numbers. Stable cargo
+      honors `[unstable] build-std = ["core"]` in `rust/.cargo/config.toml`
+      when `RUSTC_BOOTSTRAP=1` is in cargo's own env (exported by devshell,
+      wasm-tool wrappers, harness scripts, grinder sandbox; a missing export
+      fails loudly at link). `compiler-builtins-mem` NOT needed: +bulk-memory
+      lowers memcpy/memset intrinsics natively, artifact has no memcpy import.
+      Memory imported and re-exported (`--import-memory --export-memory
+      --max-memory=4GiB`) so `exports.memory` and the wasm fn ABI survive; JS
+      frontends create the shared memory, maximum sized per workload
+      (`maxPagesForDims` 32MB + 32B/px; measured peaks: 720p 14.4MB,
+      largescaling 61.5MB; V8 reserves the provided max upfront — matters on
+      arm32). Corpus 307/307, wasm tests 95/95, vitest green. Perf: X4 jelly
+      9.4 ms/f (vs ~10.4 logged, no regression); A55 jelly 138.4 vs ~132
+      (+5%), BBB 101.5 vs ~93.5 (+8.5%) — arm32 shared-memory codegen tax
+      (decode_residual +2.3% bytes / +6% ldr, no atomics emitted), accepted as
+      the entry fee of the threads route. A55 first-pass compile ~3.7s now
+      trips the full-window bench warmup deadline — A55 benches keep using
+      `--frames` windows as the campaign did. build-std rebuild cost: core
+      adds ~2-3s to a cold build (7s total on the workstation); grinder
+      sandboxes always cold-build anyway — non-issue
 - [ ] shadow-stack binding: every instance initializes `__stack_pointer` to the
       same linker address, so N instances over one shared memory alias one
       shadow stack. Reserve per-worker stack regions in the arena; export a raw
@@ -535,12 +550,14 @@ availability/MV search, no cross-tile pixel reads).
       over the shared memory; job dispatch via atomics +
       `memory.atomic.wait32`/`notify`; coordinator blocks only in its dedicated
       worker (blocking waits are illegal on the browser main thread; d8 allows
-      them anywhere)
-- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`); driver
-      detects shared-vs-plain memory per artifact (`WebAssembly.Module.imports`)
-      so threaded candidates A/B against single-thread baselines under the
-      existing counterbalanced protocol; characterize streamer
-      thermals/frequency under sustained 4-core load
+      them anywhere); per-worker stacks and scratch land in the same memory —
+      once they enter `WorkspaceLayout`, `vip9r_required_pages` covers them
+      automatically
+- [ ] harness: daemon pin-set support for timed kinds (e.g. `cpu:0-3`);
+      characterize streamer thermals/frequency under sustained 4-core load.
+      (Shared-vs-plain artifact detection dropped: the ABI break is accepted,
+      old-ABI baselines are dead, cross-ABI A/B replaced by the logged-numbers
+      eyeball at the spike boundary)
 - [ ] tile-parallel tile decode: per-thread `SyntaxCounts` (merge after join;
       skip accumulation entirely when adaptation is off — the `frame_parallel=1`
       corpus makes it dead work even single-threaded), per-thread
@@ -549,9 +566,9 @@ availability/MV search, no cross-tile pixel reads).
       golden gates the merge as usual
 - [ ] loop filter SB-row wavefront: `loop_filter_frame` is the serial remainder
       after tile parallelism (~10-19% A55); parallelize as its own measured pass
-- [ ] demo: vite COOP/COEP headers for SAB; verify `VideoFrame` construction
-      from SAB-backed views in Chrome; the Cobalt spike gains a
-      SAB/cross-origin-isolation probe
+- [ ] demo: verify `VideoFrame` construction from SAB-backed views in Chrome;
+      the Cobalt spike gains a SAB/cross-origin-isolation probe. (vite
+      COOP/COEP headers landed with the ABI spike)
 - [ ] decision point: frame-parallel decode (per-row reference progress,
       per-frame state snapshots, +1 frame latency) only if the A55 gap survives
       tile + loop-filter parallelism

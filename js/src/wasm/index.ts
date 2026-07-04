@@ -122,6 +122,10 @@ export class Vp9Decoder {
     return new Uint8Array(this.exports.memory.buffer, plane.offset, plane.byteLength);
   }
 
+  memoryByteLength(): number {
+    return this.exports.memory.buffer.byteLength;
+  }
+
   private refreshViews(): void {
     this.bytes = new Uint8Array(this.exports.memory.buffer);
     this.result = new Uint32Array(

@@ -1,7 +1,12 @@
 import { Vp9Decoder } from "../wasm";
 import type { DecodeStep, NativeFrame, Plane } from "../wasm";
 import { parseWebm } from "../webm";
-import { instanceMemory, makeVip9rImports } from "./wasm-env";
+import {
+  createScratchVip9rMemory,
+  createVip9rMemory,
+  makeVip9rImports,
+  sessionMaxPages,
+} from "./wasm-env";
 import type { WasmLog, WasmLogSink } from "./wasm-env";
 
 export { formatWasmLog, WasmLogKind } from "./wasm-env";
@@ -97,6 +102,9 @@ export type ComparisonReport = {
   skippedOutputFrames: number;
   comparisons: FrameComparison[];
   expectedCount: number;
+  // Final linear memory size; memory only grows, so this is peak use.
+  // Evidence for the packet-tail budget in sessionMaxPages.
+  finalMemoryBytes?: number;
 };
 
 export type ProgressEvent = {
@@ -273,14 +281,15 @@ export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonR
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
   const decoder = instantiateVp9Decoder(wasm, decoderDimensions, io.log);
 
-  if (args.frames !== undefined) {
-    return compareDecodedVp9WindowToGolden(args.inputPath, args.goldenPath, input, golden, decoder, args.frames);
-  }
-
-  return compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder, {
-    progressFrames: args.progressFrames,
-    onProgress: io.progress,
-  });
+  const report =
+    args.frames !== undefined
+      ? compareDecodedVp9WindowToGolden(args.inputPath, args.goldenPath, input, golden, decoder, args.frames)
+      : compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder, {
+          progressFrames: args.progressFrames,
+          onProgress: io.progress,
+        });
+  report.finalMemoryBytes = decoder.memoryByteLength();
+  return report;
 }
 
 export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkReport {
@@ -1460,14 +1469,12 @@ function instantiateVp9Decoder(
   decoderDimensions: { width: number; height: number },
   log: WasmLogSink,
 ): Vp9Decoder {
-  let instance: WebAssembly.Instance | undefined;
-  const imports = makeVip9rImports(() => {
-    if (instance === undefined) {
-      throw new Error("vip9r_log called before wasm instance was assigned");
-    }
-    return instanceMemory(instance);
-  }, log);
-  instance = new WebAssembly.Instance(wasm, imports);
+  const scratch = new WebAssembly.Instance(
+    wasm,
+    makeVip9rImports(createScratchVip9rMemory(), log),
+  );
+  const memory = createVip9rMemory(sessionMaxPages(scratch.exports, decoderDimensions));
+  const instance = new WebAssembly.Instance(wasm, makeVip9rImports(memory, log));
   return new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
 }
 

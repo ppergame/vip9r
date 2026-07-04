@@ -49,6 +49,7 @@ type GoldenJsonReport = {
   missingCount: number;
   extraCount: number;
   mismatches: FrameComparison[];
+  finalMemoryBytes?: number;
   wasmLogs?: WasmLog[];
 };
 
@@ -136,6 +137,9 @@ function makeGoldenJsonReport(
   }
   if (report.timestampScale !== undefined) {
     jsonReport.timestampScale = report.timestampScale;
+  }
+  if (report.finalMemoryBytes !== undefined) {
+    jsonReport.finalMemoryBytes = report.finalMemoryBytes;
   }
   if (wasmLogs.length !== 0) {
     jsonReport.wasmLogs = wasmLogs;

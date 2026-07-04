@@ -86,7 +86,7 @@ async function decodeAll(media: ArrayBuffer): Promise<void> {
     packets: input.packets.length,
   });
 
-  const { instance, memory } = await instantiateVip9r((message) =>
+  const { instance, memory } = await instantiateVip9r(input, (message) =>
     post({ type: "log", message, error: true }),
   );
   const decoder = new Vp9Decoder(instance, input.width, input.height);

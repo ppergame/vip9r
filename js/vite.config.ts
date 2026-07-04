@@ -56,14 +56,25 @@ function mediaCorpus(): Plugin {
   };
 }
 
+// SharedArrayBuffer (the wasm module imports a shared memory) requires
+// cross-origin isolation.
+const crossOriginIsolation = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
 export default defineConfig({
   plugins: [mediaCorpus()],
   server: {
+    headers: crossOriginIsolation,
     fs: {
       // The wasm module is imported by URL from rust/target, outside the js
       // workspace root.
       allow: [repoRoot],
     },
+  },
+  preview: {
+    headers: crossOriginIsolation,
   },
   build: {
     target: "es2022",

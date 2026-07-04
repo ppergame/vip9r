@@ -230,7 +230,7 @@ async function startBenchRun(): Promise<void> {
 }
 
 async function bootWasmCheck(): Promise<void> {
-  const { instance } = await instantiateVip9r((message) =>
+  const { instance } = await instantiateVip9r({ width: 1280, height: 720 }, (message) =>
     log(message, "error"),
   );
   new Vp9Decoder(instance, 1280, 720);

@@ -71,6 +71,10 @@
     };
 
     devShells.${system}.default = pkgs.mkShell {
+      # Threaded-wasm build: lets stable cargo honor the [unstable] build-std
+      # table in rust/.cargo/config.toml.
+      RUSTC_BOOTSTRAP = "1";
+
       V8_LINUX64 = "${v8.linux64}";
       V8_ANDROID_ARM32 = "${v8.androidArm32}";
       V8_ANDROID_ARM64 = "${v8.androidArm64}";

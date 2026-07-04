@@ -2,7 +2,7 @@ declare const readbuffer: (path: string) => ArrayBuffer;
 declare const print: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
-import { formatWasmLog, instanceMemory, makeVip9rImports, WasmLogKind } from "../wasm-driver/wasm-env";
+import { createVip9rMemory, formatWasmLog, makeVip9rImports, WasmLogKind } from "../wasm-driver/wasm-env";
 import type { WasmLog } from "../wasm-driver/wasm-env";
 
 export {};
@@ -197,14 +197,10 @@ function emptyFilteredReport(testFilter: string, discovered: number): TestReport
 function runTest(module: WebAssembly.Module, testName: string): TestResult {
   const logs: WasmLog[] = [];
   try {
-    let instance: WebAssembly.Instance | undefined;
-    const imports = makeVip9rImports(() => {
-      if (instance === undefined) {
-        throw new Error("vip9r_log called before wasm instance was assigned");
-      }
-      return instanceMemory(instance);
-    }, (log) => logs.push(log));
-    instance = new WebAssembly.Instance(module, imports);
+    // Unit tests init small decoder shapes; 64 MiB is plenty, and each test
+    // gets a fresh memory alongside its fresh instance.
+    const memory = createVip9rMemory(1024);
+    const instance = new WebAssembly.Instance(module, makeVip9rImports(memory, (log) => logs.push(log)));
     const test = instance.exports[testName];
     if (typeof test !== "function") {
       return fail("export is not callable", logs);

@@ -1073,3 +1073,35 @@ streamer cpu0:
   measure null; what moves the number is eliminating memory traffic
   (StoredModeInfo pass, −4%) and collapsing whole control-flow
   regions (DCT specialization, −1.8% jelly with *less* code).
+
+## 2026-07-03 — M6 threads: toolchain + ABI spike
+
+- The build is now threaded-wasm unconditionally: `+atomics,+bulk-memory`,
+  `--shared-memory --import-memory --export-memory`, core rebuilt via
+  build-std (`RUSTC_BOOTSTRAP=1` on the pinned stable toolchain). One ABI —
+  every JS frontend creates and imports a shared `WebAssembly.Memory`,
+  workload-sized because V8 reserves the provided maximum upfront. Old-ABI
+  baselines are retired; this entry is the cross-ABI reference point.
+- Two feared costs evaporated under test: `compiler-builtins-mem` is
+  unnecessary (+bulk-memory lowers memcpy/memset natively; the artifact has
+  no memcpy import), and build-std adds only ~2-3s of core compile to a
+  cold build — grinder sandboxes always cold-build anyway.
+- Single-threaded on the threaded build: compliance corpus 307/307, wasm
+  tests 95/95. Perf vs the logged post-fusion numbers: X4 jellyfish 9.4
+  ms/frame (vs ~10.4, no regression); A55 jellyfish 138.4 vs ~132 (**+5%**),
+  BBB 101.5 vs ~93.5 (**+8.5%**).
+- The A55 tax was run to ground (windowed profile + asm diff, no atomics
+  emitted anywhere): V8 stops caching the memory *size* across control flow
+  for shared memories — decode_block's `ldr [instance,#size]` count goes 65
+  → 556 (asm +8.8% bytes, +19% bounds-trap branches), decode_residual 219 →
+  999 — so scalar entropy code pays a serialized load→sub→cmp→bcs chain per
+  guarded access that the in-order core cannot hide. Profile confirms the
+  shape: decode_block +32% absolute, mode-info +18%, decode_residual +11%,
+  while simd-dense loop filter/IDCT are ~flat and libc/copy cost did not
+  move (the relaxed-memcpy theory was falsified). Ironically the memory
+  *base* became a hoisted constant (82 reloads → 1) — shared memory never
+  relocates. Engine-level, not source-fixable; V8 could legally cache the
+  monotonic size even for shared memories, so a future V8 may hand it back.
+  A non-growable memory (initial == maximum) measured null — V8 does not
+  constant-fold the size for shared memories regardless. A55 first-pass
+  compile grew to ~3.7s; A55 benches keep using `--frames` windows.

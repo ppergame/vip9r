@@ -76,6 +76,9 @@
       ++ podmanEnv "HOME" "/run/home"
       ++ podmanEnv "SHELL" "/bin/bash"
       ++ podmanEnv "CARGO_HOME" "/cargo-home"
+      # Threaded-wasm build: stable cargo honors the [unstable] build-std
+      # table in rust/.cargo/config.toml only with this in its environment.
+      ++ podmanEnv "RUSTC_BOOTSTRAP" "1"
       ++ podmanEnv "CODEX_HOME" "/codex-home"
       ++ podmanEnv "SSL_CERT_FILE" caBundle
       ++ podmanEnv "NIX_SSL_CERT_FILE" caBundle
