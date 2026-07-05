@@ -5,15 +5,18 @@
   "packageManager": "pnpm@11.4.0",
   "scripts": {
     "build": "pnpm typecheck && pnpm build:wasm-driver && pnpm build:web",
-    "dev": "vite",
     "build:wasm-driver": "vite build --config vite.wasm-driver.config.ts",
     "build:web": "vite build",
     "citygen:decant": "python3 ../scripts/citygen-decant.py",
+    "dev": "vite",
+    "format": "prettier --write \"*.html\" \"*.json\" \"*.ts\" pnpm-workspace.yaml \"src/**/*.ts\"",
+    "format:check": "prettier --check \"*.html\" \"*.json\" \"*.ts\" pnpm-workspace.yaml \"src/**/*.ts\"",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && tsc -p tsconfig.node.json"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",
+    "prettier": "^3.9.1",
     "typescript": "^6.0.3",
     "vite": "^8.0.16",
     "vitest": "^4.1.8"
