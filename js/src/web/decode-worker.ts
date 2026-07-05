@@ -8,6 +8,8 @@ import { instantiateVip9r } from "./vip9r-instance";
 export type WorkerInit = {
   url: string;
   queueDepth: number;
+  // Stop after this many output frames; 0 decodes the whole clip.
+  frameLimit: number;
 };
 
 export type WorkerAck = {
@@ -63,7 +65,7 @@ self.onmessage = (event: MessageEvent<WorkerInit | WorkerAck>) => {
   started = true;
   const init = data as WorkerInit;
   credits = init.queueDepth;
-  decodeAll(init.url).catch((error: unknown) => {
+  decodeAll(init).catch((error: unknown) => {
     post({ type: "error", message: String(error) });
   });
 };
@@ -92,8 +94,8 @@ function makeVideoFrame(
   });
 }
 
-async function decodeAll(url: string): Promise<void> {
-  const media = await openMediaStream(url);
+async function decodeAll(init: WorkerInit): Promise<void> {
+  const media = await openMediaStream(init.url);
   const header = media.header;
   post({
     type: "meta",
@@ -116,7 +118,7 @@ async function decodeAll(url: string): Promise<void> {
   let packets = 0;
   let totalDecodeMs = 0;
   let pendingMs = 0;
-  for await (const packet of media.packets) {
+  decode: for await (const packet of media.packets) {
     const timestamp = packetTimestampUs(header, packet.timestamp);
     const keyframe = packet.keyframe ?? packets === 0;
     decoder.beginPacket(packet.payload);
@@ -145,6 +147,10 @@ async function decodeAll(url: string): Promise<void> {
       );
       frames += 1;
       pendingMs = 0;
+      if (frames === init.frameLimit) {
+        packets += 1;
+        break decode;
+      }
     }
     packets += 1;
   }

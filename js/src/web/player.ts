@@ -6,6 +6,8 @@ export type PlaybackHandle = {
 
 export type PlaybackOptions = {
   url: string;
+  // Stop after this many decoded frames; 0 plays the whole clip.
+  frameLimit: number;
   canvas: HTMLCanvasElement;
   log: (message: string, kind?: "info" | "error") => void;
   stats: (text: string) => void;
@@ -51,7 +53,11 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
   let firstTimestampUs = 0;
   let lastTimestampUs = 0;
 
-  const init: WorkerInit = { url: options.url, queueDepth: QUEUE_DEPTH };
+  const init: WorkerInit = {
+    url: options.url,
+    queueDepth: QUEUE_DEPTH,
+    frameLimit: options.frameLimit,
+  };
   worker.postMessage(init);
 
   worker.onmessage = (event: MessageEvent<WorkerEvent>) => {

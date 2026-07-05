@@ -192,8 +192,12 @@ function startPlay(): void {
   }
   resetSessions();
   log(`streaming ${choice.label}`);
+  // Only an explicit &frames=N caps playback; the frames input's default is
+  // a bench-tab affair, and a plain page load plays the whole clip.
+  const explicitFrames = new URLSearchParams(location.search).get("frames");
   playback = startPlayback({
     url: choice.url,
+    frameLimit: Math.max(0, Number(explicitFrames) || 0),
     canvas: el<HTMLCanvasElement>("play-canvas"),
     log,
     stats: (text) => {
