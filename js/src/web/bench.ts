@@ -13,6 +13,7 @@ export type BenchOptions = {
 
 const LANE_LABELS: Record<BenchLane, string> = {
   vip9r: "vip9r",
+  ogv: "ogv.js",
   "wc-sw": "webcodecs software",
   "wc-hw": "webcodecs hardware",
 };

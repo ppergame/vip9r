@@ -65,6 +65,7 @@ const crossOriginIsolation = {
 
 export default defineConfig({
   plugins: [mediaCorpus()],
+  publicDir: path.join(repoRoot, "data"),
   server: {
     headers: crossOriginIsolation,
     fs: {

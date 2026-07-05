@@ -1,5 +1,5 @@
-// Sequential pure-decode benchmark: vip9r wasm vs WebCodecs software vs
-// WebCodecs hardware, one lane at a time on this worker thread. The vip9r
+// Sequential pure-decode benchmark: vip9r wasm vs ogv.js vs WebCodecs software
+// vs WebCodecs hardware, one lane at a time on this worker thread. The vip9r
 // headline number is the same measurand as the d8 perf oracle (summed
 // decodeNext time); VideoFrame construction cost is measured separately.
 import { Vp9Decoder } from "../wasm";
@@ -10,7 +10,7 @@ import { packetTimestampUs } from "./media-time";
 import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
 
-export type BenchLane = "vip9r" | "wc-sw" | "wc-hw";
+export type BenchLane = "vip9r" | "ogv" | "wc-sw" | "wc-hw";
 
 export type BenchInit = {
   url: string;
@@ -18,7 +18,7 @@ export type BenchInit = {
   packetLimit: number;
 };
 
-const LANES: BenchLane[] = ["vip9r", "wc-sw", "wc-hw"];
+const LANES: BenchLane[] = ["vip9r", "ogv", "wc-sw", "wc-hw"];
 
 export type LaneResult = {
   lane: BenchLane;
@@ -77,6 +77,13 @@ async function run(init: BenchInit): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 50));
     if (lane === "vip9r") {
       post({ type: "lane", result: await vip9rLane(header, packets) });
+    } else if (lane === "ogv") {
+      const result = await ogvLane(header, packets);
+      if (typeof result === "string") {
+        post({ type: "lane-skipped", lane, reason: result });
+      } else {
+        post({ type: "lane", result });
+      }
     } else {
       const mode = lane === "wc-sw" ? "prefer-software" : "prefer-hardware";
       const result = await webCodecsLane(lane, mode, header, packets);
@@ -115,6 +122,63 @@ async function vip9rLane(input: MediaHeader, packets: MediaPacket[]): Promise<La
   // the process with three parked threads holding the wasm memory alive.
   pool.terminate();
   return { lane: "vip9r", wallMs, ...stats };
+}
+
+function ogvVideoFormat(input: MediaHeader): OgvVideoFormat {
+  return {
+    width: input.width,
+    height: input.height,
+    chromaWidth: (input.width + 1) >> 1,
+    chromaHeight: (input.height + 1) >> 1,
+    cropLeft: 0,
+    cropTop: 0,
+    cropWidth: input.width,
+    cropHeight: input.height,
+    displayWidth: input.width,
+    displayHeight: input.height,
+    fps: 0,
+  };
+}
+
+async function ogvLane(input: MediaHeader, packets: MediaPacket[]): Promise<LaneResult | string> {
+  // The ogv.js wrapper is a classic-worker script that uses importScripts().
+  const worker = new Worker(new URL("./ogv-lane-worker.ts", import.meta.url));
+  try {
+    const init: OgvLaneInit = {
+      moduleScript: "/ogv/ogv-decoder-video-vp9-mt.js",
+      videoFormat: ogvVideoFormat(input),
+      warmupPackets: WARMUP_PACKETS,
+      packets: packets.map((packet) => ({
+        data: packet.payload,
+        timestampUs: packetTimestampUs(input, packet.timestamp),
+      })),
+    };
+    return await new Promise<LaneResult | string>((resolve, reject) => {
+      worker.onmessage = (event: MessageEvent<OgvLaneEvent>) => {
+        const message = event.data;
+        switch (message.type) {
+          case "log":
+            post({ type: "log", message: message.message, error: message.error });
+            break;
+          case "done":
+            resolve({ lane: "ogv", frames: message.frames, wallMs: message.wallMs });
+            break;
+          case "skipped":
+            resolve(message.reason);
+            break;
+          case "error":
+            reject(new Error(message.message));
+            break;
+        }
+      };
+      worker.onerror = (event) => {
+        reject(new Error(`ogv worker: ${event.message}`));
+      };
+      worker.postMessage(init);
+    });
+  } finally {
+    worker.terminate();
+  }
 }
 
 function vip9rPass(
@@ -171,7 +235,7 @@ function vp9CodecString(input: MediaHeader): string {
 }
 
 async function webCodecsLane(
-  lane: BenchLane,
+  lane: "wc-sw" | "wc-hw",
   mode: HardwareAcceleration,
   input: MediaHeader,
   packets: MediaPacket[],
