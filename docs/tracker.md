@@ -601,10 +601,10 @@ availability/MV search, no cross-tile pixel reads).
       content — every probed YouTube track has `frame_parallel=0`. A
       jellyfish-class gap surviving tile + loop-filter parallelism is accepted
 
-### decode_residual structural reshape — gated spike (2026-07-04)
+### decode_residual structural reshape — gated spike (2026-07-04, closed)
 
-Deferred behind M6 threads (2026-07-04): finish tile-parallel + loop-filter
-wavefront first, then revisit with threads-era profiles.
+Was deferred behind M6 threads; revisited 2026-07-04 with threads-era profiles
+and closed at the evidence gate.
 
 The last named single-CPU lever of campaign scale. Evidence: current-tree
 profiles put the fused decode_residual monolith at 53-60% on all three 720p
@@ -619,13 +619,19 @@ profiles is that size. Prior adjacent probes measured null/negative (branchless
 read_bool, icache cold-outlining, P1b traversal), so treat as a research bet,
 not an expected harvest.
 
-- [ ] time-boxed spike: probe whether any source-level shape (phase batching,
-      split/merge of the monolith, inlining barriers V8 respects) moves the L1I
-      phase-cycling cost or the frontend-stall share on the A55; asm + PMU
-      evidence first, counterbalanced bench to confirm any signal
-- [ ] decision point: escalate to a campaign only on a measured double-digit
-      seam; otherwise close single-CPU work and let M6 threads own the remaining
-      A55 gap
+- [x] time-boxed spike: resolved at the evidence gate, no grinder run (2026-07-04).
+      Threads-era attribution holds the premise's first half (monolith 50.5%
+      jellyfish / 54.2% BBB, A55 pooled) but the PMU re-anchor kills the second:
+      frontend stalls 8.6–9.0% of cycles (P5: 13.1%), L1I refills 0.48–0.51/100
+      instr (P5: 0.82), 4:1 vs L1D (P5: 5:1) — the post-P5 fusion and
+      specialization passes already removed ~40% of the per-instruction icache
+      tax. The mechanism's total pool is single-digit; no source shape can
+      clear the double-digit bar from a 9% pool
+- [x] decision point: closed single-CPU work (2026-07-04). No double-digit seam
+      — perfect frontend-stall elimination buys ~9% vs the ~28% jellyfish-class
+      clips need on top of threads; fusion's win came from tightening phase
+      interleave, the opposite of phase batching. M6 threads own the remaining
+      A55 gap; details in log.md
 
 ## M7 — Stretch
 

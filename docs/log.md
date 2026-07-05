@@ -1226,3 +1226,34 @@ streamer cpu0:
   profiles next).
 - Suite: wasm tests 100/100, compliance corpus 307/307 pooled and serial,
   full corpus 339/339 pooled.
+
+## 2026-07-04 — decode_residual reshape spike: closed without a campaign
+
+- The gated spike asked whether any source-level shape (phase batching,
+  monolith split/merge, V8-respected inlining barriers) could move the L1I
+  phase-cycling cost. The evidence gate answered it before a grinder run
+  was justified: the mechanism's total pool is single-digit, below the
+  pre-committed double-digit escalation bar.
+- Threads-era attribution (A55 pooled `cpu:0-3`, 0:5 windows): the
+  decode_residual monolith is 50.5% jellyfish / 54.2% BBB — same share as
+  the pre-threads profiles, so the spike premise was worth re-measuring.
+- PMU re-anchor (per-process simpleperf stat, serial `cpu:0` jellyfish
+  full-clip validate, 2.0 GHz held, two clean 5 s samples): frontend
+  stalls 8.6–9.0% of cycles (P5: 13.1%), L1I refills 0.48–0.51 per 100
+  instructions (P5: 0.82), L1I:L1D refill ratio 4:1 (P5: 5:1), backend
+  stalls 30%. The post-P5 passes — fusion, StoredModeInfo/divide/IDCT
+  specializations — already removed ~40% of the per-instruction icache
+  tax as a side effect; the P5 premise numbers no longer exist.
+- Ceiling arithmetic: eliminating *every* frontend stall — impossible;
+  any 135 KB hot loop has compulsory refills and entropy branches are
+  data-dependent — buys ~9%, under the double-digit seam the tracker
+  requires, and far from the ~28% single-CPU that jellyfish-class clips
+  would need on top of threads.
+- Directional evidence agrees: every probe at this seam measured
+  null-to-negative (icache cold-outlining, P1b traversal restructure,
+  branchless bool decision), and the one structural move that won —
+  parse→dequant fusion, −4.5% BBB — won by *tightening* phase
+  interleave, the opposite of phase batching.
+- Decision per the tracker's rule: single-CPU work is closed. M6 threads
+  own the remaining A55 gap; the jellyfish-class residual (~1.4x over
+  33.3 ms pooled) stays accepted as scoped.
