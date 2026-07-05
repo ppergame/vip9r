@@ -632,7 +632,3 @@ not an expected harvest.
       clips need on top of threads; fusion's win came from tightening phase
       interleave, the opposite of phase batching. M6 threads own the remaining
       A55 gap; details in log.md
-
-## M7 — Stretch
-
-relaxed-simd
