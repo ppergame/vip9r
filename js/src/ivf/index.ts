@@ -54,7 +54,10 @@ export class IvfDemuxer {
       this.parseHeader();
     }
     if (this.skipRemaining > 0) {
-      const take = Math.min(this.data.byteLength - this.cursor, this.skipRemaining);
+      const take = Math.min(
+        this.data.byteLength - this.cursor,
+        this.skipRemaining,
+      );
       this.cursor += take;
       this.skipRemaining -= take;
       if (this.skipRemaining > 0) {
@@ -86,7 +89,9 @@ export class IvfDemuxer {
       throw new Error("IVF header is truncated");
     }
     if (this.skipRemaining > 0) {
-      throw new Error(`IVF header length exceeds file size: ${this.headerLength}`);
+      throw new Error(
+        `IVF header length exceeds file size: ${this.headerLength}`,
+      );
     }
     const avail = this.data.byteLength - this.cursor;
     if (avail > 0) {
@@ -159,7 +164,13 @@ function le16(data: Uint8Array, offset: number): number {
 }
 
 function le32(data: Uint8Array, offset: number): number {
-  return (data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24)) >>> 0;
+  return (
+    (data[offset] |
+      (data[offset + 1] << 8) |
+      (data[offset + 2] << 16) |
+      (data[offset + 3] << 24)) >>>
+    0
+  );
 }
 
 function le64(data: Uint8Array, offset: number): bigint {

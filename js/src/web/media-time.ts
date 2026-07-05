@@ -5,7 +5,10 @@ export type MediaTimebase = {
   timebaseDenominator?: number;
 };
 
-export function packetTimestampUs(input: MediaTimebase, timestamp: bigint): number {
+export function packetTimestampUs(
+  input: MediaTimebase,
+  timestamp: bigint,
+): number {
   if (input.container === "ivf") {
     const numerator = input.timebaseNumerator ?? 1;
     const denominator = input.timebaseDenominator ?? 30;

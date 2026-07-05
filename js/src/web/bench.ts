@@ -1,4 +1,9 @@
-import type { BenchEvent, BenchInit, BenchLane, LaneResult } from "./bench-worker";
+import type {
+  BenchEvent,
+  BenchInit,
+  BenchLane,
+  LaneResult,
+} from "./bench-worker";
 
 export type BenchHandle = {
   stop(): void;
@@ -45,7 +50,11 @@ export function startBench(options: BenchOptions): BenchHandle {
     if (budgetMs > 0 && msPerFrame > 0) {
       line += ` · ${(budgetMs / msPerFrame).toFixed(1)}× realtime`;
     }
-    if (result.decodeMs !== undefined && result.videoFrameMs !== undefined && result.frames > 0) {
+    if (
+      result.decodeMs !== undefined &&
+      result.videoFrameMs !== undefined &&
+      result.frames > 0
+    ) {
       line +=
         ` · decodeNext ${(result.decodeMs / result.frames).toFixed(1)}` +
         ` + VideoFrame ${(result.videoFrameMs / result.frames).toFixed(1)} ms/frame`;
@@ -78,7 +87,9 @@ export function startBench(options: BenchOptions): BenchHandle {
         addLine(formatLane(message.result));
         break;
       case "lane-skipped":
-        addLine(`${LANE_LABELS[message.lane].padEnd(19)} skipped — ${message.reason}`);
+        addLine(
+          `${LANE_LABELS[message.lane].padEnd(19)} skipped — ${message.reason}`,
+        );
         break;
       case "done":
         options.log("bench done");

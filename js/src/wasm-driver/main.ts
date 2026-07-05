@@ -11,7 +11,12 @@ import {
   parseDriverArgs,
   passes,
 } from "./golden";
-import type { ComparisonReport, DriverArgs, FrameComparison, WasmLog } from "./golden";
+import type {
+  ComparisonReport,
+  DriverArgs,
+  FrameComparison,
+  WasmLog,
+} from "./golden";
 
 declare const read: (path: string) => string;
 declare const readbuffer: (path: string) => ArrayBuffer;
@@ -74,7 +79,9 @@ function main(args: string[]): void {
       },
       now: nowMs,
     });
-    print(JSON.stringify(wasmLogs.length === 0 ? report : { ...report, wasmLogs }));
+    print(
+      JSON.stringify(wasmLogs.length === 0 ? report : { ...report, wasmLogs }),
+    );
     return;
   }
 
@@ -167,7 +174,10 @@ function printStderr(...values: unknown[]): void {
 }
 
 function nowMs(): number {
-  if (typeof performance === "object" && typeof performance.now === "function") {
+  if (
+    typeof performance === "object" &&
+    typeof performance.now === "function"
+  ) {
     return performance.now();
   }
   return Date.now();
@@ -192,9 +202,21 @@ try {
   const args = d8.scriptArgs ?? d8.arguments ?? [];
   if (error instanceof DriverUsageError) {
     printUsage(printStderr);
-    print(JSON.stringify({ mode: modeFromArgs(args), ok: false, error: error.message }));
+    print(
+      JSON.stringify({
+        mode: modeFromArgs(args),
+        ok: false,
+        error: error.message,
+      }),
+    );
     quit(2);
   }
-  print(JSON.stringify({ mode: modeFromArgs(args), ok: false, error: errorMessage(error) }));
+  print(
+    JSON.stringify({
+      mode: modeFromArgs(args),
+      ok: false,
+      error: errorMessage(error),
+    }),
+  );
   quit(1);
 }

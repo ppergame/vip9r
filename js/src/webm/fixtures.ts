@@ -52,7 +52,9 @@ export function segmentContentBytes(
   } = {},
 ): Uint8Array {
   const tracks = options.tracks ?? [vp9Track(1, { width: 320, height: 240 })];
-  const clusters = options.clusters ?? [cluster(0, [simpleBlock(1, 0, 0, [1])])];
+  const clusters = options.clusters ?? [
+    cluster(0, [simpleBlock(1, 0, 0, [1])]),
+  ];
   return concat(
     element(ID.Info, uintElement(ID.TimestampScale, 1_000_000)),
     element(ID.Tracks, concat(...tracks)),
@@ -61,7 +63,10 @@ export function segmentContentBytes(
   );
 }
 
-export function vp9Track(trackNumber: number, dimensions: { width: number; height: number }): Uint8Array {
+export function vp9Track(
+  trackNumber: number,
+  dimensions: { width: number; height: number },
+): Uint8Array {
   return trackEntry([
     uintElement(ID.TrackNumber, trackNumber),
     uintElement(ID.TrackType, 1),
@@ -70,7 +75,10 @@ export function vp9Track(trackNumber: number, dimensions: { width: number; heigh
     uintElement(ID.DefaultDuration, 33_333_333),
     element(
       ID.Video,
-      concat(uintElement(ID.PixelWidth, dimensions.width), uintElement(ID.PixelHeight, dimensions.height)),
+      concat(
+        uintElement(ID.PixelWidth, dimensions.width),
+        uintElement(ID.PixelHeight, dimensions.height),
+      ),
     ),
   ]);
 }
@@ -88,7 +96,10 @@ export function trackEntry(fields: Uint8Array[]): Uint8Array {
 }
 
 export function cluster(timestamp: number, blocks: Uint8Array[]): Uint8Array {
-  return element(ID.Cluster, concat(uintElement(ID.Timestamp, timestamp), ...blocks));
+  return element(
+    ID.Cluster,
+    concat(uintElement(ID.Timestamp, timestamp), ...blocks),
+  );
 }
 
 export function simpleBlock(
@@ -97,7 +108,10 @@ export function simpleBlock(
   flags: number,
   payload: number[],
 ): Uint8Array {
-  return element(ID.SimpleBlock, blockContent(trackNumber, relativeTimestamp, flags, payload));
+  return element(
+    ID.SimpleBlock,
+    blockContent(trackNumber, relativeTimestamp, flags, payload),
+  );
 }
 
 export function block(
@@ -106,7 +120,10 @@ export function block(
   flags: number,
   payload: number[],
 ): Uint8Array {
-  return element(ID.Block, blockContent(trackNumber, relativeTimestamp, flags, payload));
+  return element(
+    ID.Block,
+    blockContent(trackNumber, relativeTimestamp, flags, payload),
+  );
 }
 
 export function blockGroup(blockElement: Uint8Array): Uint8Array {
@@ -120,21 +137,41 @@ export function blockContent(
   payload: number[],
 ): Uint8Array {
   if (trackNumber < 1 || trackNumber > 126) {
-    throw new Error(`test fixture track number is out of range: ${trackNumber}`);
+    throw new Error(
+      `test fixture track number is out of range: ${trackNumber}`,
+    );
   }
-  const timestamp = relativeTimestamp < 0 ? 0x1_0000 + relativeTimestamp : relativeTimestamp;
-  return new Uint8Array([0x80 | trackNumber, (timestamp >>> 8) & 0xff, timestamp & 0xff, flags, ...payload]);
+  const timestamp =
+    relativeTimestamp < 0 ? 0x1_0000 + relativeTimestamp : relativeTimestamp;
+  return new Uint8Array([
+    0x80 | trackNumber,
+    (timestamp >>> 8) & 0xff,
+    timestamp & 0xff,
+    flags,
+    ...payload,
+  ]);
 }
 
 export function element(id: number, content: Uint8Array): Uint8Array {
   return elementWithSize(id, content.byteLength, content);
 }
 
-export function elementWithSize(id: number, declaredSize: number, content: Uint8Array): Uint8Array {
-  return concat(new Uint8Array(idBytes(id)), new Uint8Array(sizeVint(declaredSize)), content);
+export function elementWithSize(
+  id: number,
+  declaredSize: number,
+  content: Uint8Array,
+): Uint8Array {
+  return concat(
+    new Uint8Array(idBytes(id)),
+    new Uint8Array(sizeVint(declaredSize)),
+    content,
+  );
 }
 
-export function unknownSizeElement(id: number, content: Uint8Array): Uint8Array {
+export function unknownSizeElement(
+  id: number,
+  content: Uint8Array,
+): Uint8Array {
   return concat(new Uint8Array(idBytes(id)), new Uint8Array([0xff]), content);
 }
 
@@ -175,7 +212,12 @@ function sizeVint(size: number): number[] {
     return [0x40 | (size >>> 8), size & 0xff];
   }
   if (size <= 0x0fff_fffe) {
-    return [0x10 | ((size >>> 24) & 0x0f), (size >>> 16) & 0xff, (size >>> 8) & 0xff, size & 0xff];
+    return [
+      0x10 | ((size >>> 24) & 0x0f),
+      (size >>> 16) & 0xff,
+      (size >>> 8) & 0xff,
+      size & 0xff,
+    ];
   }
   throw new Error(`test fixture element is too large: ${size}`);
 }

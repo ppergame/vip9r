@@ -77,14 +77,16 @@ describe("wasm golden runner helpers", () => {
 
   test("rejects malformed IVF files", () => {
     const truncatedPayload = sampleIvf();
-    expect(() => parseIvf(truncatedPayload.subarray(0, truncatedPayload.byteLength - 1))).toThrow(
-      "packet 1 payload is truncated",
-    );
+    expect(() =>
+      parseIvf(truncatedPayload.subarray(0, truncatedPayload.byteLength - 1)),
+    ).toThrow("packet 1 payload is truncated");
 
     const badHeaderLength = sampleIvf();
     badHeaderLength[6] = 31;
     badHeaderLength[7] = 0;
-    expect(() => parseIvf(badHeaderLength)).toThrow("IVF header length is too small: 31");
+    expect(() => parseIvf(badHeaderLength)).toThrow(
+      "IVF header length is too small: 31",
+    );
 
     const noPackets = sampleIvf().subarray(0, 32);
     expect(() => parseIvf(noPackets)).toThrow("IVF contains no packets");
@@ -125,7 +127,9 @@ describe("wasm golden runner helpers", () => {
         timebaseDenominator: undefined,
         timebaseNumerator: undefined,
       }),
-    ).toContain("webm: codec=V_VP9 size=320x240 timestamp_scale=1000000 packets=2");
+    ).toContain(
+      "webm: codec=V_VP9 size=320x240 timestamp_scale=1000000 packets=2",
+    );
   });
 
   test("reports optional compared-frame progress", () => {
@@ -137,16 +141,28 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
     const progress: string[] = [];
 
-    const report = compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, scriptedDecoder(frames), {
-      progressFrames: 2,
-      onProgress(event) {
-        progress.push(formatProgress(event));
+    const report = compareDecodedVp9ToGolden(
+      "input.ivf",
+      "input.ivf.md5",
+      ivf,
+      golden,
+      scriptedDecoder(frames),
+      {
+        progressFrames: 2,
+        onProgress(event) {
+          progress.push(formatProgress(event));
+        },
       },
-    });
+    );
 
     expect(passes(report, false)).toBe(true);
     expect(progress).toEqual([
@@ -164,11 +180,15 @@ describe("wasm golden runner helpers", () => {
       goldenPath: "input.ivf.md5",
       bench: undefined,
     });
-    expect(parseDriverArgs(["--pool", "vip9r.wasm", "input.ivf"])).toMatchObject({
+    expect(
+      parseDriverArgs(["--pool", "vip9r.wasm", "input.ivf"]),
+    ).toMatchObject({
       pool: true,
       bench: undefined,
     });
-    expect(parseDriverArgs(["--bench", "--pool", "vip9r.wasm", "input.ivf"])).toMatchObject({
+    expect(
+      parseDriverArgs(["--bench", "--pool", "vip9r.wasm", "input.ivf"]),
+    ).toMatchObject({
       pool: true,
       bench: DEFAULT_BENCHMARK_OPTIONS,
     });
@@ -178,7 +198,9 @@ describe("wasm golden runner helpers", () => {
       goldenPath: "/bulk/vip9r/chromium/bear-vp9.ivf.md5",
       bench: undefined,
     });
-    expect(parseDriverArgs(["--frames", "2:6", "vip9r.wasm", "input.ivf"])).toMatchObject({
+    expect(
+      parseDriverArgs(["--frames", "2:6", "vip9r.wasm", "input.ivf"]),
+    ).toMatchObject({
       wasmPath: "vip9r.wasm",
       inputPath: "input.ivf",
       goldenPath: "input.ivf.md5",
@@ -210,7 +232,9 @@ describe("wasm golden runner helpers", () => {
       },
     });
 
-    expect(parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench).toEqual(DEFAULT_BENCHMARK_OPTIONS);
+    expect(
+      parseDriverArgs(["--bench", "vip9r.wasm", "input.ivf"]).bench,
+    ).toEqual(DEFAULT_BENCHMARK_OPTIONS);
     expect(parseDriverArgs(["--bench", "vip9r.wasm"])).toMatchObject({
       wasmPath: "vip9r.wasm",
       inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
@@ -220,20 +244,36 @@ describe("wasm golden runner helpers", () => {
   });
 
   test("rejects benchmark options that would make output non-benchmark or non-machine-readable", () => {
-    expect(() => parseDriverArgs(["--bench", "--allow-mismatch", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--allow-mismatch cannot be used with --bench",
-    );
-    expect(() => parseDriverArgs(["--bench", "--progress-frames=1", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--progress-frames cannot be used with --bench",
-    );
+    expect(() =>
+      parseDriverArgs([
+        "--bench",
+        "--allow-mismatch",
+        "vip9r.wasm",
+        "input.ivf",
+      ]),
+    ).toThrow("--allow-mismatch cannot be used with --bench");
+    expect(() =>
+      parseDriverArgs([
+        "--bench",
+        "--progress-frames=1",
+        "vip9r.wasm",
+        "input.ivf",
+      ]),
+    ).toThrow("--progress-frames cannot be used with --bench");
   });
 
   test("rejects invalid validation frame selections", () => {
-    expect(() => parseDriverArgs(["--frames", "2:1", "vip9r.wasm", "input.ivf"])).toThrow(
-      "--frames last must be greater than or equal to start",
-    );
     expect(() =>
-      parseDriverArgs(["--frames", "0:1", "--progress-frames=1", "vip9r.wasm", "input.ivf"]),
+      parseDriverArgs(["--frames", "2:1", "vip9r.wasm", "input.ivf"]),
+    ).toThrow("--frames last must be greater than or equal to start");
+    expect(() =>
+      parseDriverArgs([
+        "--frames",
+        "0:1",
+        "--progress-frames=1",
+        "vip9r.wasm",
+        "input.ivf",
+      ]),
     ).toThrow("--progress-frames cannot be used with --frames");
   });
 
@@ -245,42 +285,56 @@ describe("wasm golden runner helpers", () => {
     );
 
     expect(maxGoldenDimensions(golden)).toEqual({ width: 640, height: 480 });
-    expect(decoderDimensionsForGolden({ width: 320, height: 240 }, golden)).toEqual({
+    expect(
+      decoderDimensionsForGolden({ width: 320, height: 240 }, golden),
+    ).toEqual({
       width: 640,
       height: 480,
     });
   });
 
   test("chooses decoder dimensions from sidecar frame names when IVF dimensions are zero", () => {
-    const golden = parseGolden("369f3d6ce1ba7ad7bd5716d0aef8daf4  svc-1280x720-0001.i420\n");
+    const golden = parseGolden(
+      "369f3d6ce1ba7ad7bd5716d0aef8daf4  svc-1280x720-0001.i420\n",
+    );
 
-    expect(decoderDimensionsForGolden({ width: 0, height: 0 }, golden)).toEqual({
-      width: 1280,
-      height: 720,
-    });
+    expect(decoderDimensionsForGolden({ width: 0, height: 0 }, golden)).toEqual(
+      {
+        width: 1280,
+        height: 720,
+      },
+    );
   });
 
   test("falls back to container dimensions when sidecar names do not include dimensions", () => {
-    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
+    const golden = parseGolden(
+      "d41d8cd98f00b204e9800998ecf8427e  frame.i420\n",
+    );
 
     expect(maxGoldenDimensions(golden)).toBeUndefined();
-    expect(decoderDimensionsForGolden({ width: 320, height: 240 }, golden)).toEqual({
+    expect(
+      decoderDimensionsForGolden({ width: 320, height: 240 }, golden),
+    ).toEqual({
       width: 320,
       height: 240,
     });
   });
 
   test("rejects decoder dimensions when neither container nor sidecar gives a size", () => {
-    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
-
-    expect(() => decoderDimensionsForGolden({ width: 0, height: 0 }, golden)).toThrow(
-      "decoder dimensions unavailable: container=0x0, golden=none",
+    const golden = parseGolden(
+      "d41d8cd98f00b204e9800998ecf8427e  frame.i420\n",
     );
+
+    expect(() =>
+      decoderDimensionsForGolden({ width: 0, height: 0 }, golden),
+    ).toThrow("decoder dimensions unavailable: container=0x0, golden=none");
   });
 
   test("md5 implementation matches known vectors", () => {
     expect(md5Hex(new Uint8Array())).toBe("d41d8cd98f00b204e9800998ecf8427e");
-    expect(md5Hex(new Uint8Array([0x61, 0x62, 0x63]))).toBe("900150983cd24fb0d6963f7d28e17f72");
+    expect(md5Hex(new Uint8Array([0x61, 0x62, 0x63]))).toBe(
+      "900150983cd24fb0d6963f7d28e17f72",
+    );
   });
 
   test("compact I420 strips stride and orders planes as Y, U, V", () => {
@@ -302,7 +356,9 @@ describe("wasm golden runner helpers", () => {
       { data: [14, 15, 99, 16, 17, 99], stride: 3 },
     );
 
-    expect(() => compactI420(frame.decoder, frame.native)).toThrow("invalid U plane: stride 1 < width 2");
+    expect(() => compactI420(frame.decoder, frame.native)).toThrow(
+      "invalid U plane: stride 1 < width 2",
+    );
   });
 
   test("allow-mismatch still rejects missing and extra shown frames", () => {
@@ -346,7 +402,13 @@ describe("wasm golden runner helpers", () => {
         `${md5Hex(top2.compact)}  svc-4x4-0002.i420\n`,
     );
 
-    const report = compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder);
+    const report = compareDecodedVp9ToGolden(
+      "input.ivf",
+      "input.ivf.md5",
+      ivf,
+      golden,
+      decoder,
+    );
 
     expect(report.decodedOutputFrames).toBe(4);
     expect(report.skippedOutputFrames).toBe(2);
@@ -363,7 +425,12 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
     const decoder: FrameDecoder = {
       ...scriptedDecoder(frames),
@@ -426,9 +493,17 @@ describe("wasm golden runner helpers", () => {
 
   test("aborts benchmark window validation when pass deadline expires", () => {
     const ivf = parseIvf(sampleIvf());
-    const frames = [scriptedFrame(2, 2, 1, 2, 3, 1), scriptedFrame(2, 2, 4, 5, 6, 10)];
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+    ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
     const nowSamples = [0, 6];
     const now = () => {
@@ -474,7 +549,12 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
     let timeMs = 0;
     const now = () => timeMs;
@@ -522,7 +602,12 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
     let timeMs = 0;
     const now = () => timeMs;
@@ -571,7 +656,12 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
 
     const report = compareDecodedVp9WindowToGolden(
@@ -586,7 +676,9 @@ describe("wasm golden runner helpers", () => {
       },
     );
 
-    expect(report.comparisons.map((comparison) => comparison.frameNumber)).toEqual([2, 3]);
+    expect(
+      report.comparisons.map((comparison) => comparison.frameNumber),
+    ).toEqual([2, 3]);
     expect(matchedCount(report)).toBe(2);
     expect(missingCount(report)).toBe(0);
     expect(passes(report, false)).toBe(true);
@@ -604,7 +696,12 @@ describe("wasm golden runner helpers", () => {
       scriptedFrame(2, 2, 10, 11, 12, 30),
     ];
     const golden = parseGolden(
-      frames.map((frame, index) => `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`).join("\n"),
+      frames
+        .map(
+          (frame, index) =>
+            `${md5Hex(frame.compact)}  frame-000${index + 1}.i420`,
+        )
+        .join("\n"),
     );
 
     const report = compareDecodedVp9WindowToGolden(
@@ -620,7 +717,9 @@ describe("wasm golden runner helpers", () => {
       { goldenOffset: 2 },
     );
 
-    expect(report.comparisons.map((comparison) => comparison.frameNumber)).toEqual([3, 4]);
+    expect(
+      report.comparisons.map((comparison) => comparison.frameNumber),
+    ).toEqual([3, 4]);
     expect(matchedCount(report)).toBe(2);
     expect(passes(report, false)).toBe(true);
   });
@@ -653,13 +752,20 @@ describe("wasm golden runner helpers", () => {
         outputOffset: 1,
         outputFrames: 1,
       }),
-    ).toThrow("nonzero benchmark --frames start requires WebM keyframe metadata");
+    ).toThrow(
+      "nonzero benchmark --frames start requires WebM keyframe metadata",
+    );
 
     expect(() =>
-      planBenchmarkDecode(sampleDemuxedWebm([samplePacket(0, [0], { keyframe: false, visible: true })]), {
-        outputOffset: 0,
-        outputFrames: 1,
-      }),
+      planBenchmarkDecode(
+        sampleDemuxedWebm([
+          samplePacket(0, [0], { keyframe: false, visible: true }),
+        ]),
+        {
+          outputOffset: 0,
+          outputFrames: 1,
+        },
+      ),
     ).not.toThrow();
 
     expect(() =>
@@ -673,12 +779,17 @@ describe("wasm golden runner helpers", () => {
           outputFrames: 1,
         },
       ),
-    ).toThrow("benchmark start frame 1 maps to WebM packet 1, which is not marked as a keyframe");
+    ).toThrow(
+      "benchmark start frame 1 maps to WebM packet 1, which is not marked as a keyframe",
+    );
   });
 
   test("benchmark window validation reports missing selected outputs", () => {
     const ivf = parseIvf(sampleIvf());
-    const frames = [scriptedFrame(2, 2, 1, 2, 3, 1), scriptedFrame(2, 2, 4, 5, 6, 10)];
+    const frames = [
+      scriptedFrame(2, 2, 1, 2, 3, 1),
+      scriptedFrame(2, 2, 4, 5, 6, 10),
+    ];
     const golden = parseGolden(
       [
         `${md5Hex(frames[0].compact)}  frame-0001.i420`,
@@ -706,7 +817,9 @@ describe("wasm golden runner helpers", () => {
 
   test("adds packet context to begin-packet failures without wasm ABI help", () => {
     const ivf = parseIvf(sampleIvf());
-    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
+    const golden = parseGolden(
+      "d41d8cd98f00b204e9800998ecf8427e  frame.i420\n",
+    );
     const decoder: FrameDecoder = {
       beginPacket() {
         throw new Error("bad packet");
@@ -719,14 +832,22 @@ describe("wasm golden runner helpers", () => {
       },
     };
 
-    expect(() => compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
-      "decode packet 0 timestamp 0: bad packet",
-    );
+    expect(() =>
+      compareDecodedVp9ToGolden(
+        "input.ivf",
+        "input.ivf.md5",
+        ivf,
+        golden,
+        decoder,
+      ),
+    ).toThrow("decode packet 0 timestamp 0: bad packet");
   });
 
   test("adds coded-frame context to decode failures without wasm ABI help", () => {
     const ivf = parseIvf(sampleIvf());
-    const golden = parseGolden("d41d8cd98f00b204e9800998ecf8427e  frame.i420\n");
+    const golden = parseGolden(
+      "d41d8cd98f00b204e9800998ecf8427e  frame.i420\n",
+    );
     const decoder: FrameDecoder = {
       beginPacket() {},
       decodeNext() {
@@ -737,13 +858,22 @@ describe("wasm golden runner helpers", () => {
       },
     };
 
-    expect(() => compareDecodedVp9ToGolden("input.ivf", "input.ivf.md5", ivf, golden, decoder)).toThrow(
-      "decode packet 0 coded frame 0: bad coded frame",
-    );
+    expect(() =>
+      compareDecodedVp9ToGolden(
+        "input.ivf",
+        "input.ivf.md5",
+        ivf,
+        golden,
+        decoder,
+      ),
+    ).toThrow("decode packet 0 coded frame 0: bad coded frame");
   });
 });
 
-function sampleReport(comparisons: ComparisonReport["comparisons"], expectedCount: number): ComparisonReport {
+function sampleReport(
+  comparisons: ComparisonReport["comparisons"],
+  expectedCount: number,
+): ComparisonReport {
   return {
     inputPath: "input.ivf",
     goldenPath: "input.ivf.md5",
@@ -839,7 +969,10 @@ function scriptedDecoderWithTrailingEnd(frames: ScriptedFrame[]): FrameDecoder {
   return scriptedDecoderInternal(frames, true);
 }
 
-function scriptedDecoderInternal(frames: ScriptedFrame[], trailingEnd: boolean): FrameDecoder {
+function scriptedDecoderInternal(
+  frames: ScriptedFrame[],
+  trailingEnd: boolean,
+): FrameDecoder {
   const planeBytes = new Map<number, Uint8Array>();
   for (const frame of frames) {
     for (const [offset, bytes] of frame.planes) {
@@ -895,8 +1028,16 @@ function scriptedFrame(
       renderWidth: width,
       renderHeight: height,
       y: { offset: offsetBase, byteLength: y.byteLength, stride: width },
-      u: { offset: offsetBase + 1, byteLength: u.byteLength, stride: chromaWidth },
-      v: { offset: offsetBase + 2, byteLength: v.byteLength, stride: chromaWidth },
+      u: {
+        offset: offsetBase + 1,
+        byteLength: u.byteLength,
+        stride: chromaWidth,
+      },
+      v: {
+        offset: offsetBase + 2,
+        byteLength: v.byteLength,
+        stride: chromaWidth,
+      },
     },
     compact,
     planes: new Map([
@@ -913,7 +1054,10 @@ function sampleWebm(): Uint8Array {
     webmElement(
       WEBM_ID.Segment,
       webmConcat(
-        webmElement(WEBM_ID.Info, webmUintElement(WEBM_ID.TimestampScale, 1_000_000)),
+        webmElement(
+          WEBM_ID.Info,
+          webmUintElement(WEBM_ID.TimestampScale, 1_000_000),
+        ),
         webmElement(
           WEBM_ID.Tracks,
           webmElement(
@@ -925,7 +1069,10 @@ function sampleWebm(): Uint8Array {
               webmUintElement(WEBM_ID.FlagLacing, 0),
               webmElement(
                 WEBM_ID.Video,
-                webmConcat(webmUintElement(WEBM_ID.PixelWidth, 160), webmUintElement(WEBM_ID.PixelHeight, 90)),
+                webmConcat(
+                  webmUintElement(WEBM_ID.PixelWidth, 160),
+                  webmUintElement(WEBM_ID.PixelHeight, 90),
+                ),
               ),
             ),
           ),
@@ -934,7 +1081,10 @@ function sampleWebm(): Uint8Array {
           WEBM_ID.Cluster,
           webmConcat(
             webmUintElement(WEBM_ID.Timestamp, 0),
-            webmElement(WEBM_ID.SimpleBlock, new Uint8Array([0x81, 0, 0, 0, 9, 8, 7])),
+            webmElement(
+              WEBM_ID.SimpleBlock,
+              new Uint8Array([0x81, 0, 0, 0, 9, 8, 7]),
+            ),
           ),
         ),
       ),
@@ -942,7 +1092,9 @@ function sampleWebm(): Uint8Array {
   );
 }
 
-function sampleIvf(options: { headerLength?: number; width?: number; height?: number } = {}): Uint8Array {
+function sampleIvf(
+  options: { headerLength?: number; width?: number; height?: number } = {},
+): Uint8Array {
   const headerLength = options.headerLength ?? 32;
   const bytes: number[] = [];
   ascii(bytes, "DKIF");
@@ -980,7 +1132,12 @@ function le16(bytes: number[], value: number): void {
 }
 
 function le32(bytes: number[], value: number): void {
-  bytes.push(value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff);
+  bytes.push(
+    value & 0xff,
+    (value >>> 8) & 0xff,
+    (value >>> 16) & 0xff,
+    (value >>> 24) & 0xff,
+  );
 }
 
 function le64(bytes: number[], value: bigint): void {
@@ -1009,7 +1166,11 @@ const WEBM_ID = {
 } as const;
 
 function webmElement(id: number, content: Uint8Array): Uint8Array {
-  return webmConcat(new Uint8Array(webmIdBytes(id)), new Uint8Array(webmSizeVint(content.byteLength)), content);
+  return webmConcat(
+    new Uint8Array(webmIdBytes(id)),
+    new Uint8Array(webmSizeVint(content.byteLength)),
+    content,
+  );
 }
 
 function webmUintElement(id: number, value: number): Uint8Array {

@@ -12,7 +12,10 @@ const WEBM_BYTES = webmFile({
   ],
 });
 
-function bodyFromChunks(bytes: Uint8Array, chunkSize: number): ReadableStream<Uint8Array> {
+function bodyFromChunks(
+  bytes: Uint8Array,
+  chunkSize: number,
+): ReadableStream<Uint8Array> {
   let offset = 0;
   return new ReadableStream({
     pull(controller) {
@@ -34,8 +37,11 @@ async function collect(media: MediaStream): Promise<MediaPacket[]> {
   return packets;
 }
 
-function ivfFile(packets: { timestamp: bigint; payload: number[] }[]): Uint8Array {
-  const size = 32 + packets.reduce((sum, packet) => sum + 12 + packet.payload.length, 0);
+function ivfFile(
+  packets: { timestamp: bigint; payload: number[] }[],
+): Uint8Array {
+  const size =
+    32 + packets.reduce((sum, packet) => sum + 12 + packet.payload.length, 0);
   const bytes = new Uint8Array(size);
   const view = new DataView(bytes.buffer);
   bytes.set([0x44, 0x4b, 0x49, 0x46]); // DKIF
@@ -94,7 +100,10 @@ describe("media-stream", () => {
       });
       const packets = await collect(media);
       expect(packets.map((packet) => packet.timestamp)).toEqual([0n, 1n]);
-      expect(packets.map((packet) => [...packet.payload])).toEqual([[1, 2, 3], [4]]);
+      expect(packets.map((packet) => [...packet.payload])).toEqual([
+        [1, 2, 3],
+        [4],
+      ]);
     }
   });
 
@@ -120,15 +129,17 @@ describe("media-stream", () => {
   });
 
   test("rejects unknown containers and packet-less streams", async () => {
-    await expect(demuxMediaBody(bodyFromChunks(new Uint8Array([1, 2, 3, 4, 5]), 2))).rejects.toThrow(
-      "unsupported input container",
-    );
+    await expect(
+      demuxMediaBody(bodyFromChunks(new Uint8Array([1, 2, 3, 4, 5]), 2)),
+    ).rejects.toThrow("unsupported input container");
     const noClusters = webmFile({ clusters: [] });
     await expect(demuxMediaBody(bodyFromChunks(noClusters, 8))).rejects.toThrow(
       "WebM contains no VP9 packets",
     );
     const truncated = WEBM_BYTES.subarray(0, WEBM_BYTES.byteLength - 1);
     const media = await demuxMediaBody(bodyFromChunks(truncated, 16));
-    await expect(collect(media)).rejects.toThrow(/size exceeds parent|truncated/);
+    await expect(collect(media)).rejects.toThrow(
+      /size exceeds parent|truncated/,
+    );
   });
 });

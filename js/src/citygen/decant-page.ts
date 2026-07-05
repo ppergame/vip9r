@@ -125,6 +125,7 @@ main().catch((error: unknown) => {
   setState({
     ok: false,
     status: "error",
-    error: error instanceof Error ? error.stack ?? error.message : String(error),
+    error:
+      error instanceof Error ? (error.stack ?? error.message) : String(error),
   });
 });

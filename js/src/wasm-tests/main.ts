@@ -2,7 +2,12 @@ declare const readbuffer: (path: string) => ArrayBuffer;
 declare const print: (...values: unknown[]) => void;
 declare const quit: (code?: number) => never;
 
-import { createVip9rMemory, formatWasmLog, makeVip9rImports, WasmLogKind } from "../wasm-driver/wasm-env";
+import {
+  createVip9rMemory,
+  formatWasmLog,
+  makeVip9rImports,
+  WasmLogKind,
+} from "../wasm-driver/wasm-env";
 import type { WasmLog } from "../wasm-driver/wasm-env";
 import { spawnWorkerPool } from "../wasm-driver/pool";
 import type { WorkerPool } from "../wasm-driver/pool";
@@ -63,7 +68,9 @@ function main(args: string[]): void {
       if (json) {
         print(JSON.stringify(report));
       } else {
-        print(`no tests matched substring ${filterLabel} (${testNames.length} discovered)`);
+        print(
+          `no tests matched substring ${filterLabel} (${testNames.length} discovered)`,
+        );
       }
       quit(1);
     }
@@ -87,7 +94,11 @@ function main(args: string[]): void {
       }
     } else {
       failed += 1;
-      failures.push({ name: testName, message: result.message, logs: result.logs });
+      failures.push({
+        name: testName,
+        message: result.message,
+        logs: result.logs,
+      });
       if (!json) {
         printDiagnosticLogs(testName, result.logs);
         print(`test ${testName} ... FAILED: ${result.message}`);
@@ -118,11 +129,25 @@ function main(args: string[]): void {
   }
 
   if (failed === 0) {
-    print(formatResult("ok", passed, failed, testNames.length - selectedTestNames.length));
+    print(
+      formatResult(
+        "ok",
+        passed,
+        failed,
+        testNames.length - selectedTestNames.length,
+      ),
+    );
     return;
   }
 
-  print(formatResult("FAILED", passed, failed, testNames.length - selectedTestNames.length));
+  print(
+    formatResult(
+      "FAILED",
+      passed,
+      failed,
+      testNames.length - selectedTestNames.length,
+    ),
+  );
   quit(1);
 }
 
@@ -162,21 +187,32 @@ function printUsage(): void {
 function discoverTests(module: WebAssembly.Module): string[] {
   const tests: string[] = [];
   for (const descriptor of WebAssembly.Module.exports(module)) {
-    if (descriptor.kind === "function" && descriptor.name.startsWith(TEST_PREFIX)) {
+    if (
+      descriptor.kind === "function" &&
+      descriptor.name.startsWith(TEST_PREFIX)
+    ) {
       tests.push(descriptor.name);
     }
   }
   return tests;
 }
 
-function selectTests(testNames: string[], testFilter: string | undefined): string[] {
+function selectTests(
+  testNames: string[],
+  testFilter: string | undefined,
+): string[] {
   if (testFilter === undefined) {
     return testNames;
   }
   return testNames.filter((testName) => testName.includes(testFilter));
 }
 
-function formatResult(status: "ok" | "FAILED", passed: number, failed: number, filtered: number): string {
+function formatResult(
+  status: "ok" | "FAILED",
+  passed: number,
+  failed: number,
+  filtered: number,
+): string {
   const base = `result: ${status}. ${passed} passed; ${failed} failed`;
   if (filtered === 0) {
     return base;
@@ -184,7 +220,10 @@ function formatResult(status: "ok" | "FAILED", passed: number, failed: number, f
   return `${base}; ${filtered} filtered out`;
 }
 
-function emptyFilteredReport(testFilter: string, discovered: number): TestReport {
+function emptyFilteredReport(
+  testFilter: string,
+  discovered: number,
+): TestReport {
   return {
     mode: "tests",
     ok: false,
@@ -206,7 +245,10 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
     // Unit tests init small decoder shapes; 64 MiB is plenty, and each test
     // gets a fresh memory alongside its fresh instance.
     const memory = createVip9rMemory(1024);
-    const instance = new WebAssembly.Instance(module, makeVip9rImports(memory, (log) => logs.push(log)));
+    const instance = new WebAssembly.Instance(
+      module,
+      makeVip9rImports(memory, (log) => logs.push(log)),
+    );
     const test = instance.exports[testName];
     if (typeof test !== "function") {
       return fail("export is not callable", logs);
@@ -239,13 +281,20 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
 }
 
 function fail(fallback: string, logs: WasmLog[]): TestResult {
-  return { kind: "fail", message: loggedFailureMessage(logs) ?? fallback, logs };
+  return {
+    kind: "fail",
+    message: loggedFailureMessage(logs) ?? fallback,
+    logs,
+  };
 }
 
 function loggedFailureMessage(logs: WasmLog[]): string | undefined {
   for (let index = logs.length - 1; index >= 0; index -= 1) {
     const log = logs[index];
-    if (log.kind === WasmLogKind.Panic || log.kind === WasmLogKind.TestFailure) {
+    if (
+      log.kind === WasmLogKind.Panic ||
+      log.kind === WasmLogKind.TestFailure
+    ) {
       return formatWasmLog(log);
     }
   }
@@ -254,7 +303,10 @@ function loggedFailureMessage(logs: WasmLog[]): string | undefined {
 
 function printDiagnosticLogs(testName: string, logs: WasmLog[]): void {
   for (const log of logs) {
-    if (log.kind === WasmLogKind.Panic || log.kind === WasmLogKind.TestFailure) {
+    if (
+      log.kind === WasmLogKind.Panic ||
+      log.kind === WasmLogKind.TestFailure
+    ) {
       continue;
     }
     print(`test ${testName} ${formatWasmLog(log)}`);
@@ -288,7 +340,9 @@ try {
     quit(2);
   }
   if (json) {
-    print(JSON.stringify({ mode: "tests", ok: false, error: errorMessage(error) }));
+    print(
+      JSON.stringify({ mode: "tests", ok: false, error: errorMessage(error) }),
+    );
   } else {
     print(errorMessage(error));
   }

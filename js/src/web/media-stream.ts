@@ -34,7 +34,9 @@ type Demuxer = {
 export async function openMediaStream(url: string): Promise<MediaStream> {
   const response = await fetch(url);
   if (!response.ok) {
-    throw new Error(`media fetch failed: ${response.status} ${response.statusText}`);
+    throw new Error(
+      `media fetch failed: ${response.status} ${response.statusText}`,
+    );
   }
   if (response.body === null) {
     throw new Error("media response has no body");
@@ -43,7 +45,9 @@ export async function openMediaStream(url: string): Promise<MediaStream> {
 }
 
 // Split from openMediaStream so tests can feed a synthetic body.
-export async function demuxMediaBody(body: ReadableStream<Uint8Array>): Promise<MediaStream> {
+export async function demuxMediaBody(
+  body: ReadableStream<Uint8Array>,
+): Promise<MediaStream> {
   const reader = body.getReader();
   let demuxer: Demuxer | undefined;
   let sniff: Uint8Array = new Uint8Array(0);
@@ -113,7 +117,9 @@ function sniffContainer(sniff: Uint8Array): Demuxer {
   ) {
     return new WebmStreamDemuxer();
   }
-  throw new Error("unsupported input container: expected IVF DKIF or WebM EBML");
+  throw new Error(
+    "unsupported input container: expected IVF DKIF or WebM EBML",
+  );
 }
 
 class WebmStreamDemuxer implements Demuxer {

@@ -17,7 +17,13 @@ export type WorkerAck = {
 
 export type WorkerEvent =
   | { type: "meta"; container: string; width: number; height: number }
-  | { type: "frame"; frame: VideoFrame; decodeMs: number; packetBytes: number; keyframe: boolean }
+  | {
+      type: "frame";
+      frame: VideoFrame;
+      decodeMs: number;
+      packetBytes: number;
+      keyframe: boolean;
+    }
   | { type: "log"; message: string; error: boolean }
   | { type: "done"; frames: number; packets: number; totalDecodeMs: number }
   | { type: "error"; message: string };
@@ -62,12 +68,21 @@ self.onmessage = (event: MessageEvent<WorkerInit | WorkerAck>) => {
   });
 };
 
-function makeVideoFrame(memory: WebAssembly.Memory, native: NativeFrame, timestamp: number): VideoFrame {
+function makeVideoFrame(
+  memory: WebAssembly.Memory,
+  native: NativeFrame,
+  timestamp: number,
+): VideoFrame {
   return new VideoFrame(memory.buffer, {
     format: "I420",
     codedWidth: native.decodedWidth,
     codedHeight: native.decodedHeight,
-    visibleRect: { x: 0, y: 0, width: native.renderWidth, height: native.renderHeight },
+    visibleRect: {
+      x: 0,
+      y: 0,
+      width: native.renderWidth,
+      height: native.renderHeight,
+    },
     layout: [
       { offset: native.y.offset, stride: native.y.stride },
       { offset: native.u.offset, stride: native.u.stride },
@@ -87,8 +102,9 @@ async function decodeAll(url: string): Promise<void> {
     height: header.height,
   });
 
-  const { instance, module, memory } = await instantiateVip9r(header, (message) =>
-    post({ type: "log", message, error: true }),
+  const { instance, module, memory } = await instantiateVip9r(
+    header,
+    (message) => post({ type: "log", message, error: true }),
   );
   // The pool dies with this worker.
   await activateWorkerPool(instance, module, memory, (message) =>

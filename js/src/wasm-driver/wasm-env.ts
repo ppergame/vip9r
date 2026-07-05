@@ -11,7 +11,8 @@ export type WasmLog = {
 
 export type WasmLogSink = (log: WasmLog) => void;
 
-const utf8Decoder = typeof TextDecoder === "function" ? new TextDecoder("utf-8") : undefined;
+const utf8Decoder =
+  typeof TextDecoder === "function" ? new TextDecoder("utf-8") : undefined;
 
 export const WASM_PAGE_BYTES = 65536;
 
@@ -68,7 +69,9 @@ export function sessionMaxPages(
   }
   const pages = requiredPages(dims.width, dims.height) as number;
   if (!Number.isInteger(pages) || pages <= 0) {
-    throw new Error(`vip9r_required_pages(${dims.width}x${dims.height}) failed: ${pages}`);
+    throw new Error(
+      `vip9r_required_pages(${dims.width}x${dims.height}) failed: ${pages}`,
+    );
   }
   return pages + PACKET_TAIL_PAGES;
 }
@@ -81,7 +84,12 @@ export function makeVip9rImports(
     env: {
       memory,
       vip9r_log(kind: number, ptr: number, len: number): void {
-        if (!Number.isInteger(ptr) || !Number.isInteger(len) || ptr < 0 || len < 0) {
+        if (
+          !Number.isInteger(ptr) ||
+          !Number.isInteger(len) ||
+          ptr < 0 ||
+          len < 0
+        ) {
           throw new Error(`invalid wasm log span: ptr=${ptr} len=${len}`);
         }
         if (ptr + len > memory.buffer.byteLength) {

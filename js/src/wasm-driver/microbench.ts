@@ -51,12 +51,29 @@ function main(args: string[]): void {
   const module = new WebAssembly.Module(readbuffer(parsed.wasmPath));
   // Microbench kernels run on small fixed scratch; 64 MiB is plenty.
   const memory = createVip9rMemory(1024);
-  const instance = new WebAssembly.Instance(module, makeVip9rImports(memory, (log) => logs.push(log)));
+  const instance = new WebAssembly.Instance(
+    module,
+    makeVip9rImports(memory, (log) => logs.push(log)),
+  );
   const bench = benchExport(instance);
 
   const now = nowMs;
-  const warmup = runTimedMicrobench(bench, parsed.slot, DEFAULT_INNER_ITERS, DEFAULT_WARMUP_MS, now, false);
-  const measurement = runTimedMicrobench(bench, parsed.slot, DEFAULT_INNER_ITERS, DEFAULT_TARGET_MS, now, true);
+  const warmup = runTimedMicrobench(
+    bench,
+    parsed.slot,
+    DEFAULT_INNER_ITERS,
+    DEFAULT_WARMUP_MS,
+    now,
+    false,
+  );
+  const measurement = runTimedMicrobench(
+    bench,
+    parsed.slot,
+    DEFAULT_INNER_ITERS,
+    DEFAULT_TARGET_MS,
+    now,
+    true,
+  );
   const report: MicrobenchReport = {
     mode: "microbench",
     ok: true,
@@ -169,7 +186,9 @@ function runTimedMicrobench(
   };
 }
 
-function benchExport(instance: WebAssembly.Instance): (slot: number, innerIters: number) => number {
+function benchExport(
+  instance: WebAssembly.Instance,
+): (slot: number, innerIters: number) => number {
   const bench = instance.exports.vip9r_bench_run;
   if (typeof bench !== "function") {
     throw new Error("missing wasm export: vip9r_bench_run");
@@ -220,7 +239,10 @@ function parseSafeInteger(value: string, name: string): number {
 }
 
 function nowMs(): number {
-  if (typeof performance === "object" && typeof performance.now === "function") {
+  if (
+    typeof performance === "object" &&
+    typeof performance.now === "function"
+  ) {
     return performance.now();
   }
   return Date.now();
@@ -241,9 +263,17 @@ try {
 } catch (error) {
   if (error instanceof UsageError) {
     printUsage(printStderr);
-    print(JSON.stringify({ mode: "microbench", ok: false, error: error.message }));
+    print(
+      JSON.stringify({ mode: "microbench", ok: false, error: error.message }),
+    );
     quit(2);
   }
-  print(JSON.stringify({ mode: "microbench", ok: false, error: errorMessage(error) }));
+  print(
+    JSON.stringify({
+      mode: "microbench",
+      ok: false,
+      error: errorMessage(error),
+    }),
+  );
   quit(1);
 }

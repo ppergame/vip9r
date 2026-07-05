@@ -139,7 +139,10 @@ export type FrameDecoder = {
   planeBytes(plane: Plane): Uint8Array;
 };
 
-export type DecodeWindow = Pick<BenchmarkOptions, "outputOffset" | "outputFrames">;
+export type DecodeWindow = Pick<
+  BenchmarkOptions,
+  "outputOffset" | "outputFrames"
+>;
 
 export type DecodeWindowStats = {
   codedFrames: number;
@@ -237,7 +240,10 @@ export function parseDriverArgs(args: string[]): DriverArgs {
       continue;
     }
     if (arg.startsWith("--progress-frames=")) {
-      progressFrames = parsePositiveInteger(arg.slice("--progress-frames=".length), "--progress-frames");
+      progressFrames = parsePositiveInteger(
+        arg.slice("--progress-frames=".length),
+        "--progress-frames",
+      );
       continue;
     }
     if (arg === "--frames") {
@@ -273,7 +279,9 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   }
 
   const [wasmPath, explicitInputPath] = paths;
-  const inputPath = explicitInputPath ?? (bench ? DEFAULT_BENCHMARK_INPUT : DEFAULT_GOLDEN_INPUT);
+  const inputPath =
+    explicitInputPath ??
+    (bench ? DEFAULT_BENCHMARK_INPUT : DEFAULT_GOLDEN_INPUT);
   const goldenPath = `${inputPath}.md5`;
   return {
     allowMismatch,
@@ -287,25 +295,50 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   };
 }
 
-export function compareWasmToGolden(args: DriverArgs, io: GoldenIo): ComparisonReport {
+export function compareWasmToGolden(
+  args: DriverArgs,
+  io: GoldenIo,
+): ComparisonReport {
   const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
   // The single pool (if any) lives for the whole comparison; workers die with
   // the process (Worker.terminate at exit is the pinned shutdown story).
-  const { decoder } = instantiateVp9Decoder(wasm, decoderDimensions, io.log, args.pool);
+  const { decoder } = instantiateVp9Decoder(
+    wasm,
+    decoderDimensions,
+    io.log,
+    args.pool,
+  );
 
   const report =
     args.frames !== undefined
-      ? compareDecodedVp9WindowToGolden(args.inputPath, args.goldenPath, input, golden, decoder, args.frames)
-      : compareDecodedVp9ToGolden(args.inputPath, args.goldenPath, input, golden, decoder, {
-          progressFrames: args.progressFrames,
-          onProgress: io.progress,
-        });
+      ? compareDecodedVp9WindowToGolden(
+          args.inputPath,
+          args.goldenPath,
+          input,
+          golden,
+          decoder,
+          args.frames,
+        )
+      : compareDecodedVp9ToGolden(
+          args.inputPath,
+          args.goldenPath,
+          input,
+          golden,
+          decoder,
+          {
+            progressFrames: args.progressFrames,
+            onProgress: io.progress,
+          },
+        );
   report.finalMemoryBytes = decoder.memoryByteLength();
   return report;
 }
 
-export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkReport {
+export function benchmarkWasmGolden(
+  args: DriverArgs,
+  io: GoldenIo,
+): BenchmarkReport {
   if (args.bench === undefined) {
     throw new Error("benchmark options missing");
   }
@@ -313,8 +346,14 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
   const window = normalizeDecodeWindow(args.bench);
-  const warmupMs = validNonNegativeInteger("benchmark warmup ms", args.bench.warmupMs);
-  const targetMs = validPositiveIntegerValue("benchmark target ms", args.bench.targetMs);
+  const warmupMs = validNonNegativeInteger(
+    "benchmark warmup ms",
+    args.bench.warmupMs,
+  );
+  const targetMs = validPositiveIntegerValue(
+    "benchmark target ms",
+    args.bench.targetMs,
+  );
   validateGoldenWindow(golden, window);
   const plan = planBenchmarkDecode(input, window);
   // Each pass gets a fresh decoder over a fresh shared memory; parked pool
@@ -323,7 +362,12 @@ export function benchmarkWasmGolden(args: DriverArgs, io: GoldenIo): BenchmarkRe
   let livePool: WorkerPool | undefined;
   const makeDecoder = () => {
     livePool?.terminate();
-    const made = instantiateVp9Decoder(wasm, decoderDimensions, io.log, args.pool);
+    const made = instantiateVp9Decoder(
+      wasm,
+      decoderDimensions,
+      io.log,
+      args.pool,
+    );
     livePool = made.pool;
     return made.decoder;
   };
@@ -391,7 +435,9 @@ export function compareDecodedVp9ToGolden(
   options: CompareOptions = {},
 ): ComparisonReport {
   const comparisons: FrameComparison[] = [];
-  const comparedDimensions = zeroDimensionIvf(input) ? comparedGoldenDimensions(golden) : undefined;
+  const comparedDimensions = zeroDimensionIvf(input)
+    ? comparedGoldenDimensions(golden)
+    : undefined;
   const progressFrames = normalizeProgressFrames(options.progressFrames);
   let nextProgressFrame = progressFrames;
   let coded = 0;
@@ -401,7 +447,10 @@ export function compareDecodedVp9ToGolden(
     try {
       decoder.beginPacket(packet.payload);
     } catch (error) {
-      throw contextError(`decode packet ${packet.index} timestamp ${packet.timestamp}`, error);
+      throw contextError(
+        `decode packet ${packet.index} timestamp ${packet.timestamp}`,
+        error,
+      );
     }
 
     let codedIndex = 0;
@@ -410,7 +459,10 @@ export function compareDecodedVp9ToGolden(
       try {
         step = decoder.decodeNext();
       } catch (error) {
-        throw contextError(`decode packet ${packet.index} coded frame ${codedIndex}`, error);
+        throw contextError(
+          `decode packet ${packet.index} coded frame ${codedIndex}`,
+          error,
+        );
       }
       coded += 1;
       codedIndex += 1;
@@ -419,7 +471,9 @@ export function compareDecodedVp9ToGolden(
         decodedOutputFrames += 1;
         if (
           comparedDimensions !== undefined &&
-          !comparedDimensions.has(dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight))
+          !comparedDimensions.has(
+            dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight),
+          )
         ) {
           skippedOutputFrames += 1;
           if (step.packetDone) {
@@ -448,7 +502,11 @@ export function compareDecodedVp9ToGolden(
           renderWidth: step.frame.renderWidth,
           renderHeight: step.frame.renderHeight,
         });
-        if (progressFrames !== undefined && nextProgressFrame !== undefined && options.onProgress !== undefined) {
+        if (
+          progressFrames !== undefined &&
+          nextProgressFrame !== undefined &&
+          options.onProgress !== undefined
+        ) {
           while (comparisons.length >= nextProgressFrame) {
             options.onProgress({
               packetIndex: packet.index,
@@ -494,7 +552,10 @@ export function compareDecodedVp9WindowToGolden(
     options.goldenOffset === undefined
       ? normalizedWindow.outputOffset
       : validNonNegativeInteger("golden output offset", options.goldenOffset);
-  validateGoldenWindow(golden, { outputOffset: goldenOffset, outputFrames: normalizedWindow.outputFrames });
+  validateGoldenWindow(golden, {
+    outputOffset: goldenOffset,
+    outputFrames: normalizedWindow.outputFrames,
+  });
   const comparisons: FrameComparison[] = [];
   const stats = decodeVp9Window(
     input,
@@ -540,7 +601,10 @@ export function compareDecodedVp9WindowToGolden(
   );
 }
 
-export function planBenchmarkDecode(input: DemuxedVp9, window: DecodeWindow): BenchmarkDecodePlan {
+export function planBenchmarkDecode(
+  input: DemuxedVp9,
+  window: DecodeWindow,
+): BenchmarkDecodePlan {
   const normalizedWindow = normalizeDecodeWindow(window);
   if (normalizedWindow.outputOffset === 0) {
     return {
@@ -551,11 +615,17 @@ export function planBenchmarkDecode(input: DemuxedVp9, window: DecodeWindow): Be
   }
 
   if (input.container !== "webm") {
-    throw new Error("nonzero benchmark --frames start requires WebM keyframe metadata");
+    throw new Error(
+      "nonzero benchmark --frames start requires WebM keyframe metadata",
+    );
   }
 
   let visibleIndex = 0;
-  for (let packetIndex = 0; packetIndex < input.packets.length; packetIndex += 1) {
+  for (
+    let packetIndex = 0;
+    packetIndex < input.packets.length;
+    packetIndex += 1
+  ) {
     const packet = input.packets[packetIndex];
     if (packet.visible === false) {
       continue;
@@ -597,7 +667,9 @@ export function decodeVp9Window(
   deadline?: DecodeWindowDeadline,
 ): DecodeWindowStats {
   const normalizedWindow = normalizeDecodeWindow(window);
-  const comparedDimensions = zeroDimensionIvf(input) ? comparedGoldenDimensions(golden) : undefined;
+  const comparedDimensions = zeroDimensionIvf(input)
+    ? comparedGoldenDimensions(golden)
+    : undefined;
   let codedFrames = 0;
   let decodedOutputFrames = 0;
   let skippedOutputFrames = 0;
@@ -630,7 +702,10 @@ export function decodeVp9Window(
     try {
       decoder.beginPacket(packet.payload);
     } catch (error) {
-      throw contextError(`decode packet ${packet.index} timestamp ${packet.timestamp}`, error);
+      throw contextError(
+        `decode packet ${packet.index} timestamp ${packet.timestamp}`,
+        error,
+      );
     }
     checkDeadline();
 
@@ -640,7 +715,10 @@ export function decodeVp9Window(
       try {
         step = decoder.decodeNext();
       } catch (error) {
-        throw contextError(`decode packet ${packet.index} coded frame ${codedIndex}`, error);
+        throw contextError(
+          `decode packet ${packet.index} coded frame ${codedIndex}`,
+          error,
+        );
       }
       codedFrames += 1;
       codedIndex += 1;
@@ -649,7 +727,9 @@ export function decodeVp9Window(
         decodedOutputFrames += 1;
         if (
           comparedDimensions !== undefined &&
-          !comparedDimensions.has(dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight))
+          !comparedDimensions.has(
+            dimensionKey(step.frame.decodedWidth, step.frame.decodedHeight),
+          )
         ) {
           skippedOutputFrames += 1;
           checkDeadline();
@@ -662,7 +742,10 @@ export function decodeVp9Window(
         const outputIndex = comparableOutputFrames;
         comparableOutputFrames += 1;
         let windowComplete = false;
-        if (outputIndex >= normalizedWindow.outputOffset && selectedOutputFrames < normalizedWindow.outputFrames) {
+        if (
+          outputIndex >= normalizedWindow.outputOffset &&
+          selectedOutputFrames < normalizedWindow.outputFrames
+        ) {
           const selectedIndex = selectedOutputFrames;
           selectedOutputFrames += 1;
           onSelectedOutput?.(step.frame, {
@@ -671,7 +754,8 @@ export function decodeVp9Window(
             outputIndex,
             selectedIndex,
           });
-          windowComplete = selectedOutputFrames >= normalizedWindow.outputFrames;
+          windowComplete =
+            selectedOutputFrames >= normalizedWindow.outputFrames;
         }
         checkDeadline();
         if (windowComplete) {
@@ -696,7 +780,9 @@ type WindowOutputContext = {
   selectedIndex: number;
 };
 
-function normalizeProgressFrames(progressFrames: number | undefined): number | undefined {
+function normalizeProgressFrames(
+  progressFrames: number | undefined,
+): number | undefined {
   if (progressFrames === undefined) {
     return undefined;
   }
@@ -707,13 +793,26 @@ function normalizeProgressFrames(progressFrames: number | undefined): number | u
 }
 
 function normalizeDecodeWindow(window: DecodeWindow): DecodeWindow {
-  const outputOffset = validNonNegativeInteger("benchmark output offset", window.outputOffset);
-  const outputFrames = validPositiveIntegerValue("benchmark output frames", window.outputFrames);
+  const outputOffset = validNonNegativeInteger(
+    "benchmark output offset",
+    window.outputOffset,
+  );
+  const outputFrames = validPositiveIntegerValue(
+    "benchmark output frames",
+    window.outputFrames,
+  );
   return { outputOffset, outputFrames };
 }
 
-function validateGoldenWindow(golden: GoldenFrame[], window: DecodeWindow): void {
-  const end = checkedAdd(window.outputOffset, window.outputFrames, "output window");
+function validateGoldenWindow(
+  golden: GoldenFrame[],
+  window: DecodeWindow,
+): void {
+  const end = checkedAdd(
+    window.outputOffset,
+    window.outputFrames,
+    "output window",
+  );
   if (end > golden.length) {
     throw new Error(
       `output window ${window.outputOffset}..${end} exceeds golden frame count ${golden.length}`,
@@ -795,13 +894,20 @@ export function runTimedWarmupValidation(
     if (warmupPassStart - start < 0) {
       throw new Error("benchmark clock moved backwards");
     }
-    const stats = decodeVp9Window(input, golden, makeDecoder(), window, undefined, {
-      phase: "warmup",
-      pass: passCount + 1,
-      startMs: warmupPassStart,
-      limitMs: passLimitMs,
-      now,
-    });
+    const stats = decodeVp9Window(
+      input,
+      golden,
+      makeDecoder(),
+      window,
+      undefined,
+      {
+        phase: "warmup",
+        pass: passCount + 1,
+        startMs: warmupPassStart,
+        limitMs: passLimitMs,
+        now,
+      },
+    );
     if (stats.selectedOutputFrames !== window.outputFrames) {
       throw new Error(
         `benchmark decode window incomplete: selected ${stats.selectedOutputFrames}/${window.outputFrames} output frames`,
@@ -854,13 +960,20 @@ export function runTimedDecodePasses(
     if (passStart - start < 0) {
       throw new Error("benchmark clock moved backwards");
     }
-    const stats = decodeVp9Window(input, golden, makeDecoder(), window, undefined, {
-      phase,
-      pass: passes + 1,
-      startMs: passStart,
-      limitMs: passLimitMs,
-      now,
-    });
+    const stats = decodeVp9Window(
+      input,
+      golden,
+      makeDecoder(),
+      window,
+      undefined,
+      {
+        phase,
+        pass: passes + 1,
+        startMs: passStart,
+        limitMs: passLimitMs,
+        now,
+      },
+    );
     if (stats.selectedOutputFrames !== window.outputFrames) {
       throw new Error(
         `benchmark decode window incomplete: selected ${stats.selectedOutputFrames}/${window.outputFrames} output frames`,
@@ -909,7 +1022,10 @@ function passRange(passMs: number[]): { minPassMs: number; maxPassMs: number } {
   return { minPassMs: Math.min(...passMs), maxPassMs: Math.max(...passMs) };
 }
 
-function frameRate(frames: number, elapsedMs: number): { msPerFrame: number; fps: number } {
+function frameRate(
+  frames: number,
+  elapsedMs: number,
+): { msPerFrame: number; fps: number } {
   if (frames === 0 || elapsedMs <= 0) {
     return { msPerFrame: 0, fps: 0 };
   }
@@ -937,7 +1053,9 @@ function parseSafeInteger(value: string, name: string): number {
 function parseOutputFrameRange(value: string): DecodeWindow {
   const match = /^(\d+):(\d+)$/.exec(value);
   if (match === null) {
-    throw new Error("--frames must be START:LAST with non-negative integer start and last");
+    throw new Error(
+      "--frames must be START:LAST with non-negative integer start and last",
+    );
   }
   const start = parseSafeInteger(match[1], "--frames start");
   const last = parseSafeInteger(match[2], "--frames last");
@@ -989,7 +1107,9 @@ export function parseVp9Input(data: Uint8Array): DemuxedVp9 {
       packets: webm.packets,
     };
   }
-  throw new Error("unsupported input container: expected IVF DKIF or WebM EBML");
+  throw new Error(
+    "unsupported input container: expected IVF DKIF or WebM EBML",
+  );
 }
 
 export function parseIvf(data: Uint8Array): IvfFile {
@@ -1033,17 +1153,26 @@ export function decoderDimensionsForGolden(
   const maxDimensions = maxGoldenDimensions(golden);
   const width = Math.max(input.width, maxDimensions?.width ?? 0);
   const height = Math.max(input.height, maxDimensions?.height ?? 0);
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+  if (
+    !Number.isSafeInteger(width) ||
+    !Number.isSafeInteger(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
     throw new Error(
       `decoder dimensions unavailable: container=${input.width}x${input.height}, golden=${
-        maxDimensions === undefined ? "none" : `${maxDimensions.width}x${maxDimensions.height}`
+        maxDimensions === undefined
+          ? "none"
+          : `${maxDimensions.width}x${maxDimensions.height}`
       }`,
     );
   }
   return { width, height };
 }
 
-export function maxGoldenDimensions(golden: GoldenFrame[]): { width: number; height: number } | undefined {
+export function maxGoldenDimensions(
+  golden: GoldenFrame[],
+): { width: number; height: number } | undefined {
   let width = 0;
   let height = 0;
   for (const frame of golden) {
@@ -1060,7 +1189,9 @@ export function maxGoldenDimensions(golden: GoldenFrame[]): { width: number; hei
   return { width, height };
 }
 
-function comparedGoldenDimensions(golden: GoldenFrame[]): Set<string> | undefined {
+function comparedGoldenDimensions(
+  golden: GoldenFrame[],
+): Set<string> | undefined {
   const dimensions = new Set<string>();
   for (const frame of golden) {
     const parsed = dimensionsFromGoldenName(frame.name);
@@ -1072,7 +1203,9 @@ function comparedGoldenDimensions(golden: GoldenFrame[]): Set<string> | undefine
   return dimensions;
 }
 
-function dimensionsFromGoldenName(name: string): { width: number; height: number } | undefined {
+function dimensionsFromGoldenName(
+  name: string,
+): { width: number; height: number } | undefined {
   const xSeparated = /(?:^|[-_])(\d+)x(\d+)-\d+\.i420$/i.exec(name);
   const dashSeparated = /(?:^|[-_])(\d+)-(\d+)-\d+\.i420$/i.exec(name);
   const match = xSeparated ?? dashSeparated;
@@ -1082,7 +1215,12 @@ function dimensionsFromGoldenName(name: string): { width: number; height: number
 
   const width = Number(match[1]);
   const height = Number(match[2]);
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
+  if (
+    !Number.isSafeInteger(width) ||
+    !Number.isSafeInteger(height) ||
+    width <= 0 ||
+    height <= 0
+  ) {
     return undefined;
   }
   return { width, height };
@@ -1132,7 +1270,8 @@ export function matchedCount(report: ComparisonReport): number {
 
 export function mismatchCount(report: ComparisonReport): number {
   return report.comparisons.filter(
-    (comparison) => comparison.expectedMd5 !== undefined && !isMatch(comparison),
+    (comparison) =>
+      comparison.expectedMd5 !== undefined && !isMatch(comparison),
   ).length;
 }
 
@@ -1144,9 +1283,18 @@ export function extraCount(report: ComparisonReport): number {
   return Math.max(report.comparisons.length - report.expectedCount, 0);
 }
 
-export function passes(report: ComparisonReport, allowMismatch: boolean): boolean {
-  const matches = mismatchCount(report) === 0 && missingCount(report) === 0 && extraCount(report) === 0;
-  return matches || (allowMismatch && missingCount(report) === 0 && extraCount(report) === 0);
+export function passes(
+  report: ComparisonReport,
+  allowMismatch: boolean,
+): boolean {
+  const matches =
+    mismatchCount(report) === 0 &&
+    missingCount(report) === 0 &&
+    extraCount(report) === 0;
+  return (
+    matches ||
+    (allowMismatch && missingCount(report) === 0 && extraCount(report) === 0)
+  );
 }
 
 export function formatReport(report: ComparisonReport): string[] {
@@ -1158,7 +1306,9 @@ export function formatReport(report: ComparisonReport): string[] {
     `frames: ${matchedCount(report)} matched, ${mismatchCount(report)} mismatched, ${missingCount(report)} missing, ${extraCount(report)} extra`,
   ];
 
-  for (const comparison of report.comparisons.filter((comparison) => !isMatch(comparison)).slice(0, 10)) {
+  for (const comparison of report.comparisons
+    .filter((comparison) => !isMatch(comparison))
+    .slice(0, 10)) {
     lines.push(
       `mismatch frame ${comparison.frameNumber} ${comparison.expectedName ?? "<extra>"}: expected ${comparison.expectedMd5 ?? "<none>"}, actual ${comparison.actualMd5}, size=${comparison.decodedWidth}x${comparison.decodedHeight} render=${comparison.renderWidth}x${comparison.renderHeight}`,
     );
@@ -1169,7 +1319,9 @@ export function formatReport(report: ComparisonReport): string[] {
 
 export function formatProgress(event: ProgressEvent): string {
   const percent =
-    event.expectedCount > 0 ? ` ${(event.comparedFrames / event.expectedCount * 100).toFixed(1)}%` : "";
+    event.expectedCount > 0
+      ? ` ${((event.comparedFrames / event.expectedCount) * 100).toFixed(1)}%`
+      : "";
   return `progress: compared=${event.comparedFrames}/${event.expectedCount}${percent} decoded_outputs=${event.decodedOutputFrames} coded_frames=${event.codedFrames} packet=${event.packetIndex + 1}/${event.packetCount}`;
 }
 
@@ -1180,7 +1332,10 @@ function formatContainerLine(report: ComparisonReport): string {
   return `webm: codec=${report.codec} size=${report.width}x${report.height} timestamp_scale=${report.timestampScale} packets=${report.packetCount}`;
 }
 
-export function compactI420(decoder: FrameDecoder, frame: NativeFrame): Uint8Array {
+export function compactI420(
+  decoder: FrameDecoder,
+  frame: NativeFrame,
+): Uint8Array {
   const width = validPositiveInteger("decoded width", frame.decodedWidth);
   const height = validPositiveInteger("decoded height", frame.decodedHeight);
   const chromaWidth = Math.ceil(width / 2);
@@ -1216,12 +1371,18 @@ export function compactI420(decoder: FrameDecoder, frame: NativeFrame): Uint8Arr
     "V",
   );
   if (offset !== output.byteLength) {
-    throw new Error(`compact I420 length mismatch: wrote ${offset}, expected ${output.byteLength}`);
+    throw new Error(
+      `compact I420 length mismatch: wrote ${offset}, expected ${output.byteLength}`,
+    );
   }
   return output;
 }
 
-function planeBytes(decoder: FrameDecoder, plane: Plane, name: string): Uint8Array {
+function planeBytes(
+  decoder: FrameDecoder,
+  plane: Plane,
+  name: string,
+): Uint8Array {
   try {
     return decoder.planeBytes(plane);
   } catch (error) {
@@ -1248,12 +1409,20 @@ function copyPlane(
     `${name} plane input length`,
   );
   if (input.byteLength < requiredInput) {
-    throw new Error(`invalid ${name} plane: data too short ${input.byteLength} < ${requiredInput}`);
+    throw new Error(
+      `invalid ${name} plane: data too short ${input.byteLength} < ${requiredInput}`,
+    );
   }
 
-  const requiredOutput = checkedMul(width, height, `${name} plane output length`);
+  const requiredOutput = checkedMul(
+    width,
+    height,
+    `${name} plane output length`,
+  );
   if (output.byteLength - outputOffset < requiredOutput) {
-    throw new Error(`compact I420 output too small: ${output.byteLength - outputOffset} < ${requiredOutput}`);
+    throw new Error(
+      `compact I420 output too small: ${output.byteLength - outputOffset} < ${requiredOutput}`,
+    );
   }
 
   for (let row = 0; row < height; row += 1) {
@@ -1309,7 +1478,10 @@ export function md5Hex(input: Uint8Array): string {
 
       const nextD = c;
       c = b;
-      b = (b + rotateLeft((a + f + MD5_K[index] + words[g]) >>> 0, MD5_S[index])) >>> 0;
+      b =
+        (b +
+          rotateLeft((a + f + MD5_K[index] + words[g]) >>> 0, MD5_S[index])) >>>
+        0;
       a = d;
       d = nextD;
     }
@@ -1325,7 +1497,9 @@ export function md5Hex(input: Uint8Array): string {
   writeLe32(digest, 4, b0);
   writeLe32(digest, 8, c0);
   writeLe32(digest, 12, d0);
-  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }
 
 function requiredI420Length(width: number, height: number): number {
@@ -1333,7 +1507,11 @@ function requiredI420Length(width: number, height: number): number {
   const chromaHeight = Math.ceil(height / 2);
   const luma = checkedMul(width, height, "I420 luma length");
   const chroma = checkedMul(chromaWidth, chromaHeight, "I420 chroma length");
-  return checkedAdd(luma, checkedMul(2, chroma, "I420 chroma pair length"), "I420 length");
+  return checkedAdd(
+    luma,
+    checkedMul(2, chroma, "I420 chroma pair length"),
+    "I420 length",
+  );
 }
 
 function validPositiveInteger(name: string, value: number): number {
@@ -1369,21 +1547,24 @@ function ascii(data: Uint8Array, start: number, end: number): string {
 
 function le32(data: Uint8Array, offset: number): number {
   return (
-    data[offset] |
-    (data[offset + 1] << 8) |
-    (data[offset + 2] << 16) |
-    (data[offset + 3] << 24)
-  ) >>> 0;
+    (data[offset] |
+      (data[offset + 1] << 8) |
+      (data[offset + 2] << 16) |
+      (data[offset + 3] << 24)) >>>
+    0
+  );
 }
 
 const MD5_S = [
-  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9,
-  14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15,
-  21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+  7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5,
+  9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11,
+  16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15,
+  21,
 ];
 
-const MD5_K = Array.from({ length: 64 }, (_, index) =>
-  Math.floor(Math.abs(Math.sin(index + 1)) * 0x1_0000_0000) >>> 0,
+const MD5_K = Array.from(
+  { length: 64 },
+  (_, index) => Math.floor(Math.abs(Math.sin(index + 1)) * 0x1_0000_0000) >>> 0,
 );
 
 function rotateLeft(value: number, bits: number): number {
@@ -1430,9 +1611,18 @@ function instantiateVp9Decoder(
     wasm,
     makeVip9rImports(createScratchVip9rMemory(), log),
   );
-  const memory = createVip9rMemory(sessionMaxPages(scratch.exports, decoderDimensions));
-  const instance = new WebAssembly.Instance(wasm, makeVip9rImports(memory, log));
-  const decoder = new Vp9Decoder(instance, decoderDimensions.width, decoderDimensions.height);
+  const memory = createVip9rMemory(
+    sessionMaxPages(scratch.exports, decoderDimensions),
+  );
+  const instance = new WebAssembly.Instance(
+    wasm,
+    makeVip9rImports(memory, log),
+  );
+  const decoder = new Vp9Decoder(
+    instance,
+    decoderDimensions.width,
+    decoderDimensions.height,
+  );
   if (!pool) {
     return { decoder };
   }
@@ -1447,7 +1637,10 @@ function instantiateVp9Decoder(
 }
 
 function monotonicNow(): number {
-  if (typeof performance === "object" && typeof performance.now === "function") {
+  if (
+    typeof performance === "object" &&
+    typeof performance.now === "function"
+  ) {
     return performance.now();
   }
   return Date.now();

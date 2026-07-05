@@ -27,6 +27,9 @@ export async function instantiateVip9r(
     makeVip9rImports(createScratchVip9rMemory(), sink),
   );
   const memory = createVip9rMemory(sessionMaxPages(scratch.exports, dims));
-  const instance = await WebAssembly.instantiate(module, makeVip9rImports(memory, sink));
+  const instance = await WebAssembly.instantiate(
+    module,
+    makeVip9rImports(memory, sink),
+  );
   return { instance, module, memory };
 }

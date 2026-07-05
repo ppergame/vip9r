@@ -29,7 +29,14 @@ export type LaneResult = {
 };
 
 export type BenchEvent =
-  | { type: "meta"; container: string; width: number; height: number; packets: number; budgetMs: number }
+  | {
+      type: "meta";
+      container: string;
+      width: number;
+      height: number;
+      packets: number;
+      budgetMs: number;
+    }
   | { type: "log"; message: string; error: boolean }
   | { type: "lane"; result: LaneResult }
   | { type: "lane-skipped"; lane: BenchLane; reason: string }
@@ -62,7 +69,8 @@ async function run(init: BenchInit): Promise<void> {
   }
   const first = packetTimestampUs(header, packets[0].timestamp);
   const last = packetTimestampUs(header, packets[packets.length - 1].timestamp);
-  const budgetMs = packets.length < 2 ? 0 : (last - first) / 1000 / (packets.length - 1);
+  const budgetMs =
+    packets.length < 2 ? 0 : (last - first) / 1000 / (packets.length - 1);
   post({
     type: "meta",
     container: header.container,
@@ -103,9 +111,13 @@ type Vip9rPassStats = {
   videoFrameMs: number;
 };
 
-async function vip9rLane(input: MediaHeader, packets: MediaPacket[]): Promise<LaneResult> {
-  const { instance, module, memory } = await instantiateVip9r(input, (message) =>
-    post({ type: "log", message, error: true }),
+async function vip9rLane(
+  input: MediaHeader,
+  packets: MediaPacket[],
+): Promise<LaneResult> {
+  const { instance, module, memory } = await instantiateVip9r(
+    input,
+    (message) => post({ type: "log", message, error: true }),
   );
   // Tile-parallel like playback, so the lane measures what the player runs.
   const pool = await activateWorkerPool(instance, module, memory, (message) =>
@@ -114,7 +126,11 @@ async function vip9rLane(input: MediaHeader, packets: MediaPacket[]): Promise<La
   const decoder = new Vp9Decoder(instance, input.width, input.height);
   post({ type: "log", message: "vip9r: warmup", error: false });
   vip9rPass(decoder, memory, input, packets.slice(0, WARMUP_PACKETS));
-  post({ type: "log", message: `vip9r: timing ${packets.length} packets`, error: false });
+  post({
+    type: "log",
+    message: `vip9r: timing ${packets.length} packets`,
+    error: false,
+  });
   const before = performance.now();
   const stats = vip9rPass(decoder, memory, input, packets);
   const wallMs = performance.now() - before;
@@ -140,7 +156,10 @@ function ogvVideoFormat(input: MediaHeader): OgvVideoFormat {
   };
 }
 
-async function ogvLane(input: MediaHeader, packets: MediaPacket[]): Promise<LaneResult | string> {
+async function ogvLane(
+  input: MediaHeader,
+  packets: MediaPacket[],
+): Promise<LaneResult | string> {
   // The ogv.js wrapper is a classic-worker script that uses importScripts().
   const worker = new Worker(new URL("./ogv-lane-worker.ts", import.meta.url));
   try {
@@ -158,10 +177,18 @@ async function ogvLane(input: MediaHeader, packets: MediaPacket[]): Promise<Lane
         const message = event.data;
         switch (message.type) {
           case "log":
-            post({ type: "log", message: message.message, error: message.error });
+            post({
+              type: "log",
+              message: message.message,
+              error: message.error,
+            });
             break;
           case "done":
-            resolve({ lane: "ogv", frames: message.frames, wallMs: message.wallMs });
+            resolve({
+              lane: "ogv",
+              frames: message.frames,
+              wallMs: message.wallMs,
+            });
             break;
           case "skipped":
             resolve(message.reason);
@@ -200,7 +227,11 @@ function vip9rPass(
         continue;
       }
       const vfBefore = performance.now();
-      makeVideoFrame(memory, step.frame, packetTimestampUs(input, packet.timestamp)).close();
+      makeVideoFrame(
+        memory,
+        step.frame,
+        packetTimestampUs(input, packet.timestamp),
+      ).close();
       stats.videoFrameMs += performance.now() - vfBefore;
       stats.frames += 1;
     }
@@ -217,7 +248,12 @@ function makeVideoFrame(
     format: "I420",
     codedWidth: native.decodedWidth,
     codedHeight: native.decodedHeight,
-    visibleRect: { x: 0, y: 0, width: native.renderWidth, height: native.renderHeight },
+    visibleRect: {
+      x: 0,
+      y: 0,
+      width: native.renderWidth,
+      height: native.renderHeight,
+    },
     layout: [
       { offset: native.y.offset, stride: native.y.stride },
       { offset: native.u.offset, stride: native.u.stride },
@@ -282,7 +318,11 @@ async function webCodecsLane(
     }
     await decoder.flush();
 
-    post({ type: "log", message: `${lane}: timing ${chunks.length} packets`, error: false });
+    post({
+      type: "log",
+      message: `${lane}: timing ${chunks.length} packets`,
+      error: false,
+    });
     frames = 0;
     const before = performance.now();
     for (const chunk of chunks) {

@@ -67,7 +67,11 @@ export class Vp9Decoder {
   private result: Uint32Array;
   private bytes: Uint8Array;
 
-  constructor(instance: WebAssembly.Instance, maxWidth: number, maxHeight: number) {
+  constructor(
+    instance: WebAssembly.Instance,
+    maxWidth: number,
+    maxHeight: number,
+  ) {
     this.exports = asVip9rExports(instance.exports);
     this.resultPtr = this.exports.vip9r_result_ptr();
     this.bytes = new Uint8Array(this.exports.memory.buffer);
@@ -81,17 +85,25 @@ export class Vp9Decoder {
   }
 
   beginPacket(packet: Uint8Array): void {
-    checkStatus("vip9r_reserve_input", this.exports.vip9r_reserve_input(packet.byteLength));
+    checkStatus(
+      "vip9r_reserve_input",
+      this.exports.vip9r_reserve_input(packet.byteLength),
+    );
     this.refreshViews();
 
     const inputPtr = this.result[ResultField.InputPtr];
     const inputCapacity = this.result[ResultField.InputCapacity];
     if (packet.byteLength > inputCapacity) {
-      throw new Error(`reserved input too small: ${inputCapacity} < ${packet.byteLength}`);
+      throw new Error(
+        `reserved input too small: ${inputCapacity} < ${packet.byteLength}`,
+      );
     }
     this.bytes.set(packet, inputPtr);
 
-    checkStatus("vip9r_begin_packet", this.exports.vip9r_begin_packet(packet.byteLength));
+    checkStatus(
+      "vip9r_begin_packet",
+      this.exports.vip9r_begin_packet(packet.byteLength),
+    );
   }
 
   decodeNext(): DecodeStep {
@@ -119,7 +131,11 @@ export class Vp9Decoder {
   }
 
   planeBytes(plane: Plane): Uint8Array {
-    return new Uint8Array(this.exports.memory.buffer, plane.offset, plane.byteLength);
+    return new Uint8Array(
+      this.exports.memory.buffer,
+      plane.offset,
+      plane.byteLength,
+    );
   }
 
   memoryByteLength(): number {
@@ -135,7 +151,11 @@ export class Vp9Decoder {
     );
   }
 
-  private plane(ptr: ResultField, len: ResultField, stride: ResultField): Plane {
+  private plane(
+    ptr: ResultField,
+    len: ResultField,
+    stride: ResultField,
+  ): Plane {
     return {
       offset: this.result[ptr],
       byteLength: this.result[len],

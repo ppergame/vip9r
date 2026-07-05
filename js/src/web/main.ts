@@ -260,8 +260,12 @@ function initControls(): void {
   );
   tabs.play.addEventListener("click", () => switchMode("play"));
   tabs.bench.addEventListener("click", () => switchMode("bench"));
-  el<HTMLButtonElement>("play-start").addEventListener("click", () => startPlay());
-  el<HTMLButtonElement>("bench-start").addEventListener("click", () => startBenchRun());
+  el<HTMLButtonElement>("play-start").addEventListener("click", () =>
+    startPlay(),
+  );
+  el<HTMLButtonElement>("bench-start").addEventListener("click", () =>
+    startBenchRun(),
+  );
   copyLink.addEventListener("click", () => {
     void navigator.clipboard
       .writeText(location.href)

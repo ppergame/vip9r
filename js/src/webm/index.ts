@@ -79,14 +79,20 @@ export function parseWebm(data: Uint8Array): WebmFile {
   return { ...demuxer.header!, packets };
 }
 
-export function readEbmlVint(data: Uint8Array, offset: number, kind: VintKind = "size"): EbmlVint {
+export function readEbmlVint(
+  data: Uint8Array,
+  offset: number,
+  kind: VintKind = "size",
+): EbmlVint {
   if (offset >= data.byteLength) {
     throw new Error(`EBML VINT at offset ${offset} is truncated`);
   }
 
   const first = data[offset];
   if (first === 0) {
-    throw new Error(`invalid EBML VINT at offset ${offset}: first byte is zero`);
+    throw new Error(
+      `invalid EBML VINT at offset ${offset}: first byte is zero`,
+    );
   }
 
   let marker = 0x80;
@@ -188,12 +194,17 @@ export class WebmDemuxer {
   private advance(out: WebmPacket[], final: boolean): void {
     while (true) {
       if (this.skipRemaining > 0) {
-        const take = Math.min(this.data.byteLength - this.cursor, this.skipRemaining);
+        const take = Math.min(
+          this.data.byteLength - this.cursor,
+          this.skipRemaining,
+        );
         this.cursor += take;
         this.skipRemaining -= take;
         if (this.skipRemaining > 0) {
           if (final) {
-            throw new Error(`element ${hexId(this.skipId)} size exceeds parent`);
+            throw new Error(
+              `element ${hexId(this.skipId)} size exceeds parent`,
+            );
           }
           return;
         }
@@ -209,7 +220,10 @@ export class WebmDemuxer {
       if (idVint === undefined) {
         return;
       }
-      if (this.inSegment && this.streamOffset + idVint.nextOffset > this.segmentEnd) {
+      if (
+        this.inSegment &&
+        this.streamOffset + idVint.nextOffset > this.segmentEnd
+      ) {
         throw new Error(`element ID at offset ${this.cursor} exceeds parent`);
       }
       const sizeVint = this.tryVint(idVint.nextOffset, "size", final);
@@ -217,7 +231,10 @@ export class WebmDemuxer {
         return;
       }
       const id = toSafeNumber(idVint.value, "EBML ID");
-      if (this.inSegment && this.streamOffset + sizeVint.nextOffset > this.segmentEnd) {
+      if (
+        this.inSegment &&
+        this.streamOffset + sizeVint.nextOffset > this.segmentEnd
+      ) {
         throw new Error(`element ${hexId(id)} size exceeds parent`);
       }
 
@@ -241,7 +258,10 @@ export class WebmDemuxer {
       }
 
       const contentSize = toSafeNumber(sizeVint.value, "element size");
-      if (this.inSegment && this.streamOffset + contentStart + contentSize > this.segmentEnd) {
+      if (
+        this.inSegment &&
+        this.streamOffset + contentStart + contentSize > this.segmentEnd
+      ) {
         throw new Error(`element ${hexId(id)} size exceeds parent`);
       }
 
@@ -285,7 +305,11 @@ export class WebmDemuxer {
 
   // Reads a VINT at `offset`, or returns undefined when the window is too
   // short to contain it. In final mode short reads throw instead.
-  private tryVint(offset: number, kind: VintKind, final: boolean): EbmlVint | undefined {
+  private tryVint(
+    offset: number,
+    kind: VintKind,
+    final: boolean,
+  ): EbmlVint | undefined {
     if (!final) {
       if (offset >= this.data.byteLength) {
         return undefined;
@@ -319,10 +343,14 @@ export class WebmDemuxer {
       throw new Error("VP9 track is missing Video/PixelHeight");
     }
     if (track.pixelWidth <= 0 || track.pixelHeight <= 0) {
-      throw new Error(`WebM dimensions must be non-zero: ${track.pixelWidth}x${track.pixelHeight}`);
+      throw new Error(
+        `WebM dimensions must be non-zero: ${track.pixelWidth}x${track.pixelHeight}`,
+      );
     }
     if (this.timestampScale <= 0) {
-      throw new Error(`WebM TimestampScale must be non-zero: ${this.timestampScale}`);
+      throw new Error(
+        `WebM TimestampScale must be non-zero: ${this.timestampScale}`,
+      );
     }
     this.headerValue = {
       codecId: "V_VP9",
@@ -341,7 +369,11 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.DocType: {
-          const docType = readAscii(this.data, element.contentStart, element.contentEnd);
+          const docType = readAscii(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+          );
           if (docType !== "webm") {
             throw new Error(`unsupported EBML DocType: ${docType}`);
           }
@@ -360,7 +392,12 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.TimestampScale:
-          this.timestampScale = readUint(this.data, element.contentStart, element.contentEnd, "TimestampScale");
+          this.timestampScale = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "TimestampScale",
+          );
           break;
         default:
           break;
@@ -375,7 +412,9 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.TrackEntry:
-          this.tracks.push(this.parseTrackEntry(element.contentStart, element.contentEnd));
+          this.tracks.push(
+            this.parseTrackEntry(element.contentStart, element.contentEnd),
+          );
           break;
         default:
           break;
@@ -391,19 +430,43 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.TrackNumber:
-          track.trackNumber = readUint(this.data, element.contentStart, element.contentEnd, "TrackNumber");
+          track.trackNumber = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "TrackNumber",
+          );
           break;
         case ID.TrackType:
-          track.trackType = readUint(this.data, element.contentStart, element.contentEnd, "TrackType");
+          track.trackType = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "TrackType",
+          );
           break;
         case ID.CodecID:
-          track.codecId = readAscii(this.data, element.contentStart, element.contentEnd);
+          track.codecId = readAscii(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+          );
           break;
         case ID.FlagLacing:
-          track.flagLacing = readUint(this.data, element.contentStart, element.contentEnd, "FlagLacing");
+          track.flagLacing = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "FlagLacing",
+          );
           break;
         case ID.DefaultDuration:
-          track.defaultDuration = readUint(this.data, element.contentStart, element.contentEnd, "DefaultDuration");
+          track.defaultDuration = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "DefaultDuration",
+          );
           break;
         case ID.Video:
           this.parseVideo(element.contentStart, element.contentEnd, track);
@@ -422,10 +485,20 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.PixelWidth:
-          track.pixelWidth = readUint(this.data, element.contentStart, element.contentEnd, "PixelWidth");
+          track.pixelWidth = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "PixelWidth",
+          );
           break;
         case ID.PixelHeight:
-          track.pixelHeight = readUint(this.data, element.contentStart, element.contentEnd, "PixelHeight");
+          track.pixelHeight = readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "PixelHeight",
+          );
           break;
         default:
           break;
@@ -444,7 +517,12 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       if (element.id === ID.Timestamp) {
         clusterTimestamp = BigInt(
-          readUint(this.data, element.contentStart, element.contentEnd, "Cluster Timestamp"),
+          readUint(
+            this.data,
+            element.contentStart,
+            element.contentEnd,
+            "Cluster Timestamp",
+          ),
         );
       }
       offset = element.contentEnd;
@@ -455,10 +533,22 @@ export class WebmDemuxer {
       const element = this.readElement(offset, end);
       switch (element.id) {
         case ID.SimpleBlock:
-          this.parseBlock(element.contentStart, element.contentEnd, clusterTimestamp, trackNumber, out);
+          this.parseBlock(
+            element.contentStart,
+            element.contentEnd,
+            clusterTimestamp,
+            trackNumber,
+            out,
+          );
           break;
         case ID.BlockGroup:
-          this.parseBlockGroup(element.contentStart, element.contentEnd, clusterTimestamp, trackNumber, out);
+          this.parseBlockGroup(
+            element.contentStart,
+            element.contentEnd,
+            clusterTimestamp,
+            trackNumber,
+            out,
+          );
           break;
         default:
           break;
@@ -493,9 +583,16 @@ export class WebmDemuxer {
     }
 
     for (const block of blocks) {
-      this.parseBlock(block.contentStart, block.contentEnd, clusterTimestamp, selectedTrackNumber, out, {
-        keyframe: !hasReferenceBlock,
-      });
+      this.parseBlock(
+        block.contentStart,
+        block.contentEnd,
+        clusterTimestamp,
+        selectedTrackNumber,
+        out,
+        {
+          keyframe: !hasReferenceBlock,
+        },
+      );
     }
   }
 
@@ -512,7 +609,10 @@ export class WebmDemuxer {
       throw new Error(`block at offset ${start} header is truncated`);
     }
 
-    const trackNumber = toSafeNumber(trackNumberVint.value, "block TrackNumber");
+    const trackNumber = toSafeNumber(
+      trackNumberVint.value,
+      "block TrackNumber",
+    );
     const relativeTimestamp = readI16(this.data, trackNumberVint.nextOffset);
     const flagsOffset = trackNumberVint.nextOffset + 2;
     const flags = this.data[flagsOffset];
@@ -522,7 +622,9 @@ export class WebmDemuxer {
       return;
     }
     if ((flags & 0x06) !== 0) {
-      throw new Error(`laced VP9 block on track ${selectedTrackNumber} is not supported`);
+      throw new Error(
+        `laced VP9 block on track ${selectedTrackNumber} is not supported`,
+      );
     }
 
     out.push({
@@ -537,7 +639,9 @@ export class WebmDemuxer {
   }
 
   private requireSelectedTrack(): WebmTrack {
-    const selected = this.tracks.filter((track) => track.trackType === 1 && track.codecId === "V_VP9");
+    const selected = this.tracks.filter(
+      (track) => track.trackType === 1 && track.codecId === "V_VP9",
+    );
     if (selected.length === 0) {
       throw new Error("WebM has no VP9 video track");
     }
@@ -552,7 +656,11 @@ export class WebmDemuxer {
   }
 }
 
-function readElementHeader(data: Uint8Array, offset: number, parentEnd: number): ElementHeader {
+function readElementHeader(
+  data: Uint8Array,
+  offset: number,
+  parentEnd: number,
+): ElementHeader {
   const id = readEbmlVint(data, offset, "id");
   if (id.nextOffset > parentEnd) {
     throw new Error(`element ID at offset ${offset} exceeds parent`);
@@ -560,7 +668,9 @@ function readElementHeader(data: Uint8Array, offset: number, parentEnd: number):
 
   const size = readEbmlVint(data, id.nextOffset);
   if (size.nextOffset > parentEnd) {
-    throw new Error(`element ${hexId(toSafeNumber(id.value, "EBML ID"))} size exceeds parent`);
+    throw new Error(
+      `element ${hexId(toSafeNumber(id.value, "EBML ID"))} size exceeds parent`,
+    );
   }
 
   const numericId = toSafeNumber(id.value, "EBML ID");
@@ -568,7 +678,10 @@ function readElementHeader(data: Uint8Array, offset: number, parentEnd: number):
     throw new Error(`element ${hexId(numericId)} has unsupported unknown size`);
   }
   const contentStart = size.nextOffset;
-  const contentEnd = checkedAdd(contentStart, toSafeNumber(size.value, "element size"));
+  const contentEnd = checkedAdd(
+    contentStart,
+    toSafeNumber(size.value, "element size"),
+  );
   if (contentEnd > parentEnd) {
     throw new Error(`element ${hexId(numericId)} size exceeds parent`);
   }
@@ -580,7 +693,12 @@ function readElementHeader(data: Uint8Array, offset: number, parentEnd: number):
   };
 }
 
-function readUint(data: Uint8Array, start: number, end: number, name: string): number {
+function readUint(
+  data: Uint8Array,
+  start: number,
+  end: number,
+  name: string,
+): number {
   const length = end - start;
   if (length > 8) {
     throw new Error(`${name} integer is too wide: ${length} bytes`);

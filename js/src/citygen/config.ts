@@ -77,7 +77,9 @@ export type EncodeSettings = {
   keyframeIntervalS: number;
 };
 
-export function defaultValues(specs: readonly ParamSpec[]): Map<string, number> {
+export function defaultValues(
+  specs: readonly ParamSpec[],
+): Map<string, number> {
   return new Map(specs.map((spec) => [spec.key, spec.def]));
 }
 
@@ -140,7 +142,10 @@ export function formatValue(spec: ParamSpec, value: number): string {
   return value.toFixed(decimals);
 }
 
-export function citygenFileName(params: SceneParams, durationS: number): string {
+export function citygenFileName(
+  params: SceneParams,
+  durationS: number,
+): string {
   return `citygen-${WIDTH}x${HEIGHT}p${FPS}-${durationS}s-seed${params.seed}.webm`;
 }
 

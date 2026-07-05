@@ -85,7 +85,11 @@
     try {
       post({ type: "log", message: "ogv: warmup", error: false });
       await decodePass(decoder, init.packets.slice(0, init.warmupPackets));
-      post({ type: "log", message: `ogv: timing ${init.packets.length} packets`, error: false });
+      post({
+        type: "log",
+        message: `ogv: timing ${init.packets.length} packets`,
+        error: false,
+      });
       const before = performance.now();
       const frames = await decodePass(decoder, init.packets);
       const wallMs = performance.now() - before;
@@ -98,7 +102,10 @@
   // Keep one packet in flight ahead of the awaited one so the ogv decode
   // pthread never idles while this thread builds VideoFrames — the
   // decode-ahead ogv.js's own player gets.
-  async function decodePass(decoder: OgvDecoder, packets: OgvPacket[]): Promise<number> {
+  async function decodePass(
+    decoder: OgvDecoder,
+    packets: OgvPacket[],
+  ): Promise<number> {
     let frames = 0;
     let pending: Promise<OgvDecodeResult> | null = null;
     for (const packet of packets) {

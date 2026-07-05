@@ -82,7 +82,11 @@ export class Sparkline {
       ctx.font = `${10 * dpr}px system-ui, sans-serif`;
       ctx.textAlign = "right";
       ctx.textBaseline = "bottom";
-      ctx.fillText(`budget ${this.budgetMs.toFixed(1)} ms`, width - 4 * dpr, budgetY - 2 * dpr);
+      ctx.fillText(
+        `budget ${this.budgetMs.toFixed(1)} ms`,
+        width - 4 * dpr,
+        budgetY - 2 * dpr,
+      );
     }
 
     if (this.samples.length >= 2) {

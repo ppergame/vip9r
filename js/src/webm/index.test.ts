@@ -30,13 +30,17 @@ describe("webm", () => {
       unknownSize: false,
     });
     expect(readEbmlVint(new Uint8Array([0x40, 0x7f]), 0).value).toBe(127n);
-    expect(readEbmlVint(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]), 0, "id").value).toBe(0x1a45dfa3n);
+    expect(
+      readEbmlVint(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3]), 0, "id").value,
+    ).toBe(0x1a45dfa3n);
     expect(readEbmlVint(new Uint8Array([0xff]), 0).unknownSize).toBe(true);
 
     expect(() => readEbmlVint(new Uint8Array([0]), 0)).toThrow(
       "invalid EBML VINT at offset 0: first byte is zero",
     );
-    expect(() => readEbmlVint(new Uint8Array([0x40]), 0)).toThrow("EBML VINT at offset 0 is truncated");
+    expect(() => readEbmlVint(new Uint8Array([0x40]), 0)).toThrow(
+      "EBML VINT at offset 0 is truncated",
+    );
   });
 
   test("parses a VP9 WebM, skips audio and Cues, and preserves packet payload subarrays", () => {
@@ -80,7 +84,9 @@ describe("webm", () => {
         clusters: [
           cluster(0, [
             simpleBlock(1, 0, 0x88, [1]),
-            blockGroup(concat(block(1, 1, 0x08, [2]), intElement(ID.ReferenceBlock, -1))),
+            blockGroup(
+              concat(block(1, 1, 0x08, [2]), intElement(ID.ReferenceBlock, -1)),
+            ),
           ]),
         ],
       }),
@@ -107,7 +113,10 @@ describe("webm", () => {
       }),
     );
 
-    expect(webm.packets.map((packet) => packet.timestamp)).toEqual([102n, 195n]);
+    expect(webm.packets.map((packet) => packet.timestamp)).toEqual([
+      102n,
+      195n,
+    ]);
   });
 
   test("accepts a complete Segment prefix with a declared size beyond EOF", () => {
@@ -128,7 +137,10 @@ describe("webm", () => {
       unknownSizeElement(
         ID.Segment,
         segmentContentBytes({
-          clusters: [cluster(0, [simpleBlock(1, 0, 0x80, [1])]), cluster(33, [simpleBlock(1, 0, 0, [2])])],
+          clusters: [
+            cluster(0, [simpleBlock(1, 0, 0x80, [1])]),
+            cluster(33, [simpleBlock(1, 0, 0, [2])]),
+          ],
         }),
       ),
     );
@@ -138,24 +150,33 @@ describe("webm", () => {
   });
 
   test("rejects malformed and truncated WebM input", () => {
-    expect(() => parseWebm(new Uint8Array([0x1a, 0x45, 0xdf]))).toThrow("EBML VINT at offset 0 is truncated");
+    expect(() => parseWebm(new Uint8Array([0x1a, 0x45, 0xdf]))).toThrow(
+      "EBML VINT at offset 0 is truncated",
+    );
 
     const bytes = webmFile();
-    expect(() => parseWebm(bytes.subarray(0, bytes.byteLength - 1))).toThrow(/size exceeds parent|truncated/);
+    expect(() => parseWebm(bytes.subarray(0, bytes.byteLength - 1))).toThrow(
+      /size exceeds parent|truncated/,
+    );
 
     expect(() =>
-      parseWebm(elementWithSize(ID.EBML, 10_000, stringElement(ID.DocType, "webm"))),
+      parseWebm(
+        elementWithSize(ID.EBML, 10_000, stringElement(ID.DocType, "webm")),
+      ),
     ).toThrow("element 0x1a45dfa3 size exceeds parent");
   });
 
   test("rejects missing and duplicate VP9 video tracks", () => {
-    expect(() => parseWebm(webmFile({ tracks: [audioTrack(1)], clusters: [] }))).toThrow(
-      "WebM has no VP9 video track",
-    );
+    expect(() =>
+      parseWebm(webmFile({ tracks: [audioTrack(1)], clusters: [] })),
+    ).toThrow("WebM has no VP9 video track");
     expect(() =>
       parseWebm(
         webmFile({
-          tracks: [vp9Track(1, { width: 320, height: 240 }), vp9Track(2, { width: 320, height: 240 })],
+          tracks: [
+            vp9Track(1, { width: 320, height: 240 }),
+            vp9Track(2, { width: 320, height: 240 }),
+          ],
           clusters: [],
         }),
       ),
@@ -180,15 +201,20 @@ describe("webm", () => {
   });
 
   test("rejects laced selected-video blocks", () => {
-    expect(() => parseWebm(webmFile({ clusters: [cluster(0, [simpleBlock(1, 0, 0x02, [0, 1])])] }))).toThrow(
-      "laced VP9 block on track 1 is not supported",
-    );
+    expect(() =>
+      parseWebm(
+        webmFile({ clusters: [cluster(0, [simpleBlock(1, 0, 0x02, [0, 1])])] }),
+      ),
+    ).toThrow("laced VP9 block on track 1 is not supported");
   });
 });
 
 describe("webm streaming", () => {
   const clusters = [
-    cluster(10, [simpleBlock(1, 0, 0x80, [1, 2, 3]), blockGroup(block(1, 5, 0, [4, 5]))]),
+    cluster(10, [
+      simpleBlock(1, 0, 0x80, [1, 2, 3]),
+      blockGroup(block(1, 5, 0, [4, 5])),
+    ]),
     cluster(20, [simpleBlock(1, 1, 0, [6])]),
   ];
 
@@ -200,7 +226,9 @@ describe("webm streaming", () => {
       const demuxer = new WebmDemuxer();
       const packets: WebmPacket[] = [];
       for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
-        packets.push(...demuxer.push(bytes.subarray(offset, offset + chunkSize)));
+        packets.push(
+          ...demuxer.push(bytes.subarray(offset, offset + chunkSize)),
+        );
       }
       demuxer.finish();
 
@@ -242,8 +270,14 @@ describe("webm streaming", () => {
     expect(demuxer.push(bytes.subarray(0, firstClusterEnd - 1))).toEqual([]);
     expect(demuxer.header).toBeUndefined();
 
-    const packets = demuxer.push(bytes.subarray(firstClusterEnd - 1, firstClusterEnd));
-    expect(demuxer.header).toMatchObject({ codecId: "V_VP9", width: 320, height: 240 });
+    const packets = demuxer.push(
+      bytes.subarray(firstClusterEnd - 1, firstClusterEnd),
+    );
+    expect(demuxer.header).toMatchObject({
+      codecId: "V_VP9",
+      width: 320,
+      height: 240,
+    });
     expect(packets).toHaveLength(2);
   });
 

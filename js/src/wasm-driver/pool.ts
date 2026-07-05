@@ -3,17 +3,25 @@
 // (layout and protocol in docs/design.md, Threads). d8-only: uses d8's
 // string-source Worker; the web frontend ships its own worker file.
 
-import { COORDINATOR_STACK_TOP, MIN_HEAP_BASE, WORKER_STACK_TOPS } from "./stack-layout";
+import {
+  COORDINATOR_STACK_TOP,
+  MIN_HEAP_BASE,
+  WORKER_STACK_TOPS,
+} from "./stack-layout";
 
 type D8Worker = {
   postMessage(value: unknown): void;
   terminate(): void;
 };
-type D8WorkerConstructor = new (source: string, options: { type: "string" }) => D8Worker;
+type D8WorkerConstructor = new (
+  source: string,
+  options: { type: "string" },
+) => D8Worker;
 
 // Reached through globalThis because lib.webworker declares a Worker with a
 // different constructor shape.
-const D8WorkerCtor = (globalThis as Record<string, unknown>).Worker as D8WorkerConstructor;
+const D8WorkerCtor = (globalThis as Record<string, unknown>)
+  .Worker as D8WorkerConstructor;
 
 // Runs in a fresh d8 isolate: self-contained, no module imports, so the
 // stack-layout ABI constants are interpolated in. The two asserts are pure

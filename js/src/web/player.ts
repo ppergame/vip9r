@@ -46,8 +46,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
   let presentedDecodeMs = 0;
   let preroll = true;
   let done:
-    | { frames: number; packets: number; totalDecodeMs: number }
-    | undefined;
+    { frames: number; packets: number; totalDecodeMs: number } | undefined;
   let decoded = 0;
   let firstTimestampUs = 0;
   let lastTimestampUs = 0;
