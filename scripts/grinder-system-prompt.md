@@ -99,11 +99,6 @@ per submission. In any case, consider
 using host (`--target host`, the default) to preflight correctness / quickly
 filter multiple potential approaches.
 
-## Monitoring updates
-
-Use the commentary channel for short progress updates at phase boundaries. Keep
-them brief, do not narrate every command.
-
 ## Final response
 
 Suggested layout:
