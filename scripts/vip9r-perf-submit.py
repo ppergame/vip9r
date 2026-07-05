@@ -17,6 +17,7 @@ MAX_CANDIDATE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 U32_MAX = 2**32 - 1
 TARGETS = ("host", "device")
+CORPUS_ROOT = PurePosixPath("/bulk/vip9r")
 DEFAULT_VALIDATION_MEDIA = PurePosixPath("chromium/bear-vp9.ivf")
 
 
@@ -49,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--media",
         type=parse_media_path,
         default=DEFAULT_VALIDATION_MEDIA,
-        help="corpus-relative media path",
+        help="corpus-relative media path or /bulk/vip9r/... absolute path",
     )
     validate.add_argument(
         "--allow-mismatch",
@@ -68,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--media",
         required=True,
         type=parse_media_path,
-        help="corpus-relative media path",
+        help="corpus-relative media path or /bulk/vip9r/... absolute path",
     )
     bench.add_argument(
         "--frames",
@@ -114,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--media",
         required=True,
         type=parse_media_path,
-        help="corpus-relative media path",
+        help="corpus-relative media path or /bulk/vip9r/... absolute path",
     )
     profile.add_argument(
         "--frames",
@@ -499,8 +500,21 @@ def parse_frame_range(value: str) -> tuple[int, int]:
 
 def parse_media_path(value: str) -> PurePosixPath:
     path = PurePosixPath(value)
-    if path.is_absolute() or path == PurePosixPath(".") or ".." in path.parts:
-        raise argparse.ArgumentTypeError("must be a corpus-relative path without '..'")
+    if ".." in path.parts:
+        raise argparse.ArgumentTypeError(
+            f"must be corpus-relative or under {CORPUS_ROOT}, without '..'"
+        )
+    if path.is_absolute():
+        try:
+            path = path.relative_to(CORPUS_ROOT)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"absolute media paths must be under {CORPUS_ROOT}"
+            ) from error
+    if path == PurePosixPath(".") or path.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"must be corpus-relative or under {CORPUS_ROOT}, without '..'"
+        )
     return path
 
 
