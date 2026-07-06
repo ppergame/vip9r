@@ -76,6 +76,15 @@ export type DriverArgs = {
   progressFrames?: number;
   frames?: DecodeWindow;
   bench?: BenchmarkOptions;
+  timed?: TimedOptions;
+};
+
+// Timed mode measures one wall-clock decode of the first `packets` demuxed
+// packets (all of them when absent). The unit is packets, not output frames,
+// to match the web bench page: both sides feed the identical packet list and
+// divide by frames actually output.
+export type TimedOptions = {
+  packets?: number;
 };
 
 export type FrameComparison = {
@@ -209,6 +218,30 @@ export type BenchmarkReport = {
   measurement: BenchmarkTimedPasses;
 };
 
+export type TimedReport = {
+  mode: "timed";
+  ok: true;
+  input: string;
+  golden: string;
+  container: "ivf" | "webm";
+  codec: "VP90" | "V_VP9";
+  width: number;
+  height: number;
+  pool: boolean;
+  packets: number;
+  validation: {
+    elapsedMs: number;
+    matchedFrames: number;
+    codedFrames: number;
+    decodedOutputFrames: number;
+  };
+  wallMs: number;
+  codedFrames: number;
+  decodedOutputFrames: number;
+  msPerFrame: number;
+  fps: number;
+};
+
 export class DriverUsageError extends Error {
   constructor(message: string) {
     super(message);
@@ -222,6 +255,8 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   let progressFrames: number | undefined;
   let frames: DecodeWindow | undefined;
   let bench = false;
+  let timed = false;
+  let packets: number | undefined;
   const benchmarkOptions = { ...DEFAULT_BENCHMARK_OPTIONS };
   const paths: string[] = [];
 
@@ -233,6 +268,19 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     }
     if (arg === "--bench") {
       bench = true;
+      continue;
+    }
+    if (arg === "--timed") {
+      timed = true;
+      continue;
+    }
+    if (arg === "--packets") {
+      const value = args[index + 1];
+      if (value === undefined) {
+        throw new Error("--packets requires a count");
+      }
+      index += 1;
+      packets = parsePositiveInteger(value, "--packets");
       continue;
     }
     if (arg === "--pool") {
@@ -264,6 +312,21 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   if (paths.length < 1 || paths.length > 2) {
     throw new DriverUsageError("invalid path count");
   }
+  if (bench && timed) {
+    throw new Error("--bench cannot be used with --timed");
+  }
+  if (!timed && packets !== undefined) {
+    throw new Error("--packets requires --timed");
+  }
+  if (timed && allowMismatch) {
+    throw new Error("--allow-mismatch cannot be used with --timed");
+  }
+  if (timed && progressFrames !== undefined) {
+    throw new Error("--progress-frames cannot be used with --timed");
+  }
+  if (timed && frames !== undefined) {
+    throw new Error("--frames cannot be used with --timed; use --packets");
+  }
   if (bench && allowMismatch) {
     throw new Error("--allow-mismatch cannot be used with --bench");
   }
@@ -281,7 +344,7 @@ export function parseDriverArgs(args: string[]): DriverArgs {
   const [wasmPath, explicitInputPath] = paths;
   const inputPath =
     explicitInputPath ??
-    (bench ? DEFAULT_BENCHMARK_INPUT : DEFAULT_GOLDEN_INPUT);
+    (bench || timed ? DEFAULT_BENCHMARK_INPUT : DEFAULT_GOLDEN_INPUT);
   const goldenPath = `${inputPath}.md5`;
   return {
     allowMismatch,
@@ -292,6 +355,7 @@ export function parseDriverArgs(args: string[]): DriverArgs {
     progressFrames,
     frames: bench ? undefined : frames,
     bench: bench ? benchmarkOptions : undefined,
+    timed: timed ? { packets } : undefined,
   };
 }
 
@@ -423,6 +487,96 @@ export function benchmarkWasmGolden(
     },
     warmup,
     measurement,
+  };
+}
+
+export function timedWasmGolden(args: DriverArgs, io: GoldenIo): TimedReport {
+  if (args.timed === undefined) {
+    throw new Error("timed options missing");
+  }
+
+  const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
+  const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
+  const requested = args.timed.packets;
+  if (requested !== undefined && requested > input.packets.length) {
+    throw new Error(
+      `--packets ${requested} exceeds packet count ${input.packets.length}`,
+    );
+  }
+  const timedInput =
+    requested === undefined
+      ? input
+      : { ...input, packets: input.packets.slice(0, requested) };
+  // Every comparable output frame lands in the window; golden covers the whole
+  // clip, so a truncated packet list just stops short of filling it.
+  const window = { outputOffset: 0, outputFrames: golden.length };
+
+  let livePool: WorkerPool | undefined;
+  const makeDecoder = () => {
+    livePool?.terminate();
+    const made = instantiateVp9Decoder(
+      wasm,
+      decoderDimensions,
+      io.log,
+      args.pool,
+    );
+    livePool = made.pool;
+    return made.decoder;
+  };
+  const now = io.now ?? monotonicNow;
+
+  // The validation pass doubles as warmup and keeps all md5 work out of the
+  // timed pass.
+  const validationStart = now();
+  const validationDecoder = makeDecoder();
+  let matchedFrames = 0;
+  const validationStats = decodeVp9Window(
+    timedInput,
+    golden,
+    validationDecoder,
+    window,
+    (frame, context) => {
+      const actual = md5Hex(compactI420(validationDecoder, frame));
+      const expected = golden[context.selectedIndex];
+      if (actual !== expected.md5) {
+        throw new Error(
+          `timed validation mismatch at output frame ${context.selectedIndex + 1}: expected ${expected.md5} (${expected.name}), got ${actual}`,
+        );
+      }
+      matchedFrames += 1;
+    },
+  );
+  if (validationStats.selectedOutputFrames === 0) {
+    throw new Error("timed validation decoded no output frames");
+  }
+  const validationMs = now() - validationStart;
+
+  const timedDecoder = makeDecoder();
+  const before = now();
+  const stats = decodeVp9Window(timedInput, golden, timedDecoder, window);
+  const wallMs = now() - before;
+
+  return {
+    mode: "timed",
+    ok: true,
+    input: args.inputPath,
+    golden: args.goldenPath,
+    container: input.container,
+    codec: input.codec,
+    width: input.width,
+    height: input.height,
+    pool: args.pool,
+    packets: timedInput.packets.length,
+    validation: {
+      elapsedMs: validationMs,
+      matchedFrames,
+      codedFrames: validationStats.codedFrames,
+      decodedOutputFrames: validationStats.decodedOutputFrames,
+    },
+    wallMs,
+    codedFrames: stats.codedFrames,
+    decodedOutputFrames: stats.decodedOutputFrames,
+    ...frameRate(stats.decodedOutputFrames, wallMs),
   };
 }
 

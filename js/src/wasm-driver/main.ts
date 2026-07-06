@@ -10,6 +10,7 @@ import {
   mismatchCount,
   parseDriverArgs,
   passes,
+  timedWasmGolden,
 } from "./golden";
 import type {
   ComparisonReport,
@@ -69,16 +70,20 @@ function main(args: string[]): void {
 
   const driverArgs = parseDriverArgs(args);
 
-  if (driverArgs.bench !== undefined) {
+  if (driverArgs.bench !== undefined || driverArgs.timed !== undefined) {
     const wasmLogs: string[] = [];
-    const report = benchmarkWasmGolden(driverArgs, {
+    const io = {
       read,
       readbuffer,
-      log(log) {
+      log(log: WasmLog) {
         wasmLogs.push(formatWasmLog(log));
       },
       now: nowMs,
-    });
+    };
+    const report =
+      driverArgs.bench !== undefined
+        ? benchmarkWasmGolden(driverArgs, io)
+        : timedWasmGolden(driverArgs, io);
     print(
       JSON.stringify(wasmLogs.length === 0 ? report : { ...report, wasmLogs }),
     );
@@ -163,6 +168,9 @@ function printUsage(out: (...values: unknown[]) => void = print): void {
   out(
     "       wasm-golden --bench [--pool] [--frames START:LAST] [input.ivf|input.webm]",
   );
+  out(
+    "       wasm-golden --timed [--pool] [--packets N] [input.ivf|input.webm]",
+  );
 }
 
 function printStderr(...values: unknown[]): void {
@@ -190,8 +198,11 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-function modeFromArgs(args: string[]): "bench" | "golden" {
-  return args.includes("--bench") ? "bench" : "golden";
+function modeFromArgs(args: string[]): "bench" | "timed" | "golden" {
+  if (args.includes("--bench")) {
+    return "bench";
+  }
+  return args.includes("--timed") ? "timed" : "golden";
 }
 
 try {

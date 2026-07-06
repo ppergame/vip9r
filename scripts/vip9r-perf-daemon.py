@@ -535,6 +535,14 @@ def handle_host_job(job: Job) -> dict[str, object]:
         except ValueError as error:
             return {"ok": False, "kind": "validate", "target": "host", "error": str(error)}
         return handle_host_validate_request(job.candidate_path, MEDIA_ROOT / media, validation, pool)
+    if kind == "timed":
+        try:
+            media = media_from_request(request)
+            packets = packets_from_request(request)
+            pool = pool_from_request(request)
+        except ValueError as error:
+            return {"ok": False, "kind": "timed", "target": "host", "error": str(error)}
+        return handle_host_timed_request(job.candidate_path, MEDIA_ROOT / media, packets, pool)
     if kind in ("tests", "microbench", "asm"):
         try:
             reject_pool(request)
@@ -603,6 +611,12 @@ def handle_device_job(lane: DeviceLane, job: Job) -> dict[str, object]:
             )
         if kind == "asm":
             raise ValueError("asm runs on the daemon host")
+        if kind == "timed":
+            media = media_from_request(request)
+            packets = packets_from_request(request)
+            pin_name = pin_from_request(request, required=True)
+            pool = pool_from_request(request)
+            return handle_device_timed_request(lane, job, media, packets, pin_name, pool)
         if kind != "bench":
             raise ValueError(f"unsupported request kind: {kind!r}")
         media = media_from_request(request)
@@ -727,6 +741,25 @@ def handle_host_validate_request(
     }
 
 
+def handle_host_timed_request(
+    candidate_path: Path,
+    media_path: Path,
+    packets: int | None,
+    pool: bool,
+) -> dict[str, object]:
+    candidate_result = run_host_timed(candidate_path, media_path, packets, pool)
+    return {
+        "ok": candidate_result.get("ok") is True,
+        "kind": "timed",
+        "target": "host",
+        "host": {
+            "media": str(media_path),
+            "pool": pool,
+            "candidate": candidate_result,
+        },
+    }
+
+
 def handle_host_microbench_request(
     request: dict[str, object],
     candidate_path: Path,
@@ -782,6 +815,15 @@ def frame_range_from_request(request: dict[str, object]) -> tuple[int, int] | No
     if not isinstance(last, int) or isinstance(last, bool) or last < offset:
         raise ValueError("frames.last must be an integer greater than or equal to offset")
     return offset, last
+
+
+def packets_from_request(request: dict[str, object]) -> int | None:
+    packets = request.get("packets")
+    if packets is None:
+        return None
+    if not isinstance(packets, int) or isinstance(packets, bool) or packets <= 0:
+        raise ValueError("packets must be a positive integer")
+    return packets
 
 
 def microbench_from_request(request: dict[str, object]) -> dict[str, int]:
@@ -845,7 +887,7 @@ def pool_from_request(request: dict[str, object]) -> bool:
 
 def reject_pool(request: dict[str, object]) -> None:
     if "pool" in request:
-        raise ValueError("pool applies to validate, bench, and profile requests")
+        raise ValueError("pool applies to validate, bench, timed, and profile requests")
 
 
 def pin_from_request(request: dict[str, object], *, required: bool) -> str:
@@ -922,6 +964,51 @@ def handle_device_bench_request(
             "no_op_control": job.baseline_sha256 == job.candidate_sha256,
             "bench": bench_summary(runs),
             "runs": runs,
+        },
+    }
+
+
+def handle_device_timed_request(
+    lane: DeviceLane,
+    job: Job,
+    media: PurePosixPath,
+    packets: int | None,
+    pin_name: str,
+    pool: bool,
+) -> dict[str, object]:
+    device, session = lane.device, lane.session
+    base = device_response_base(lane, "timed")
+    try:
+        pin = resolve_and_verify_pin(device, pin_name)
+        media_path = str(device.root / "media" / media)
+        verify_remote_files(device, [media_path, f"{media_path}.md5"])
+        run_dir = create_device_run_dir(device, session, "timed")
+        result_path = str(PurePosixPath(run_dir) / "result.json")
+        candidate_wasm = push_wasm_blob(lane, job.candidate_path, job.candidate_sha256)
+        candidate_result = run_device_timed(
+            device,
+            device_session_path(session, GOLDEN_RUNNER_PATH),
+            candidate_wasm,
+            media_path,
+            packets,
+            pin,
+            pool,
+            result_path,
+        )
+    except (DeviceError, ValueError) as error:
+        return {**base, "ok": False, "error": str(error)}
+
+    return {
+        **base,
+        "ok": candidate_result.get("ok") is True,
+        "device_run": {
+            "pin": pin_summary(pin),
+            "pool": pool,
+            "session_dir": session.path,
+            "run_dir": run_dir,
+            "media": media_path,
+            "result": result_path,
+            "candidate": candidate_result,
         },
     }
 
@@ -1414,6 +1501,33 @@ def run_device_bench(
         d8_args.extend(["--frames", f"{start}:{last}"])
     d8_args.append(media_path)
     return run_device_json(device, d8_args, pin, "benchmark", result_path)
+
+
+def run_device_timed(
+    device: DeviceContext,
+    runner_path: str,
+    wasm_path: str,
+    media_path: str,
+    packets: int | None,
+    pin: PinSelection,
+    pool: bool,
+    result_path: str,
+) -> dict[str, object]:
+    d8_args = [
+        "./d8",
+        "--no-liftoff",
+        "--module",
+        runner_path,
+        "--",
+        wasm_path,
+        "--timed",
+    ]
+    if pool:
+        d8_args.append("--pool")
+    if packets is not None:
+        d8_args.extend(["--packets", str(packets)])
+    d8_args.append(media_path)
+    return run_device_json(device, d8_args, pin, "timed decode", result_path)
 
 
 def run_device_validation(
@@ -2395,6 +2509,39 @@ def run_host_bench(
     except subprocess.TimeoutExpired as error:
         return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
     return json_stdout_result(completed, "benchmark")
+
+
+def run_host_timed(
+    wasm_path: Path,
+    media_path: Path,
+    packets: int | None,
+    pool: bool,
+) -> dict[str, object]:
+    cmd = [
+        host_d8_path(),
+        "--no-liftoff",
+        "--module",
+        str(GOLDEN_RUNNER_PATH),
+        "--",
+        str(wasm_path),
+        "--timed",
+    ]
+    if pool:
+        cmd.append("--pool")
+    if packets is not None:
+        cmd.extend(["--packets", str(packets)])
+    cmd.append(str(media_path))
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=HOST_D8_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        return timeout_result("host d8", HOST_D8_TIMEOUT_SECONDS, error)
+    return json_stdout_result(completed, "timed decode")
 
 
 def run_host_validation(

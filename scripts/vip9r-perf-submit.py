@@ -89,6 +89,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="A/B the candidate against itself to measure harness noise",
     )
 
+    timed = subparsers.add_parser(
+        "timed", help="single timed decode of the first N packets"
+    )
+    timed.add_argument(
+        "--media",
+        required=True,
+        type=parse_media_path,
+        help="corpus-relative media path or /bulk/vip9r/... absolute path",
+    )
+    timed.add_argument(
+        "--packets",
+        type=parse_positive_int,
+        help="decode only the first N demuxed packets (default: all)",
+    )
+    add_pool_argument(timed)
+
     tests = subparsers.add_parser("tests", help="run wasm unit tests")
     tests.add_argument(
         "test_filter",
@@ -165,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "profile" and args.target != "device":
         parser.error("profile requires --target device")
 
-    if args.command in ("validate", "bench", "profile"):
+    if args.command in ("validate", "bench", "timed", "profile"):
         try:
             pool = args.pool if args.pool is not None else pool_env_default()
         except RuntimeError as error:
@@ -186,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         pin = args.pin if args.pin is not None else env_pin
         if pin is not None:
             request["pin"] = pin
-        elif args.command in ("bench", "microbench", "profile"):
+        elif args.command in ("bench", "timed", "microbench", "profile"):
             parser.error(
                 f"{args.command} on device requires --pin (or VIP9R_PERF_DEVICE=INDEX:PIN)"
             )
@@ -219,6 +235,14 @@ def main(argv: list[str] | None = None) -> int:
             request["allow_mismatch"] = True
         if args.frames is not None:
             request["frames"] = {"offset": args.frames[0], "last": args.frames[1]}
+        if pool:
+            request["pool"] = True
+        tests = False
+    elif args.command == "timed":
+        request["kind"] = "timed"
+        request["media"] = str(args.media)
+        if args.packets is not None:
+            request["packets"] = args.packets
         if pool:
             request["pool"] = True
         tests = False
@@ -521,6 +545,12 @@ def parse_media_path(value: str) -> PurePosixPath:
 def parse_non_negative_int(value: str) -> int:
     if not re.fullmatch(r"0|[1-9]\d*", value):
         raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return int(value)
+
+
+def parse_positive_int(value: str) -> int:
+    if not re.fullmatch(r"[1-9]\d*", value):
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return int(value)
 
 

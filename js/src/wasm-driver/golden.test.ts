@@ -262,6 +262,72 @@ describe("wasm golden runner helpers", () => {
     ).toThrow("--progress-frames cannot be used with --bench");
   });
 
+  test("parses timed driver arguments", () => {
+    expect(
+      parseDriverArgs(["--timed", "vip9r.wasm", "input.webm"]),
+    ).toMatchObject({
+      wasmPath: "vip9r.wasm",
+      inputPath: "input.webm",
+      goldenPath: "input.webm.md5",
+      bench: undefined,
+      timed: { packets: undefined },
+    });
+    expect(
+      parseDriverArgs([
+        "--timed",
+        "--packets",
+        "500",
+        "--pool",
+        "vip9r.wasm",
+        "input.webm",
+      ]),
+    ).toMatchObject({
+      pool: true,
+      timed: { packets: 500 },
+    });
+    expect(parseDriverArgs(["--timed", "vip9r.wasm"])).toMatchObject({
+      inputPath: "/bulk/vip9r/chromium/bear-vp9.ivf",
+      timed: { packets: undefined },
+    });
+  });
+
+  test("rejects timed option conflicts", () => {
+    expect(() =>
+      parseDriverArgs(["--packets", "500", "vip9r.wasm", "input.webm"]),
+    ).toThrow("--packets requires --timed");
+    expect(() =>
+      parseDriverArgs(["--timed", "--bench", "vip9r.wasm", "input.webm"]),
+    ).toThrow("--bench cannot be used with --timed");
+    expect(() =>
+      parseDriverArgs([
+        "--timed",
+        "--frames",
+        "0:499",
+        "vip9r.wasm",
+        "input.webm",
+      ]),
+    ).toThrow("--frames cannot be used with --timed; use --packets");
+    expect(() =>
+      parseDriverArgs([
+        "--timed",
+        "--allow-mismatch",
+        "vip9r.wasm",
+        "input.webm",
+      ]),
+    ).toThrow("--allow-mismatch cannot be used with --timed");
+    expect(() =>
+      parseDriverArgs([
+        "--timed",
+        "--progress-frames=1",
+        "vip9r.wasm",
+        "input.webm",
+      ]),
+    ).toThrow("--progress-frames cannot be used with --timed");
+    expect(() =>
+      parseDriverArgs(["--timed", "--packets", "0", "vip9r.wasm"]),
+    ).toThrow("--packets must be a positive integer");
+  });
+
   test("rejects invalid validation frame selections", () => {
     expect(() =>
       parseDriverArgs(["--frames", "2:1", "vip9r.wasm", "input.ivf"]),

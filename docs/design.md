@@ -301,12 +301,12 @@ runs on different devices proceed in parallel while access to any one device
 stays serialized. `serve` sorts device serials, so indices are stable for a
 given set of connected devices. Submissions address a device by index (`--device N`, or
 `VIP9R_PERF_DEVICE` inside grinder sandboxes) and state the CPU pin per
-request; timed kinds (bench, microbench, profile) require an explicit pin,
-validate/tests default to `any`. Pins take sets — `cpu:N`, `cpu:0-3`,
-`cpu:0,2,4-5`, or `mask:HEX` — verified against the taskset's actual
+request; wall-clock kinds (bench, timed, microbench, profile) require an
+explicit pin, validate/tests default to `any`. Pins take sets — `cpu:N`,
+`cpu:0-3`, `cpu:0,2,4-5`, or `mask:HEX` — verified against the taskset's actual
 `Cpus_allowed_list`; freq telemetry reads the first pinned CPU (both target
-clusters share one cpufreq policy). Validate, bench, and profile requests
-take a `pool` boolean (`--pool`/`--no-pool` on `vip9r-perf-submit`, defaulted
+clusters share one cpufreq policy). Validate, bench, timed, and profile
+requests take a `pool` boolean (`--pool`/`--no-pool` on `vip9r-perf-submit`, defaulted
 from `VIP9R_PERF_POOL` set by `grinder run --pool`; `--pool` on
 `vip9r-corpus-golden.py` and on the wasm-golden runner itself), which
 spawns the 3-worker pool and calls `vip9r_pool_activate` per decoder
@@ -318,7 +318,14 @@ wasm — `--baseline FILE`, else `VIP9R_PERF_BASELINE` (always set inside grinde
 sandboxes; `grinder run` requires `--baseline`) — or say `--no-op-control` to A/B the
 candidate against itself for a harness-noise reading. There are no quiet
 fallbacks: a device request without an index or a bench without a stated
-baseline is an error. The daemon holds no baseline state, so merges do not
+baseline is an error. The timed kind (`vip9r-perf-submit timed --media M
+[--packets N]`, `wasm-golden --timed [--packets N]`) is the README
+data-collection mode: one untimed md5-validated pass over the first N demuxed
+packets (doubling as warmup), then one wall-clock pass over the same packets
+with no deadline, no baseline, and no A/B interleave. The unit is packets, not
+output frames, so numbers are apples-to-apples with the demo page's bench tab,
+which feeds the identical packet list to every lane; both report ms/frame as
+wall time over frames actually output. The daemon holds no baseline state, so merges do not
 force a restart; wasm pushes are cached per device by blob hash for the
 daemon's lifetime. Grinder sandboxes bind the
 socket's parent directory, so a daemon restart while a grinder runs only
