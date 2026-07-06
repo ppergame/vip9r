@@ -502,7 +502,7 @@ milestones, and measured optimization results.
 ## 2026-07-02 — simd128 campaign wrap: both-device margins
 
 Whole-campaign position-corrected A/B, final tree vs the pre-simd scalar
-baseline (49bac22), X4 = Pixel 9a cpu7, A55 = TV streamer cpu0:
+baseline, X4 = Pixel 9a cpu7, A55 = TV streamer cpu0:
 
 | device | clip                  | before → after ms/frame | delta  | budget    | margin      |
 |--------|-----------------------|-------------------------|--------|-----------|-------------|
@@ -665,18 +665,19 @@ X4 confirmation secondary; changes stay portable-V8-principled).
   orchestrator repro proved those ops correct on device; a lane-uniform
   bisect of the full kernel then produced the fingerprint: output lanes
   4..7 corrupted to 128+{16,32,64,128} — the powers-of-two lane
-  constant that **V8's arm32 `i16x8_bitmask` lowering materializes,
-  leaking into the aliased high D-half of a live Q register under
-  register pressure**. Same wasm is correct on x64. Replacing the
-  early-out with `v128_any_true` (no lane constant, and semantically
-  what the check wants) fixes the kernel at full width; the noted
-  constraint lives next to the code.
+  constant from **V8's arm32 `i16x8_bitmask` lowering landing in a live
+  register**. Same wasm is correct on x64. Replacing the early-out with
+  `v128_any_true` (no lane constant, and semantically what the check
+  wants) fixes the kernel at full width; the noted constraint lives
+  next to the code. (The mechanism recorded here at the time —
+  TurboFan register pressure — was wrong; the 2026-07-06 entry has the
+  actual root cause, a Liftoff emitter bug.)
 - Merged the corrected 8-lane kernel: A55 jellyfish −2.1% (grinder
   measurement of the equivalent kernel) with −1.5%/−0.6% confirm runs
   at ~0.7-1.0% spreads, BBB neutral. Compliance 307/307, 93/93 tests
   host+device, validates incl. tile-4x1 and 66x66. Portable-simd
   lesson for the campaign: prefer `v128_any_true`/`v128_all_true` over
-  `*_bitmask` for emptiness checks in register-heavy arm32 kernels.
+  `*_bitmask` for emptiness checks on arm32.
 
 ## 2026-07-03 — A55 campaign: persistent intra edges
 
@@ -857,7 +858,7 @@ X4 confirmation secondary; changes stay portable-V8-principled).
 ## 2026-07-03 — A55 campaign wrap: both-device margins
 
 Whole-campaign position-corrected A/B, final tree vs the campaign-start
-baseline (3e27aa5, post-simd128 master), X4 = Pixel 9a cpu7, A55 = TV
+baseline (post-simd128 master), X4 = Pixel 9a cpu7, A55 = TV
 streamer cpu0:
 
 | device | clip                  | before → after ms/frame | delta  | budget    | margin      |
@@ -881,8 +882,8 @@ streamer cpu0:
   (bitrate-bounded), P6 (already absorbed by P1).
 - V8-portability posture held: every kernel is plain wasm simd128
   shaped by measured V8 arm32 lowering (extmul MACs, vzip-friendly
-  interleaves, no bitmask in register-heavy kernels — documented
-  arm32 codegen bug — no per-engine branches), so the tweaks carry to
+  interleaves, no bitmask on still-live inputs — documented arm32
+  Liftoff bug — no per-engine branches), so the tweaks carry to
   future V8 including the browser.
 - A55 residue: jellyfish 144 ms/f is 4.3x over 720p30 single-core;
   remaining profile mass is the serial-entropy decode_block monolith
@@ -895,11 +896,11 @@ streamer cpu0:
 - Post-campaign question: how much A55 decode time goes to V8's
   explicit wasm bounds checks? arm32 cannot use the 4GB guard-region
   trick, so every heap access carries a compare-and-branch — the asm
-  dump of the 40-line standalone `read_bool` alone shows ~8 of them
-  (1d32b952-arm32). d8 ships "performance testing only" switches:
+  dump of the 40-line standalone `read_bool` alone shows ~8 of them.
+  d8 ships "performance testing only" switches:
   `--no-wasm-bounds-checks`, `--no-wasm-stack-checks`.
 - Manual counterbalanced B/C/C/B runs replicating the daemon's pinned
-  bench invocation (streamer cpu0, tree 1d32b952, frames 0:5,
+  bench invocation (streamer cpu0, frames 0:5,
   measurement msPerFrame, spreads ≤1%):
 
 | flags dropped   | clip      | ms/frame      | delta  |
@@ -1213,7 +1214,7 @@ streamer cpu0:
   pixels, so errors aggregate after join (lowest SB raster index, matching
   serial reporting) instead of deadlocking the front.
 - A55 streamer (`cpu:0-3`, 0:5 windows, corrected deltas vs tile-parallel
-  baseline f8d54a7): jellyfish −28.3% (≈64.7 → 46.4 ms/frame, spread 3.1%),
+  baseline): jellyfish −28.3% (≈64.7 → 46.4 ms/frame, spread 3.1%),
   BBB −14.3% confirm run (47.6 → 40.8 warm, spread 1.8%; first read −11.2%
   at 4.5% was heat-drifty), f247 flag=0 lane −21.4% (63.2 → 49.7, spread
   2.3%). Deltas are Amdahl-consistent with the post-tile-parallel loop
@@ -1283,7 +1284,8 @@ streamer cpu0:
   row's row-above is always complete, decode never waits, and both decode
   and filter error paths force-publish their watermarks before returning.
   The standalone wavefront (single-tile clips) adopts the same row claiming.
-- A55 streamer (`cpu:0-3`, 0:9 windows, corrected deltas vs daca1ed):
+- A55 streamer (`cpu:0-3`, 0:9 windows, corrected deltas vs the wavefront
+  baseline):
   jellyfish −15.1% at 0.1% spread (grinder read; orchestrator confirms
   −10.8..−12.2% on heat-drifty 4% spreads, candidate ≈37.2 ms/frame), BBB
   −7.4% at 0.2% spread (33.9 → 31.4 ms/frame), f247 flag=0 lane −11.6% at
@@ -1337,3 +1339,28 @@ streamer cpu0:
   covering the clip — the single full-clip run exceeds the 180 s device
   budget on throughput (2000 frames ≈ the whole budget at validate cost),
   the same known limitation as the host-side serial f247 timeout.
+
+## 2026-07-06 — V8 arm32 bitmask miscompile root-caused: Liftoff, not TurboFan
+
+- Revisited the 2026-07-03 loop-filter miscompile to build an upstreamable
+  repro; the mechanism recorded then was wrong twice over. The bug lives in
+  the baseline tier: arm32 Liftoff's `emit_i16x8_bitmask` always runs its
+  destructive vshr/vand/vpadd chain in the *source* register, and its
+  `is_used(src)` guard fetches a spare register but assigns it to the mask
+  constant instead of the work register — so any bitmask whose input is
+  still live destroys that value. No register pressure involved. TurboFan's
+  lowering is correct, which is why the `--no-liftoff` asm dumps looked
+  clean: the device sweep test that caught it runs default tiering
+  (Liftoff), the perf/asm harness pins TurboFan.
+- Six lines of wat reproduce it: bitmask an all-ones v128 held in a live
+  local, then read the local back. x64 both tiers and arm32 TurboFan return
+  bitmask 0xff and an intact vector; arm32 Liftoff (15.1.159 pin, and the
+  code is unchanged on V8 main) leaves the local's high half holding the
+  emitter's 0x0080004000200010 lane constant — the 2026-07-03 fingerprint —
+  and a second bitmask on it returns 0. `i8x16`/`i32x4` bitmask share the
+  identical misassignment; the one-line fix is pointing the work register,
+  not the mask, at the spare. Repro, annotated report, and cited V8 sources:
+  `temp/v8-bitmask-repro/`.
+- Decoder unaffected: the `v128_any_true` workaround is correct on every
+  tier and is semantically what an emptiness check wants; it stays. Kernel
+  comment and tracker updated to name the real mechanism.

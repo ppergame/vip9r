@@ -317,9 +317,11 @@ residual/copy passes, jellyfish for subpel.
       BBB): pass-1 (horizontal edges) Tx4x4 narrow filter in 8 u8 lanes,
       transpose-free; pass 0 and wide filters stay scalar. Grinder's 8-lane
       kernel failed device-only; orchestrator bisect found a real V8 arm32
-      codegen bug — i16x8_bitmask lowering leaks its powers-of-two lane constant
-      into the aliased high D-half of a live Q register under pressure (lanes
-      4..7 corrupted). Fixed by v128_any_true for the early-out. A55 jellyfish
+      codegen bug — the Liftoff bitmask emitter destroys a still-live source
+      register, leaving its lane constant in the high half (lanes 4..7
+      corrupted; root-caused 2026-07-06, see log.md — not the TurboFan
+      register-pressure story recorded first). Fixed by v128_any_true for the
+      early-out. A55 jellyfish
       −2.1% (grinder, equivalent kernel) / −1.5%, −0.6% confirm runs; BBB
       neutral. Precheck-only variants measured positive (slower), dropped
 - [x] P5 (resolved by direct PMU measurement, no microbench needed): A55

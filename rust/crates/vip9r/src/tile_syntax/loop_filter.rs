@@ -1066,10 +1066,11 @@ pub(super) fn loop_filter_tx4x4_horizontal_8(
     );
 
     let filter = v128_not(masked);
-    // v128_any_true, not i16x8_bitmask: V8's arm32 bitmask lowering
-    // materializes a powers-of-two lane constant that can clobber the aliased
-    // high D-half of a live Q register under pressure, miscompiling this
-    // kernel (lanes 4..7 corrupted). See docs/log.md 2026-07-03.
+    // v128_any_true, not i16x8_bitmask: V8's arm32 Liftoff bitmask emitter
+    // runs its destructive lowering in the source register whenever the input
+    // is still live (its spare-register guard assigns the wrong variable), so
+    // a bitmask whose input is read again corrupts that value on the baseline
+    // tier. TurboFan is fine. See docs/log.md 2026-07-06.
     if !v128_any_true(filter) {
         return true;
     }
