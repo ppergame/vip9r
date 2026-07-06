@@ -869,7 +869,7 @@ fn parse_tile_frame_parallel(
     let loop_filter_done = header.loop_filter.level == 0 || can_fuse_filter;
 
     let decode_watermarks = [const { AtomicU32::new(0) }; MAX_TILE_COLS];
-    let filter_watermarks = [const { AtomicU32::new(0) }; MAX_WAVEFRONT_SB_ROWS];
+    let filter_watermarks = [const { pool::Watermark::new(0) }; MAX_WAVEFRONT_SB_ROWS];
     let filter_row_claim = AtomicU32::new(0);
     let mut sb_col_band_start = [0u8; MAX_WAVEFRONT_SB_COLS];
     let mut sb_col_band_end = [0u8; MAX_WAVEFRONT_SB_COLS];

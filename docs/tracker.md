@@ -601,10 +601,14 @@ availability/MV search, no cross-tile pixel reads).
       jellyfish −15.1% (best clean read, ≈37.2 ms/f), BBB −7.4% (33.9 →
       31.4), f247 −11.6% (≈36.4). Corpus 339/339 pooled, compliance 307/307
       both modes, wasm tests 100/100
-- [ ] watermark notify hygiene (wanted-mark): notify only when a published
-      value crosses a waiter's registered target; kernel/futex share is the
-      metric (4-6% per thread in the 2026-07-05 profiles), timing win is a
-      bonus
+- [x] watermark notify hygiene (wanted-mark) (2026-07-05): filter row
+      watermarks notify only when a store crosses the waiter's registered
+      target; decode band gates stay always-notify (multi-waiter — a shared
+      wanted word coalesces targets and oversleeps early rows, measured
+      +4.1%). A55 timing neutral-to-favorable (jellyfish −3.1%, BBB −1.1%,
+      f247 −3.4% on 4-6% heat spreads, best samples all favor candidate);
+      kernel+libc share at the fused baseline's best sample. Suite green
+      both modes; repeated pooled validates for lost-wakeup shakeout
 - [ ] later, if the coordinator tail still shows in post-fusion profiles:
       parse next frame's headers in the join tail (flag=1 content only;
       needs speculative header/probability state and JS-side input

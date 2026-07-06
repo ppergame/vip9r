@@ -135,10 +135,111 @@ pub(crate) fn join(timeout_ns: i64) -> bool {
     }
 }
 
-/// Block until `watermark` reaches at least `target`. Loop-filter wavefront
-/// progress values are monotone within a wave, so a stale Acquire load only
-/// causes an extra wait iteration; the wait itself is race-free because
-/// wait32 rechecks the expected value atomically.
+/// Monotone progress word with a wanted-mark, for wavefront dependencies
+/// with a *single concurrent waiter* — the filter row watermarks, where only
+/// the claimant of row r+1 ever waits on row r. `value` is the published
+/// progress; `wanted` is the waiter's advertised target, so the producer
+/// notifies exactly when a store crosses it instead of on every superblock.
+/// Both reset by constructing a fresh `Watermark` per frame/wave.
+///
+/// Multi-waiter watermarks (the per-band decode row counters, waited on by
+/// several gated filter rows at once) must NOT use this type: a single
+/// wanted word coalesces concurrent targets to their max, so an early-row
+/// waiter would oversleep until the band reached the farthest requested row
+/// — measured as a phase-dependent multi-percent regression. They stay on
+/// the plain always-notify helpers below, which is cheap at their once-per-
+/// SB-row publish cadence.
+pub(crate) struct Watermark {
+    value: AtomicU32,
+    wanted: AtomicU32,
+}
+
+impl Watermark {
+    pub(crate) const fn new(value: u32) -> Self {
+        Self {
+            value: AtomicU32::new(value),
+            wanted: AtomicU32::new(0),
+        }
+    }
+
+    /// Block until the watermark reaches at least `target`.
+    ///
+    /// Lost-wakeup avoidance relies on the wasm memory model: wasm atomic
+    /// memory operations, including wait's atomic compare, are sequentially
+    /// consistent. The Rust operations request `SeqCst` explicitly so the
+    /// source-level proof matches the wasm codegen.
+    ///
+    /// The waiter publishes its target with `fetch_max`, then reloads the
+    /// progress word before it can sleep. If the producer stored a
+    /// satisfying value and checked `wanted` before the `fetch_max`, the
+    /// reload is ordered after that store and observes the new progress. If
+    /// the reload still sees old progress, the `fetch_max` is ordered before
+    /// the producer's later `wanted` load, so the store that crosses the
+    /// target will notify. If the store races between the reload and
+    /// `memory_atomic_wait32`, wait32's atomic compare sees the changed
+    /// value and returns without parking. The bad interleaving "load old,
+    /// producer stores and sees no wanted, then publish wanted and sleep
+    /// forever" is excluded because the wanted mark is published before any
+    /// load whose value can feed wait32.
+    ///
+    /// The satisfied fast path returns on a plain load without touching
+    /// `wanted`: in wavefront steady state most checks are already met, and
+    /// skipping the read-modify-write avoids bouncing the watermark's cache
+    /// line between producer and waiter. Its load never feeds wait32, so the
+    /// publish-before-sleep ordering above is untouched.
+    pub(crate) fn wait_at_least(&self, target: u32) {
+        if self.value.load(Ordering::SeqCst) >= target {
+            return;
+        }
+        self.wanted.fetch_max(target, Ordering::SeqCst);
+        loop {
+            let current = self.value.load(Ordering::SeqCst);
+            if current >= target {
+                return;
+            }
+            unsafe {
+                core::arch::wasm32::memory_atomic_wait32(
+                    self.value.as_ptr().cast(),
+                    current as i32,
+                    -1,
+                );
+            }
+        }
+    }
+
+    /// Publish a new value and wake the waiter only when this store crosses
+    /// its advertised target (`old < wanted <= new` — the crossing test, so
+    /// a stale wanted mark left by a waiter that never slept does not turn
+    /// every later store into a futex wake). The `SeqCst` store carries the
+    /// filtered pixels published before it to the waiter's `SeqCst` load.
+    pub(crate) fn store(&self, value: u32) {
+        let old = self.value.load(Ordering::SeqCst);
+        debug_assert!(old <= value, "watermarks must be monotone within a wave");
+        self.value.store(value, Ordering::SeqCst);
+        let wanted = self.wanted.load(Ordering::SeqCst);
+        if old < wanted && value >= wanted {
+            unsafe {
+                core::arch::wasm32::memory_atomic_notify(self.value.as_ptr().cast(), u32::MAX);
+            }
+        }
+    }
+
+    /// Publish the row's terminal value and wake unconditionally. Row-end
+    /// and abandon paths use this: every valid target is at most this value,
+    /// so after the notify the waiter observes completion.
+    pub(crate) fn store_final(&self, value: u32) {
+        self.value.store(value, Ordering::SeqCst);
+        unsafe {
+            core::arch::wasm32::memory_atomic_notify(self.value.as_ptr().cast(), u32::MAX);
+        }
+    }
+}
+
+/// Block until `watermark` reaches at least `target`. Progress values are
+/// monotone within a wave, so a stale load only causes an extra wait
+/// iteration; the wait itself is race-free because wait32 rechecks the
+/// expected value atomically. For multi-waiter watermarks (decode band
+/// gates), paired with the always-notify `watermark_store`.
 pub(crate) fn watermark_wait_at_least(watermark: &AtomicU32, target: u32) {
     loop {
         let current = watermark.load(Ordering::Acquire);
@@ -152,8 +253,8 @@ pub(crate) fn watermark_wait_at_least(watermark: &AtomicU32, target: u32) {
 }
 
 /// Publish a new watermark value and wake every waiter. The Release store
-/// carries the pixels filtered before it; waiters pair with the Acquire load
-/// in `watermark_wait_at_least`.
+/// carries the decoded rows published before it; waiters pair with the
+/// Acquire load in `watermark_wait_at_least`.
 pub(crate) fn watermark_store(watermark: &AtomicU32, value: u32) {
     watermark.store(value, Ordering::Release);
     unsafe {

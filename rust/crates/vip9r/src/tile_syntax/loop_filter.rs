@@ -185,11 +185,11 @@ fn loop_filter_superblock_all(
 pub(super) const MAX_WAVEFRONT_SB_ROWS: usize = 1024;
 pub(super) const MAX_WAVEFRONT_SB_COLS: usize = 1024;
 
-/// Everything a wavefront participant needs. Lives on the coordinator's
-/// stack from before dispatch until after join; jobs carry a pointer to it.
-/// `watermarks[r]` counts fully filtered superblocks of row r; participants
-/// publish with Release stores and wait with Acquire loads, which also
-/// carries the filtered pixels of the row above.
+/// Decode-progress gates for the fused wave: `watermarks[band]` counts the
+/// band's completed global superblock rows. Multiple filter rows gate on the
+/// same band word, so these stay plain always-notify watermarks — a shared
+/// wanted mark would coalesce concurrent targets to their max and oversleep
+/// the earlier rows. They store once per SB row, so notify cost is negligible.
 #[derive(Clone, Copy)]
 pub(super) struct LoopFilterDecodeGates<'a> {
     pub(super) watermarks: &'a [AtomicU32],
@@ -197,6 +197,11 @@ pub(super) struct LoopFilterDecodeGates<'a> {
     pub(super) sb_col_band_end: &'a [u8],
 }
 
+/// Everything a wavefront participant needs. Lives on the coordinator's
+/// stack from before dispatch until after join; jobs carry a pointer to it.
+/// `watermarks[r]` counts fully filtered superblocks of row r; each carries a
+/// wanted mark (exactly one waiter: the claimant of row r+1) so the per-SB
+/// producer only notifies when a store reaches the advertised target.
 #[derive(Clone, Copy)]
 pub(super) struct LoopFilterWave<'a> {
     pub(super) config: LoopFilterConfig<'a>,
@@ -204,7 +209,7 @@ pub(super) struct LoopFilterWave<'a> {
     pub(super) current_frame: CurrentFrameRaw,
     pub(super) sb_rows: usize,
     pub(super) sb_cols: usize,
-    pub(super) watermarks: &'a [AtomicU32],
+    pub(super) watermarks: &'a [pool::Watermark],
     pub(super) row_claim: &'a AtomicU32,
     pub(super) decode_gates: Option<LoopFilterDecodeGates<'a>>,
 }
@@ -249,7 +254,7 @@ fn loop_filter_frame_wavefront(
     sb_rows: usize,
     sb_cols: usize,
 ) -> Result<(), TileSyntaxError> {
-    let watermarks = [const { AtomicU32::new(0) }; MAX_WAVEFRONT_SB_ROWS];
+    let watermarks = [const { pool::Watermark::new(0) }; MAX_WAVEFRONT_SB_ROWS];
     let row_claim = AtomicU32::new(0);
     let wave = LoopFilterWave {
         config,
@@ -305,7 +310,7 @@ pub(super) fn loop_filter_band(
     // accesses stay inside the current superblock window (checked per
     // segment) and simultaneously active windows are disjoint under the
     // watermark lag; cross-thread visibility rides the watermark
-    // Release/Acquire edges and the pool dispatch/join edges.
+    // SeqCst publish/wait edges and the pool dispatch/join edges.
     let mut current_frame = unsafe { CurrentFrameMut::from_raw_windowed(wave.current_frame) };
 
     let mut failure: LoopFilterBandResult = Ok(());
@@ -333,7 +338,7 @@ pub(super) fn loop_filter_band(
         // participants waiting on it would never wake. Dependents of an
         // abandoned row filter against unfiltered pixels; the error still
         // fails the frame after join, so the output is never used.
-        pool::watermark_store(&wave.watermarks[sb_row], wave.sb_cols as u32);
+        wave.watermarks[sb_row].store_final(wave.sb_cols as u32);
     }
     failure
 }
@@ -378,16 +383,17 @@ fn loop_filter_wavefront_superblock(
                 .ok_or(TileSyntaxError::InvalidBitstream)?,
             wave.sb_cols,
         );
-        pool::watermark_wait_at_least(
-            &wave.watermarks[sb_row - 1],
-            u32::try_from(target).map_err(|_| TileSyntaxError::InvalidBitstream)?,
-        );
+        wave.watermarks[sb_row - 1]
+            .wait_at_least(u32::try_from(target).map_err(|_| TileSyntaxError::InvalidBitstream)?);
     }
     let row = sb_row * MI_BLOCK_64;
     let col = sb_col * MI_BLOCK_64;
     current_frame.set_superblock_window(row, col)?;
     loop_filter_superblock_all(current_frame, wave.config, wave.strengths, row, col)?;
-    pool::watermark_store(&wave.watermarks[sb_row], sb_col as u32 + 1);
+    let completed = sb_col as u32 + 1;
+    if completed < wave.sb_cols as u32 {
+        wave.watermarks[sb_row].store(completed);
+    }
     Ok(())
 }
 

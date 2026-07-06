@@ -555,10 +555,18 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     static p, p+4 stride so the last-finishing decode band doesn't own
     blocked rows). Deadlock-free by claim order: the lowest unfinished
     row's row-above is complete, and decode never waits. Per-row
-    `AtomicU32` watermarks (stack array, 1024 rows = the 2^16 dimension
-    cap; larger stays serial) count completed SBs. Producers Release-store
-    + notify per SB; consumers Acquire-load and `memory.atomic.wait32` —
-    the Acquire also publishes the row-above pixels. Containment mirrors
+    `pool::Watermark`s (stack array, 1024 rows = the 2^16 dimension cap;
+    larger stays serial) count completed SBs, each paired with a wanted
+    mark (2026-07-05): the single waiter — the claimant of the row below —
+    `fetch_max`es its target before any load that can feed
+    `memory.atomic.wait32`, and the producer notifies only on a store
+    crossing it (row-end stores always notify). SeqCst per the wasm
+    memory model; the store also publishes the row-above pixels. The
+    multi-waiter decode band gates stay plain always-notify `AtomicU32` —
+    a shared wanted word coalesces concurrent targets to their max and
+    oversleeps earlier rows (measured, phase-dependent multi-percent);
+    their once-per-SB-row cadence never carried the notify cost anyway.
+    Containment mirrors
     the tile bands: each participant's aliased full-plane view carries a
     per-SB window (SB extent + 8px margin, `set_superblock_window`), and
     `loop_filter_segment` checks each segment's maximal touch rectangle

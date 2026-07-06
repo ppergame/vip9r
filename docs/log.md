@@ -1297,3 +1297,43 @@ streamer cpu0:
 - Suite: wasm tests 100/100, compliance corpus 307/307 pooled and serial,
   full corpus 339/339 pooled, libvpx odd-size/resize/aq2/skip/segkey
   vectors green in both pool modes.
+
+## 2026-07-05 — M6 threads: watermark notify hygiene (wanted-mark)
+
+- The filter row watermarks were notifying on every superblock — up to
+  sb_cols futex wakes per row, most with nobody sleeping — behind the
+  4-6% per-thread kernel share in the fused-wave profiles. Each watermark
+  now pairs the progress word with a wanted mark (`pool::Watermark`): the
+  waiter `fetch_max`es its target before any load that can feed
+  `memory.atomic.wait32`, the producer notifies only when a store crosses
+  the advertised target (`old < wanted <= new`), and row-end/abandon
+  stores always notify. Everything SeqCst — wasm atomics are all seq-cst,
+  so the source-level proof matches codegen; the lost-wakeup argument is
+  written on `Watermark::wait_at_least`.
+- Scope lesson (measured, not theoretical): the grinder's version also
+  put wanted marks on the decode band gates, and jellyfish went bimodal —
+  +4.1% at 0.4% spread in the bad phase. Several filter rows gate on one
+  band word concurrently, and a single wanted word coalesces their
+  targets to the max, so early rows oversleep until the band reaches the
+  farthest requested row. Wanted marks are only correct with one
+  concurrent waiter per word — true for filter rows (only the claimant of
+  row r+1 waits on row r), false for band gates. Bands keep plain
+  always-notify `AtomicU32` stores; at once-per-SB-row cadence they were
+  never the notify cost.
+- A55 streamer (`cpu:0-3`, 0:9 windows, corrected deltas vs the fused
+  wave): heat-drifty session (spreads 4-6%, one +15% interference outlier
+  discarded); jellyfish −3.1% (best sample 36.86 vs 37.33 ms/f), BBB
+  −1.1% (31.52 vs 31.72), f247 −3.4% (34.52 vs 35.02) — candidate's best
+  sample beat baseline's on all three clips, and no run reproduced the
+  pre-fix regression. Kernel+libc profile share 8.46% vs
+  8.47/9.08/11.73% in the fused-wave baseline profiles: at the baseline's
+  best sample, down against the mean but within sample noise. Gate was
+  "no regression, kernel share down" — passed on timing, modest on the
+  profile axis.
+- Suite: wasm tests 100/100, compliance 307/307 pooled and serial, full
+  corpus 339/339 pooled, host pooled validates repeated ×4 on jellyfish
+  (lost wakeups are intermittent; one green run proves little). Pooled
+  device validates: jellyfish full clip, f247 in two 1000-frame windows
+  covering the clip — the single full-clip run exceeds the 180 s device
+  budget on throughput (2000 frames ≈ the whole budget at validate cost),
+  the same known limitation as the host-side serial f247 timeout.
