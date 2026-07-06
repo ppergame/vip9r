@@ -433,10 +433,12 @@ pub extern "C" fn vip9r_pool_activate() {
 }
 
 // Exact static requirement in wasm pages (shadow stacks + data + workspace
-// arena) for a session with the given max dimensions; the growable packet
-// tail sits above it, so a memory maximum must add packet capacity on top.
-// Pure — callable on a throwaway instance so JS can size the real memory
-// before instantiation. Negative error code if the dimensions are rejected.
+// arena) for a session with the given max dimensions; the packet tail sits
+// above it, so a session's memory must add packet capacity on top. Pure.
+// Memory is pinned at link time, so JS no longer calls this to size it; the
+// export remains the dynamic-sizing ground truth, exercised by the
+// corpus_ceiling_fits_fixed_memory test against the pinned size. Negative
+// error code if the dimensions are rejected.
 #[unsafe(no_mangle)]
 pub extern "C" fn vip9r_required_pages(max_width: u32, max_height: u32) -> i32 {
     match required_pages(max_width, max_height) {
@@ -545,4 +547,25 @@ fn ensure_memory(end: usize) -> Result<(), i32> {
         return Err(RESOURCE_LIMIT);
     }
     Ok(())
+}
+
+#[vip9r_wasm_test_macros::wasm_tests]
+mod tests {
+    use super::{WASM_PAGE, required_pages};
+
+    // Memory is pinned at link time (--initial-memory == --max-memory in
+    // rust/.cargo/config.toml) while this module keeps sizing dynamically;
+    // the test runner instantiates over a memory of exactly the link-time
+    // size. Pin the ceiling: the corpus maximum (1080p) plus the 8 MiB
+    // packet-tail budget (anchors in createVip9rMemory, wasm-env.ts) must
+    // fit, otherwise large sessions fail with RESOURCE_LIMIT at init on
+    // devices instead of here.
+    #[test]
+    fn corpus_ceiling_fits_fixed_memory() {
+        let tail_pages = (8 << 20) / WASM_PAGE;
+        let required = required_pages(1920, 1080).unwrap();
+        let required = usize::try_from(required).unwrap();
+
+        assert!(required + tail_pages <= core::arch::wasm32::memory_size(0));
+    }
 }

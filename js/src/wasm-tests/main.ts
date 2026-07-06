@@ -242,9 +242,8 @@ function runTest(module: WebAssembly.Module, testName: string): TestResult {
   const logs: WasmLog[] = [];
   let pool: WorkerPool | undefined;
   try {
-    // Unit tests init small decoder shapes; 64 MiB is plenty, and each test
-    // gets a fresh memory alongside its fresh instance.
-    const memory = createVip9rMemory(1024);
+    // Each test gets a fresh memory alongside its fresh instance.
+    const memory = createVip9rMemory();
     const instance = new WebAssembly.Instance(
       module,
       makeVip9rImports(memory, (log) => logs.push(log)),

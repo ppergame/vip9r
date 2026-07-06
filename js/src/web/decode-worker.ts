@@ -109,9 +109,8 @@ async function decodeAll(init: WorkerInit): Promise<void> {
     height: header.height,
   });
 
-  const { instance, module, memory } = await instantiateVip9r(
-    header,
-    (message) => post({ type: "log", message, error: true }),
+  const { instance, module, memory } = await instantiateVip9r((message) =>
+    post({ type: "log", message, error: true }),
   );
   // The pool dies with this worker.
   await activateWorkerPool(instance, module, memory, (message) =>

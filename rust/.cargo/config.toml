@@ -8,10 +8,17 @@
 # LLVM lowers memcpy/memset intrinsics to memory.copy/memory.fill, and the
 # linked module has no memcpy import (verified 2026-07-03, rustc 1.96.0).
 #
-# --max-memory=4GiB is the declared ceiling only; each JS frontend creates the
-# shared WebAssembly.Memory and picks a real maximum for its workload (the
-# provided maximum must be <= the declared one; V8 reserves the provided
-# maximum upfront for shared memories, which matters on arm32).
+# Memory is pinned at link time: --initial-memory == --max-memory == 64 MiB,
+# so the memory import declares min == max. V8 caches the shared-memory size
+# only for declared-non-growable limits; growable limits cost +5%/+8.5% frame
+# time on the A55 (docs/design.md, Threads). The wasm code still sizes itself
+# dynamically (vip9r_required_pages, ensure_memory) — the 1024-page ceiling is
+# policy, pinned by the corpus_ceiling_fits_fixed_memory wasm test (corpus max
+# 1080p needs 669 pages incl. packet tail). Every frontend creates the shared
+# WebAssembly.Memory at exactly 1024 pages: a min == max declaration matches
+# no other shape, so drift from this value fails instantiation loudly. V8
+# reserves the full 64 MiB upfront for shared memories — fine on arm32, and
+# physical pages materialize on first touch.
 #
 # Shadow stacks (threads), fixed-address layout: coordinator stack 0..1MiB
 # (rustc's default --stack-first; -zstack-size pins the size explicitly),
@@ -37,7 +44,8 @@ rustflags = [
   "-C", "link-arg=--shared-memory",
   "-C", "link-arg=--import-memory",
   "-C", "link-arg=--export-memory",
-  "-C", "link-arg=--max-memory=4294967296",
+  "-C", "link-arg=--initial-memory=67108864",
+  "-C", "link-arg=--max-memory=67108864",
   "-C", "link-arg=-zstack-size=1048576",
   "-C", "link-arg=--global-base=4194304",
   "-C", "link-arg=--export=__stack_pointer",

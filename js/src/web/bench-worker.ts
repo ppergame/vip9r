@@ -115,9 +115,8 @@ async function vip9rLane(
   input: MediaHeader,
   packets: MediaPacket[],
 ): Promise<LaneResult> {
-  const { instance, module, memory } = await instantiateVip9r(
-    input,
-    (message) => post({ type: "log", message, error: true }),
+  const { instance, module, memory } = await instantiateVip9r((message) =>
+    post({ type: "log", message, error: true }),
   );
   // Tile-parallel like playback, so the lane measures what the player runs.
   const pool = await activateWorkerPool(instance, module, memory, (message) =>

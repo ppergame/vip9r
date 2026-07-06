@@ -4,12 +4,7 @@ import { spawnWorkerPool } from "./pool";
 import type { WorkerPool } from "./pool";
 import { parseIvf as demuxIvf } from "../ivf";
 import { parseWebm } from "../webm";
-import {
-  createScratchVip9rMemory,
-  createVip9rMemory,
-  makeVip9rImports,
-  sessionMaxPages,
-} from "./wasm-env";
+import { createVip9rMemory, makeVip9rImports } from "./wasm-env";
 import type { WasmLog, WasmLogSink } from "./wasm-env";
 
 export { formatWasmLog, WasmLogKind } from "./wasm-env";
@@ -115,8 +110,8 @@ export type ComparisonReport = {
   skippedOutputFrames: number;
   comparisons: FrameComparison[];
   expectedCount: number;
-  // Final linear memory size; memory only grows, so this is peak use.
-  // Evidence for the packet-tail budget in sessionMaxPages.
+  // Final linear memory size; fixed at link time, so this just confirms the
+  // session shape (createVip9rMemory in wasm-env.ts).
   finalMemoryBytes?: number;
 };
 
@@ -1761,13 +1756,7 @@ function instantiateVp9Decoder(
   log: WasmLogSink,
   pool: boolean,
 ): { decoder: Vp9Decoder; pool?: WorkerPool } {
-  const scratch = new WebAssembly.Instance(
-    wasm,
-    makeVip9rImports(createScratchVip9rMemory(), log),
-  );
-  const memory = createVip9rMemory(
-    sessionMaxPages(scratch.exports, decoderDimensions),
-  );
+  const memory = createVip9rMemory();
   const instance = new WebAssembly.Instance(
     wasm,
     makeVip9rImports(memory, log),

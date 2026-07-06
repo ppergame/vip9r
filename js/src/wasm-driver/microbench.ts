@@ -49,8 +49,7 @@ function main(args: string[]): void {
   const parsed = parseArgs(args);
   const logs: WasmLog[] = [];
   const module = new WebAssembly.Module(readbuffer(parsed.wasmPath));
-  // Microbench kernels run on small fixed scratch; 64 MiB is plenty.
-  const memory = createVip9rMemory(1024);
+  const memory = createVip9rMemory();
   const instance = new WebAssembly.Instance(
     module,
     makeVip9rImports(memory, (log) => logs.push(log)),

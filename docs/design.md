@@ -176,13 +176,22 @@ binding details, not a stable external API.
 
 `vip9r_required_pages(max_width, max_height)` is pure: it returns the exact
 static requirement in wasm pages (data + shadow stack + workspace arena) or a
-negative error code. Memory is imported, so JS must fix the real memory's
-maximum before instantiation: it instantiates a throwaway instance over a
-minimal scratch memory, queries `vip9r_required_pages`, and sizes the real
-memory as required pages plus a flat 8 MiB packet-tail budget
-(`sessionMaxPages` in wasm-env.ts; anchors: largest 1080p corpus packet
-504 KiB, level 4.1 CPB 3 MiB, lossless keyframe ~3.1 MiB — a multi-frame
-lossless superframe is the accepted fail-loud RESOURCE_LIMIT case).
+negative error code. The wasm side sizes itself dynamically, but everything
+around it hardcodes 64 MiB: the linker pins the memory import to
+min == max == 1024 pages (`--initial-memory` == `--max-memory` in
+rust/.cargo/config.toml; V8 caches the shared-memory size only for
+declared-non-growable limits — see Threads), and every frontend creates the
+imported memory at exactly 1024 pages (`createVip9rMemory` in wasm-env.ts —
+a min == max declaration matches no other shape, so drift between the two
+constants fails every instantiation loudly). No scratch sizing step:
+instantiation is one compile, one instantiate. The ceiling is policy, pinned
+by the `corpus_ceiling_fits_fixed_memory` wasm test: corpus max (1080p)
+needs 541 pages plus an 8 MiB packet-tail budget (anchors: largest 1080p
+corpus packet 504 KiB, level 4.1 CPB 3 MiB, lossless keyframe ~3.1 MiB).
+The memory is non-growable: `reserve_input` never grows on the happy path
+(the tail is pre-granted; physical pages commit lazily), oversized sessions
+and packets fail with RESOURCE_LIMIT at `vip9r_init`/`reserve_input` (a
+multi-frame lossless superframe remains the accepted fail-loud case).
 
 The result block is a `u32` table in wasm memory. `reserve_input` publishes the
 packet-tail pointer and capacity; JS copies one complete demuxed VP9
@@ -376,16 +385,15 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
   +bulk-memory LLVM lowers memcpy/memset intrinsics to memory.copy/fill and
   the linked module has no memcpy import (rustc 1.96.0). build-std adds ~2-3s
   of core compile to a cold build; grinder sandboxes always cold-build.
-- Link `--shared-memory --import-memory --export-memory --max-memory=4GiB`.
-  Re-exporting the imported memory keeps `exports.memory` and the whole wasm
-  ABI intact; only instantiation sites changed. The 4GiB declared max is a
-  ceiling only — each JS frontend creates the shared `WebAssembly.Memory`
-  (`createVip9rMemory` in wasm-env.ts) and provides a workload-sized maximum
-  (exact static requirement from `vip9r_required_pages` + 8 MiB packet tail;
-  see the wasm boundary section), because V8 reserves the provided maximum
-  upfront for shared memories — address space that must actually fit on
-  arm32. TextDecoder rejects SAB-backed views; wasm-env copies before
-  decoding logs.
+- Link `--shared-memory --import-memory --export-memory
+  --initial-memory=64MiB --max-memory=64MiB`. Re-exporting the imported
+  memory keeps `exports.memory` and the whole wasm ABI intact; only
+  instantiation sites changed. Equal limits declare the memory non-growable —
+  what lets V8 cache the shared-memory size (below) — and each JS frontend
+  creates the shared `WebAssembly.Memory` at exactly 1024 pages (see the wasm
+  boundary section). V8 reserves the maximum upfront for shared memories —
+  64 MiB of address space, fine on arm32. TextDecoder rejects SAB-backed
+  views; wasm-env copies before decoding logs.
 - Measured cost of the shared-memory build, single-threaded (counterbalanced
   no-op benches vs logged numbers): X4/arm64 none (jelly 9.4 ms/f vs ~10.4
   logged); A55/arm32 +5% jelly / +8.5% BBB. Mechanism (profile + asm diff):
@@ -397,11 +405,20 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
   scalar entropy code (decode_block +32% absolute, mode-info +18%); simd
   kernels and libc copy cost are flat (relaxed-memcpy theory falsified;
   memory *base* is now a hoisted constant, 82 reloads → 1). No atomics
-  emitted. Not source-fixable; size is monotonic so a future V8 could
-  legally re-cache it. initial == maximum does not help (measured null —
-  no constant-folding of shared size). A55 first-pass TurboFan compile is
-  ~3.7s, so full-window bench warmup validation trips its 5s deadline —
-  A55 benches use `--frames` windows (campaign protocol anyway).
+  emitted. Per V8 turboshaft source (InstanceCache,
+  turboshaft-graph-interface.cc), the size *is* cached — and marked
+  Immutable — when the module's *declared* import limits are equal; the
+  JS-side WebAssembly.Memory limits never reach compiled code, which is why
+  the 2026-07-03 initial == maximum experiment measured null (wrong knob).
+  Fixed by pinning the memory at link time (min == max == 64 MiB, see the
+  wasm boundary section); expected to recover the 5–8.5%, A55 numbers
+  pending. A per-session byte patch of the import limits also worked
+  (2026-07-06, replaced the same day): it kept per-dims memory sizing but
+  made every session's module bytes unique — one fresh ~290 KB compile per
+  session, no engine code cache — for flexibility nothing uses. A55
+  first-pass TurboFan compile is ~3.7s, so full-window bench warmup
+  validation trips its 5s deadline — A55 benches use `--frames` windows
+  (campaign protocol anyway).
 - Shadow-stack binding (landed 2026-07-03). `__stack_pointer` is a
   per-instance mutable i32 wasm *global* (out-of-band, not a memory word)
   whose init value is baked at link time, so every instance over one shared

@@ -246,9 +246,7 @@ function renderBenchResults(rows: BenchRow[], budgetMs: number): void {
   // tick marks 1.0×; a lane that falls short of it draws all red.
   const maxRt = Math.max(...rows.map((r) => r.realtime ?? 0), 1);
   const lanes = rows.filter((r) => r.skipped === undefined);
-  const wallDigits = Math.max(
-    ...lanes.map((r) => r.wallMs!.toFixed(0).length),
-  );
+  const wallDigits = Math.max(...lanes.map((r) => r.wallMs!.toFixed(0).length));
   const frameDigits = Math.max(...lanes.map((r) => String(r.frames).length));
   // Pad with figure spaces so "60 in 24 ms" lines up under "60 in 128 ms".
   const pad = (text: string, width: number) => text.padStart(width, " ");
@@ -303,9 +301,8 @@ function startBenchRun(): void {
 }
 
 async function bootWasmCheck(): Promise<void> {
-  const { instance } = await instantiateVip9r(
-    { width: 1280, height: 720 },
-    (message) => log(message, "error"),
+  const { instance } = await instantiateVip9r((message) =>
+    log(message, "error"),
   );
   new Vp9Decoder(instance, 1280, 720);
   log(`wasm ok: ${wasmUrl.split("/").pop()}`);
