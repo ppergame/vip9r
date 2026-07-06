@@ -12,24 +12,24 @@ type CannedClip = { name: string; path: string; label: string };
 
 const CANNED: CannedClip[] = [
   {
+    name: "youtube-coral",
+    path: "youtube/mN9_buCmKLE/mN9_buCmKLE-f247-720p30-vp9-rawprefix-0000-2000.webm",
+    label: "youtube coral - 720p30",
+  },
+  {
     name: "citygen",
     path: "synthetic/citygen-720p30-1-5-mbps.webm",
-    label: "citygen - 720p",
+    label: "citygen - 720p30",
   },
   {
     name: "bear",
     path: "chromium/bear-vp9.ivf",
-    label: "bear - 320p smoke clip",
+    label: "bear - 320p",
   },
   {
     name: "jellyfish",
     path: "realworld/test-videos/jellyfish-720p30-1_68mbps.webm",
     label: "jellyfish - 720p30",
-  },
-  {
-    name: "youtube-coral",
-    path: "youtube/mN9_buCmKLE/mN9_buCmKLE-f247-720p30-vp9-rawprefix-0000-2000.webm",
-    label: "youtube coral f247 - 720p30",
   },
   {
     name: "bbb",
@@ -65,7 +65,6 @@ function el<T extends HTMLElement>(id: string): T {
 
 const mediaSelect = el<HTMLSelectElement>("media-select");
 const mediaUrl = el<HTMLInputElement>("media-url");
-const copyLink = el<HTMLButtonElement>("copy-link");
 const tabs: Record<Mode, HTMLButtonElement> = {
   play: el<HTMLButtonElement>("tab-play"),
   bench: el<HTMLButtonElement>("tab-bench"),
@@ -99,7 +98,7 @@ window.addEventListener("unhandledrejection", (event) => {
 const DEFAULTS: Record<string, string> = {
   mode: "play",
   media: CANNED[0].name,
-  frames: "300",
+  frames: "100",
 };
 
 function setParam(key: string, value: string): void {
@@ -282,11 +281,6 @@ function initControls(): void {
   el<HTMLButtonElement>("bench-start").addEventListener("click", () =>
     startBenchRun(),
   );
-  copyLink.addEventListener("click", () => {
-    void navigator.clipboard
-      .writeText(location.href)
-      .then(() => log(`link: ${location.href}`));
-  });
 }
 
 async function main(): Promise<void> {

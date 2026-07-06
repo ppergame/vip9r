@@ -279,6 +279,11 @@ async function webCodecsLane(
   if (typeof VideoDecoder === "undefined") {
     return "WebCodecs unavailable";
   }
+  // Stock Cobalt crashes in isConfigSupported; our vip9r-tagged builds are fine.
+  const ua = navigator.userAgent;
+  if (ua.includes("Cobalt/") && !ua.includes("vip9r")) {
+    return "WebCodecs crashes stock Cobalt";
+  }
   const config: VideoDecoderConfig = {
     codec: vp9CodecString(input),
     codedWidth: input.width,
