@@ -195,15 +195,27 @@ function startPlay(): void {
   // Only an explicit &frames=N caps playback; the frames input's default is
   // a bench-tab affair, and a plain page load plays the whole clip.
   const explicitFrames = new URLSearchParams(location.search).get("frames");
+  // Perf-attribution probes, e.g. &probe=discard,prebuffer or &probe=nodraw.
+  // "nospark" mutes the per-frame sparkline redraw; the rest are handled in
+  // player.ts / decode-worker.ts.
+  const probe = (new URLSearchParams(location.search).get("probe") ?? "")
+    .split(",")
+    .filter((flag) => flag !== "");
+  if (probe.length > 0) {
+    log(`probe: ${probe.join(",")}`);
+  }
   playback = startPlayback({
     url: choice.url,
     frameLimit: Math.max(0, Number(explicitFrames) || 0),
+    probe,
     canvas: el<HTMLCanvasElement>("play-canvas"),
     log,
     stats: (text) => {
       el<HTMLSpanElement>("play-stats").textContent = text;
     },
-    onFrameDecoded: (decodeMs, budgetMs) => playSpark.push(decodeMs, budgetMs),
+    onFrameDecoded: probe.includes("nospark")
+      ? undefined
+      : (decodeMs, budgetMs) => playSpark.push(decodeMs, budgetMs),
   });
 }
 

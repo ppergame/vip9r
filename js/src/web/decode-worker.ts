@@ -1,6 +1,7 @@
 import { Vp9Decoder } from "../wasm";
 import type { NativeFrame } from "../wasm";
 import { openMediaStream } from "./media-stream";
+import type { MediaPacket } from "./media-stream";
 import { packetTimestampUs } from "./media-time";
 import { activateWorkerPool } from "./pool";
 import { instantiateVip9r } from "./vip9r-instance";
@@ -10,6 +11,10 @@ export type WorkerInit = {
   queueDepth: number;
   // Stop after this many output frames; 0 decodes the whole clip.
   frameLimit: number;
+  // Perf-attribution probes (&probe=a,b): "prebuffer" downloads and demuxes
+  // all packets before decoding (bench-style), "discard" decodes without
+  // constructing or posting frames. Main-side flags ride along untouched.
+  probe: string[];
 };
 
 export type WorkerAck = {
@@ -114,11 +119,32 @@ async function decodeAll(init: WorkerInit): Promise<void> {
   );
   const decoder = new Vp9Decoder(instance, header.width, header.height);
 
+  const discard = init.probe.includes("discard");
+  // localvf: construct and immediately close each VideoFrame on this thread
+  // without posting — isolates the plane-copy + frame GC from the transfer.
+  const localvf = init.probe.includes("localvf");
+  let source: AsyncIterable<MediaPacket> | MediaPacket[] = media.packets;
+  if (init.probe.includes("prebuffer")) {
+    const buffered: MediaPacket[] = [];
+    for await (const packet of media.packets) {
+      buffered.push(packet);
+      if (init.frameLimit > 0 && buffered.length >= init.frameLimit) {
+        break;
+      }
+    }
+    post({
+      type: "log",
+      message: `probe: prebuffered ${buffered.length} packets`,
+      error: false,
+    });
+    source = buffered;
+  }
+
   let frames = 0;
   let packets = 0;
   let totalDecodeMs = 0;
   let pendingMs = 0;
-  decode: for await (const packet of media.packets) {
+  decode: for await (const packet of source) {
     const timestamp = packetTimestampUs(header, packet.timestamp);
     const keyframe = packet.keyframe ?? packets === 0;
     decoder.beginPacket(packet.payload);
@@ -133,18 +159,22 @@ async function decodeAll(init: WorkerInit): Promise<void> {
       if (step.kind !== "output") {
         continue;
       }
-      await takeCredit();
-      const frame = makeVideoFrame(memory, step.frame, timestamp);
-      post(
-        {
-          type: "frame",
-          frame,
-          decodeMs: pendingMs,
-          packetBytes: packet.payload.byteLength,
-          keyframe,
-        },
-        [frame],
-      );
+      if (localvf) {
+        makeVideoFrame(memory, step.frame, timestamp).close();
+      } else if (!discard) {
+        await takeCredit();
+        const frame = makeVideoFrame(memory, step.frame, timestamp);
+        post(
+          {
+            type: "frame",
+            frame,
+            decodeMs: pendingMs,
+            packetBytes: packet.payload.byteLength,
+            keyframe,
+          },
+          [frame],
+        );
+      }
       frames += 1;
       pendingMs = 0;
       if (frames === init.frameLimit) {

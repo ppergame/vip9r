@@ -8,6 +8,9 @@ export type PlaybackOptions = {
   url: string;
   // Stop after this many decoded frames; 0 plays the whole clip.
   frameLimit: number;
+  // Perf-attribution probes: worker flags (see WorkerInit) pass through;
+  // "nodraw" runs the full present path minus the drawImage call.
+  probe: string[];
   canvas: HTMLCanvasElement;
   log: (message: string, kind?: "info" | "error") => void;
   stats: (text: string) => void;
@@ -52,11 +55,16 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
   let decoded = 0;
   let firstTimestampUs = 0;
   let lastTimestampUs = 0;
+  let lastStatsMs = -Infinity;
 
+  // shallowq probe: cap decode-ahead at 3 frames to expose VideoFrame
+  // buffer-pool size effects (preroll normally grows the pool to 32).
+  const queueDepth = options.probe.includes("shallowq") ? 3 : QUEUE_DEPTH;
   const init: WorkerInit = {
     url: options.url,
-    queueDepth: QUEUE_DEPTH,
+    queueDepth,
     frameLimit: options.frameLimit,
+    probe: options.probe,
   };
   worker.postMessage(init);
 
@@ -73,6 +81,14 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
           message.frame.close();
           break;
         }
+        // sink probe: swallow the frame with zero main-thread machinery —
+        // no queue, no pacing, no stats — to isolate the transfer itself.
+        if (options.probe.includes("sink")) {
+          message.frame.close();
+          const ack: WorkerAck = { type: "ack", count: 1 };
+          worker.postMessage(ack);
+          break;
+        }
         // Pacing policy: media clock caps the rate, decode floors it, no
         // frame is ever dropped. A frame arriving after its due time slips
         // the epoch by its lateness, so playback continues from there
@@ -86,7 +102,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
           epoch = arrival - ptsMs;
         }
         queue.push({ frame: message.frame, decodeMs: message.decodeMs });
-        if (preroll && queue.length >= QUEUE_DEPTH) {
+        if (preroll && queue.length >= queueDepth) {
           preroll = false;
         }
         if (decoded === 0) {
@@ -101,7 +117,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
             : (lastTimestampUs - firstTimestampUs) / 1000 / (decoded - 1),
         );
         if (rafId === undefined) {
-          rafId = requestAnimationFrame(tick);
+          rafId = scheduleTick();
         }
         break;
       }
@@ -112,6 +128,10 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
         done = message;
         // A clip shorter than the queue can never prime it.
         preroll = false;
+        // The discard probe posts no frames, so nothing else arms the loop.
+        if (rafId === undefined) {
+          rafId = scheduleTick();
+        }
         break;
       case "error":
         options.log(`decode: ${message.message}`, "error");
@@ -123,6 +143,23 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
     options.log(`worker: ${event.message}`, "error");
     finish();
   };
+
+  // noraf probe: pace with a plain timer instead of requestAnimationFrame to
+  // isolate the vsync/BeginFrame machinery from the pacing structure.
+  function scheduleTick(): number {
+    if (options.probe.includes("noraf")) {
+      return self.setTimeout(() => tick(performance.now()), 8);
+    }
+    return requestAnimationFrame(tick);
+  }
+
+  function cancelTick(id: number): void {
+    if (options.probe.includes("noraf")) {
+      clearTimeout(id);
+    } else {
+      cancelAnimationFrame(id);
+    }
+  }
 
   function tick(now: number): void {
     rafId = undefined;
@@ -147,7 +184,13 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
         presentedDecodeMs += entry.decodeMs;
         const ack: WorkerAck = { type: "ack", count: 1 };
         worker.postMessage(ack);
-        updateStats(now, mediaNowMs);
+        // The DOM write forces layout + raster in Cobalt's single process,
+        // which steals ~8ms/frame from the decode wave when done per frame.
+        // 4Hz is plenty for a HUD.
+        if (!options.probe.includes("nostats") && now - lastStatsMs >= 250) {
+          lastStatsMs = now;
+          updateStats(now, mediaNowMs);
+        }
       }
     } else if (done !== undefined) {
       const avg = done.frames === 0 ? 0 : done.totalDecodeMs / done.frames;
@@ -160,7 +203,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
       options.onFinished?.();
       return;
     }
-    rafId = requestAnimationFrame(tick);
+    rafId = scheduleTick();
   }
 
   function presentFrame(frame: VideoFrame): void {
@@ -172,7 +215,9 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
       canvas.width = frame.displayWidth;
       canvas.height = frame.displayHeight;
     }
-    context!.drawImage(frame, 0, 0);
+    if (!options.probe.includes("nodraw")) {
+      context!.drawImage(frame, 0, 0);
+    }
     frame.close();
   }
 
@@ -185,7 +230,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
     const fps = wallMs <= 0 ? 0 : ((presented - 1) * 1000) / wallMs;
     options.stats(
       `decode ${avg.toFixed(1)} ms/frame · shown ${presented} @ ${fps.toFixed(1)} fps · ` +
-        `slip ${(slipMs / 1000).toFixed(1)}s · queue ${queue.length}/${QUEUE_DEPTH} · ` +
+        `slip ${(slipMs / 1000).toFixed(1)}s · queue ${queue.length}/${queueDepth} · ` +
         `t=${(mediaNowMs / 1000).toFixed(1)}s`,
     );
   }
@@ -196,7 +241,7 @@ export function startPlayback(options: PlaybackOptions): PlaybackHandle {
     }
     stopped = true;
     if (rafId !== undefined) {
-      cancelAnimationFrame(rafId);
+      cancelTick(rafId);
       rafId = undefined;
     }
     for (const entry of queue) {

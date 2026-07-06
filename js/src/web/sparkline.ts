@@ -14,6 +14,7 @@ export class Sparkline {
   private readonly context: CanvasRenderingContext2D;
   private readonly samples: number[] = [];
   private budgetMs = 0;
+  private lastDrawMs = -Infinity;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -36,7 +37,13 @@ export class Sparkline {
       this.samples.shift();
     }
     this.budgetMs = budgetMs;
-    this.draw();
+    // Redrawing the polyline per decoded frame steals ~3ms/frame from the
+    // decode wave on 4-core devices; 4Hz reads the same.
+    const now = performance.now();
+    if (now - this.lastDrawMs >= 250) {
+      this.lastDrawMs = now;
+      this.draw();
+    }
   }
 
   private draw(): void {
