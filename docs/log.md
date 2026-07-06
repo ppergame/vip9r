@@ -1257,3 +1257,43 @@ streamer cpu0:
 - Decision per the tracker's rule: single-CPU work is closed. M6 threads
   own the remaining A55 gap; the jellyfish-class residual (~1.4x over
   33.3 ms pooled) stays accepted as scoped.
+
+## 2026-07-05 — M6 threads: fused decode+filter wave
+
+- One pool wave per frame instead of two: each participant decodes its tile
+  column band, then falls into a shared loop-filter row pool. This spends
+  the two idle pools the 2026-07-05 profiles measured — the 6-10 ms decode
+  join tail (workers draining 2→1 behind the slowest band while the
+  coordinator parks) and the filter wavefront ramp.
+- Decode publishes one monotone watermark per band: completed global SB
+  rows, stored after each SB row of `parse_tile` (tile rows stack
+  vertically within a band, tile boundaries are SB-aligned). Filtering
+  (r, c) waits — on top of the intra-wave lag rule — for decode row
+  min(r+2, sb_rows) in every band intersecting SB columns c-1..c+1: intra
+  prediction in decode row r+1 can read above/above-left/above-right, and
+  (r, c+1) can read left, from pixels inside filter(r, c)'s touch window.
+  Bands ending at column c-2 or earlier need no gate — their farthest
+  above-right reach (32 px, the max transform width) falls 56 px short of
+  the left apron. One row of decode lag makes every remaining reorderable
+  decode/filter pair touch-disjoint: still bit-exact by commutation.
+- Filter rows are claimed by a shared fetch_add counter instead of the
+  static p, p+4 stride, so the last-finishing decode band no longer owns
+  blocked rows; participants without a decode band (2-column clips) start
+  claiming immediately. Deadlock-free by claim order: the lowest unfinished
+  row's row-above is always complete, decode never waits, and both decode
+  and filter error paths force-publish their watermarks before returning.
+  The standalone wavefront (single-tile clips) adopts the same row claiming.
+- A55 streamer (`cpu:0-3`, 0:9 windows, corrected deltas vs daca1ed):
+  jellyfish −15.1% at 0.1% spread (grinder read; orchestrator confirms
+  −10.8..−12.2% on heat-drifty 4% spreads, candidate ≈37.2 ms/frame), BBB
+  −7.4% at 0.2% spread (33.9 → 31.4 ms/frame), f247 flag=0 lane −11.6% at
+  0.2% spread (candidate ≈36.4 ms/frame). All at or above the −8..12%
+  scoping estimate; BBB "less" prediction held until the row claim also
+  absorbed its band imbalance.
+- Budget position: BBB ~31 ms/frame sits well under its 40 ms budget;
+  jellyfish ~37 vs 33.3 is ~1.1x over (was ~1.4x); f247 ~36 vs 33.3
+  likewise. Bench windows overweight the keyframe 1/6 vs ~1/300 in real
+  playback, so sustained playback sits below these numbers.
+- Suite: wasm tests 100/100, compliance corpus 307/307 pooled and serial,
+  full corpus 339/339 pooled, libvpx odd-size/resize/aq2/skip/segkey
+  vectors green in both pool modes.

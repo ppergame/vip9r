@@ -13,7 +13,8 @@ use crate::pool::{self, WORKER_COUNT};
 use crate::probability::{
     CLASS0_SIZE, FrameContext, MV_OFFSET_BITS, SWITCHABLE_FILTERS, SyntaxCounts,
 };
-use crate::tile::{TileDescriptor, TileLayout};
+use crate::tile::{MAX_TILE_COLS_LOG2, TileDescriptor, TileLayout};
+use core::sync::atomic::AtomicU32;
 
 mod coef;
 mod inter_predict;
@@ -42,6 +43,7 @@ use tables::*;
 // partition contexts. Wider frames need workspace-backed context storage and
 // are reported as a resource limit instead of an invalid bitstream.
 const MAX_MI_COLS: usize = 2560;
+const MAX_TILE_COLS: usize = 1usize << (MAX_TILE_COLS_LOG2 as usize);
 const MAX_4X4_COLS: usize = MAX_MI_COLS * 2;
 const MI_SIZE_PIXELS: u32 = 8;
 const MI_BLOCK_64: usize = 8;
@@ -332,7 +334,8 @@ impl<'a> CurrentPlaneMut<'a> {
         // current frame.  The band splitter creates aliased full-plane slices
         // only with disjoint accepted column ranges; every direct access path
         // checks those ranges and reports InvalidBitstream before touching a
-        // cross-band column.
+        // cross-band column.  Fused loop-filter aliases are further contained
+        // to checked superblock windows and gated by decode-row watermarks.
         let data = unsafe { core::slice::from_raw_parts_mut(raw.data as *mut u8, raw.len) };
         Ok(Self {
             data,
@@ -598,9 +601,11 @@ pub(crate) fn parse_intra_tiles(
         accumulate_counts: !header.error_resilient_mode && !header.frame_parallel_decoding_mode,
     };
 
-    parse_tile_frame(frame, probabilities, layout, config, &mut buffers)?;
-
-    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+    let loop_filter_done =
+        parse_tile_frame(frame, header, probabilities, layout, config, &mut buffers)?;
+    if !loop_filter_done {
+        loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+    }
 
     Ok(())
 }
@@ -645,9 +650,11 @@ pub(crate) fn parse_inter_tiles(
         accumulate_counts: !header.error_resilient_mode && !header.frame_parallel_decoding_mode,
     };
 
-    parse_tile_frame(frame, probabilities, layout, config, &mut buffers)?;
-
-    loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+    let loop_filter_done =
+        parse_tile_frame(frame, header, probabilities, layout, config, &mut buffers)?;
+    if !loop_filter_done {
+        loop_filter_frame(header, buffers.current_frame, &buffers.mode_buffers)?;
+    }
 
     Ok(())
 }
@@ -670,6 +677,8 @@ struct TileWave<'a> {
     current_frame: CurrentFrameRaw,
     current_frame_modes: Option<ModeInfoViewMutRaw>,
     reference_frames: Option<ReferenceFrames<'a>>,
+    decode_watermarks: Option<&'a [AtomicU32]>,
+    loop_filter: Option<LoopFilterWave<'a>>,
 }
 
 /// One column band of the wave. All pointers are usize-erased because job
@@ -680,6 +689,21 @@ struct TileWave<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct TileJob {
     wave: usize,
+    tile_col: usize,
+    mi_col_start: usize,
+    mi_col_end: usize,
+    counts: usize,
+    result: usize,
+}
+
+/// One participant in a fused tile-decode plus loop-filter wave. A worker may
+/// have no decode band when there are fewer tile columns than participants; it
+/// then goes straight to the shared filter row-claim pool.
+#[derive(Clone, Copy)]
+pub(crate) struct FusedTileFilterJob {
+    wave: usize,
+    participant: usize,
+    has_decode: bool,
     tile_col: usize,
     mi_col_start: usize,
     mi_col_end: usize,
@@ -698,6 +722,19 @@ struct TileBandError {
 
 type TileBandResult = Result<(), TileBandError>;
 
+#[derive(Clone, Copy)]
+struct FusedTileFilterResult {
+    decode: TileBandResult,
+    filter: LoopFilterBandResult,
+}
+
+impl FusedTileFilterResult {
+    const OK: Self = Self {
+        decode: Ok(()),
+        filter: Ok(()),
+    };
+}
+
 pub(crate) fn run_tile_job(job: TileJob) {
     let result = decode_tile_job(job);
     // SAFETY: The coordinator stores a pointer to this wave's per-slot
@@ -709,25 +746,53 @@ pub(crate) fn run_tile_job(job: TileJob) {
     }
 }
 
+pub(crate) fn run_fused_tile_filter_job(job: FusedTileFilterJob) {
+    let decode = if job.has_decode {
+        decode_tile_job(TileJob {
+            wave: job.wave,
+            tile_col: job.tile_col,
+            mi_col_start: job.mi_col_start,
+            mi_col_end: job.mi_col_end,
+            counts: job.counts,
+            result: 0,
+        })
+    } else {
+        Ok(())
+    };
+    // SAFETY: The wave lives in parse_tile_frame_parallel's stack frame and
+    // this job runs strictly between dispatch and join.
+    let wave = unsafe { &*(job.wave as *const TileWave) };
+    let filter = match wave.loop_filter {
+        Some(filter_wave) => loop_filter_band(&filter_wave, job.participant),
+        None => Ok(()),
+    };
+    // SAFETY: Same result-cell handoff as tile and loop-filter jobs.
+    unsafe {
+        *(job.result as *mut FusedTileFilterResult) = FusedTileFilterResult { decode, filter };
+    }
+}
+
 fn parse_tile_frame(
     frame: &[u8],
+    header: &UncompressedFrameHeader,
     probabilities: &FrameContext,
     layout: &TileLayout,
     config: TileParserConfig,
     buffers: &mut TileParseBuffers<'_, '_, '_, '_>,
-) -> Result<(), TileSyntaxError> {
+) -> Result<bool, TileSyntaxError> {
     let (tile_cols, tile_rows) = tile_grid(layout)?;
     if !pool::is_active() || tile_cols == 1 {
-        return parse_tile_frame_serial(frame, probabilities, layout, config, buffers);
+        parse_tile_frame_serial(frame, probabilities, layout, config, buffers)?;
+        return Ok(false);
     }
     parse_tile_frame_parallel(
         frame,
+        header,
         probabilities,
-        layout,
+        layout.as_slice(),
         config,
         buffers,
-        tile_cols,
-        tile_rows,
+        (tile_cols, tile_rows),
     )
 }
 
@@ -754,6 +819,7 @@ fn parse_tile_frame_serial(
                 current_frame: &mut *buffers.current_frame,
                 reference_frames: buffers.reference_frames,
             },
+            None,
         )?;
     }
     Ok(())
@@ -768,14 +834,95 @@ static mut WORKER_SYNTAX_COUNTS: [SyntaxCounts; WORKER_COUNT] = [SyntaxCounts::Z
 
 fn parse_tile_frame_parallel(
     frame: &[u8],
+    header: &UncompressedFrameHeader,
     probabilities: &FrameContext,
-    layout: &TileLayout,
+    tiles: &[TileDescriptor],
     config: TileParserConfig,
     buffers: &mut TileParseBuffers<'_, '_, '_, '_>,
-    tile_cols: usize,
-    tile_rows: usize,
-) -> Result<(), TileSyntaxError> {
-    let tiles = layout.as_slice();
+    tile_grid: (usize, usize),
+) -> Result<bool, TileSyntaxError> {
+    let (tile_cols, tile_rows) = tile_grid;
+    if tile_cols > MAX_TILE_COLS {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    let mut band_mi_starts = [0usize; MAX_TILE_COLS];
+    let mut band_mi_ends = [0usize; MAX_TILE_COLS];
+    for tile_col in 0..tile_cols {
+        let (mi_col_start, mi_col_end) = column_mi_range(tiles, tile_cols, tile_rows, tile_col)?;
+        band_mi_starts[tile_col] = mi_col_start;
+        band_mi_ends[tile_col] = mi_col_end;
+    }
+
+    let current_frame = buffers.current_frame.raw_parts();
+    let current_frame_modes = buffers
+        .mode_buffers
+        .current_frame_modes
+        .as_mut()
+        .map(ModeInfoViewMut::raw_parts);
+
+    let sb_rows = config.frame_mis.0.div_ceil(MI_BLOCK_64);
+    let sb_cols = config.frame_mis.1.div_ceil(MI_BLOCK_64);
+    let can_fuse_filter = header.loop_filter.level != 0
+        && (2..=MAX_WAVEFRONT_SB_ROWS).contains(&sb_rows)
+        && sb_cols <= MAX_WAVEFRONT_SB_COLS;
+    let loop_filter_done = header.loop_filter.level == 0 || can_fuse_filter;
+
+    let decode_watermarks = [const { AtomicU32::new(0) }; MAX_TILE_COLS];
+    let filter_watermarks = [const { AtomicU32::new(0) }; MAX_WAVEFRONT_SB_ROWS];
+    let filter_row_claim = AtomicU32::new(0);
+    let mut sb_col_band_start = [0u8; MAX_WAVEFRONT_SB_COLS];
+    let mut sb_col_band_end = [0u8; MAX_WAVEFRONT_SB_COLS];
+
+    let loop_filter_config = if can_fuse_filter {
+        if header.profile != 0 || header.bit_depth != 8 {
+            return Err(TileSyntaxError::Unimplemented);
+        }
+        let raw_modes = current_frame_modes.ok_or(TileSyntaxError::InvalidBitstream)?;
+        // SAFETY: The read view aliases decoder band-mutable views only inside
+        // the fused wave. Loop-filter mode reads are gated by per-band decode
+        // row watermarks before use.
+        let modes = unsafe { ModeInfoView::from_raw_full(raw_modes, config.frame_mis.1)? };
+        precompute_loop_filter_band_gates(
+            config.frame_mis.1,
+            sb_cols,
+            tile_cols,
+            &band_mi_starts[..tile_cols],
+            &band_mi_ends[..tile_cols],
+            &mut sb_col_band_start[..sb_cols],
+            &mut sb_col_band_end[..sb_cols],
+        )?;
+        Some(loop_filter_config_from_modes(header, modes)?)
+    } else {
+        None
+    };
+    let loop_filter_strengths = match loop_filter_config {
+        Some(filter_config) => Some(loop_filter_strength_lut(
+            filter_config.params,
+            filter_config.segmentation,
+        )?),
+        None => None,
+    };
+    let decode_watermark_slice = &decode_watermarks[..tile_cols];
+    let decode_gates = loop_filter_config.map(|_| LoopFilterDecodeGates {
+        watermarks: decode_watermark_slice,
+        sb_col_band_start: &sb_col_band_start[..sb_cols],
+        sb_col_band_end: &sb_col_band_end[..sb_cols],
+    });
+    let loop_filter = match (loop_filter_config, loop_filter_strengths.as_ref()) {
+        (Some(filter_config), Some(strengths)) => Some(LoopFilterWave {
+            config: filter_config,
+            strengths,
+            current_frame,
+            sb_rows,
+            sb_cols,
+            watermarks: &filter_watermarks[..sb_rows],
+            row_claim: &filter_row_claim,
+            decode_gates,
+        }),
+        _ => None,
+    };
+
     let wave = TileWave {
         frame,
         tiles,
@@ -784,36 +931,113 @@ fn parse_tile_frame_parallel(
         tile_cols,
         tile_rows,
         prev_frame_modes: buffers.mode_buffers.prev_frame_modes,
-        current_frame: buffers.current_frame.raw_parts(),
-        current_frame_modes: buffers
-            .mode_buffers
-            .current_frame_modes
-            .as_mut()
-            .map(ModeInfoViewMut::raw_parts),
+        current_frame,
+        current_frame_modes,
         reference_frames: buffers.reference_frames,
+        decode_watermarks: loop_filter.map(|_| decode_watermark_slice),
+        loop_filter,
     };
     // SAFETY: The coordinator is the only caller and no wave is in flight —
     // the previous wave was joined before parse_tile_frame_parallel returned,
     // and workers touch the array only through per-wave slot pointers.
     let worker_counts = unsafe { &mut *core::ptr::addr_of_mut!(WORKER_SYNTAX_COUNTS) };
 
-    let worker_jobs = core::cmp::min(WORKER_COUNT, tile_cols - 1);
+    let worker_decode_jobs = core::cmp::min(WORKER_COUNT, tile_cols - 1);
+    if wave.loop_filter.is_some() {
+        let mut worker_results: [FusedTileFilterResult; WORKER_COUNT] =
+            [FusedTileFilterResult::OK; WORKER_COUNT];
+        let mut jobs = [None; WORKER_COUNT];
+        for worker_index in 0..WORKER_COUNT {
+            let has_decode = worker_index < worker_decode_jobs;
+            let counts = if has_decode && config.accumulate_counts {
+                worker_counts[worker_index].clear();
+                &mut worker_counts[worker_index] as *mut SyntaxCounts as usize
+            } else {
+                0
+            };
+            jobs[worker_index] = Some(pool::Job::FusedTileFilter(FusedTileFilterJob {
+                wave: &wave as *const TileWave as usize,
+                participant: worker_index + 1,
+                has_decode,
+                tile_col: worker_index,
+                mi_col_start: if has_decode {
+                    band_mi_starts[worker_index]
+                } else {
+                    0
+                },
+                mi_col_end: if has_decode {
+                    band_mi_ends[worker_index]
+                } else {
+                    0
+                },
+                counts,
+                result: &mut worker_results[worker_index] as *mut FusedTileFilterResult as usize,
+            }));
+        }
+
+        pool::dispatch(&jobs);
+
+        // No early return between dispatch and join: workers hold pointers
+        // into this frame's stack (the wave and their result cells), so every
+        // path must join before unwinding. Errors funnel through aggregation;
+        // decode errors win over any speculative filter errors because serial
+        // semantics decode the full tile frame before filtering.
+        let mut coordinator_result = FusedTileFilterResult::OK;
+        for tile_col in worker_decode_jobs..tile_cols {
+            let result = decode_tile_job(TileJob {
+                wave: &wave as *const TileWave as usize,
+                tile_col,
+                mi_col_start: band_mi_starts[tile_col],
+                mi_col_end: band_mi_ends[tile_col],
+                counts: if config.accumulate_counts {
+                    buffers.counts as *mut SyntaxCounts as usize
+                } else {
+                    0
+                },
+                result: 0,
+            });
+            choose_earliest_error(&mut coordinator_result.decode, result);
+        }
+        if let Some(filter_wave) = wave.loop_filter {
+            coordinator_result.filter = loop_filter_band(&filter_wave, 0);
+        }
+
+        if !pool::join(-1) {
+            return Err(TileSyntaxError::ResourceLimit);
+        }
+
+        let mut best_decode = coordinator_result.decode;
+        let mut best_filter = coordinator_result.filter;
+        for result in &worker_results {
+            choose_earliest_error(&mut best_decode, result.decode);
+            choose_earliest_filter_error(&mut best_filter, result.filter);
+        }
+        if let Err(failure) = best_decode {
+            return Err(failure.error);
+        }
+
+        if config.accumulate_counts {
+            for counts in worker_counts.iter().take(worker_decode_jobs) {
+                buffers.counts.merge_from(counts);
+            }
+        }
+        return best_filter.map(|()| true).map_err(|failure| failure.error);
+    }
+
     let mut worker_results: [TileBandResult; WORKER_COUNT] = [Ok(()); WORKER_COUNT];
     let mut jobs = [None; WORKER_COUNT];
-    for worker_index in 0..worker_jobs {
+    for worker_index in 0..worker_decode_jobs {
         let counts = if config.accumulate_counts {
             worker_counts[worker_index].clear();
             &mut worker_counts[worker_index] as *mut SyntaxCounts as usize
         } else {
             0
         };
-        let (mi_col_start, mi_col_end) =
-            column_mi_range(tiles, tile_cols, tile_rows, worker_index)?;
         jobs[worker_index] = Some(pool::Job::Tile(TileJob {
             wave: &wave as *const TileWave as usize,
             tile_col: worker_index,
-            mi_col_start,
-            mi_col_end,
+            mi_col_start: band_mi_starts[worker_index],
+            mi_col_end: band_mi_ends[worker_index],
             counts,
             result: &mut worker_results[worker_index] as *mut TileBandResult as usize,
         }));
@@ -826,25 +1050,19 @@ fn parse_tile_frame_parallel(
     // must join before unwinding. Errors funnel through the result
     // aggregation instead.
     let mut best: TileBandResult = Ok(());
-    for tile_col in worker_jobs..tile_cols {
-        let result = match column_mi_range(tiles, tile_cols, tile_rows, tile_col) {
-            Ok((mi_col_start, mi_col_end)) => decode_tile_job(TileJob {
-                wave: &wave as *const TileWave as usize,
-                tile_col,
-                mi_col_start,
-                mi_col_end,
-                counts: if config.accumulate_counts {
-                    buffers.counts as *mut SyntaxCounts as usize
-                } else {
-                    0
-                },
-                result: 0,
-            }),
-            Err(error) => Err(TileBandError {
-                tile_index: tile_col,
-                error,
-            }),
-        };
+    for tile_col in worker_decode_jobs..tile_cols {
+        let result = decode_tile_job(TileJob {
+            wave: &wave as *const TileWave as usize,
+            tile_col,
+            mi_col_start: band_mi_starts[tile_col],
+            mi_col_end: band_mi_ends[tile_col],
+            counts: if config.accumulate_counts {
+                buffers.counts as *mut SyntaxCounts as usize
+            } else {
+                0
+            },
+            result: 0,
+        });
         choose_earliest_error(&mut best, result);
     }
 
@@ -852,7 +1070,7 @@ fn parse_tile_frame_parallel(
         return Err(TileSyntaxError::ResourceLimit);
     }
 
-    for &result in worker_results.iter().take(worker_jobs) {
+    for &result in worker_results.iter().take(worker_decode_jobs) {
         choose_earliest_error(&mut best, result);
     }
     if let Err(failure) = best {
@@ -860,11 +1078,11 @@ fn parse_tile_frame_parallel(
     }
 
     if config.accumulate_counts {
-        for counts in worker_counts.iter().take(worker_jobs) {
+        for counts in worker_counts.iter().take(worker_decode_jobs) {
             buffers.counts.merge_from(counts);
         }
     }
-    Ok(())
+    Ok(loop_filter_done)
 }
 
 fn choose_earliest_error(best: &mut TileBandResult, candidate: TileBandResult) {
@@ -879,11 +1097,31 @@ fn choose_earliest_error(best: &mut TileBandResult, candidate: TileBandResult) {
     }
 }
 
+fn choose_earliest_filter_error(best: &mut LoopFilterBandResult, candidate: LoopFilterBandResult) {
+    if let Err(new) = candidate {
+        let earlier = match *best {
+            Ok(()) => true,
+            Err(old) => new.sb_index < old.sb_index,
+        };
+        if earlier {
+            *best = Err(new);
+        }
+    }
+}
+
 fn decode_tile_job(job: TileJob) -> TileBandResult {
     // SAFETY: The wave lives in parse_tile_frame_parallel's stack frame,
     // which does not return between dispatch and join; its references are
     // valid for at least that long, and this job runs strictly inside it.
     let wave = unsafe { &*(job.wave as *const TileWave) };
+    let result = decode_tile_job_inner(wave, job);
+    if result.is_err() {
+        publish_decode_abandoned(wave, job.tile_col);
+    }
+    result
+}
+
+fn decode_tile_job_inner(wave: &TileWave<'_>, job: TileJob) -> TileBandResult {
     // Failures before any tile decodes are attributed to this column's row-0
     // tile, whose row-major index is the column index itself.
     let band_error = |error| TileBandError {
@@ -891,7 +1129,8 @@ fn decode_tile_job(job: TileJob) -> TileBandResult {
         error,
     };
     // SAFETY: Band views are column-disjoint, live only for this wave, and all
-    // cross-thread visibility is ordered by pool dispatch/join.
+    // cross-thread visibility is ordered by pool dispatch/join plus, in the
+    // fused filter case, by the decode-row watermarks.
     let mut current_frame = unsafe {
         CurrentFrameMut::from_band_raw(wave.current_frame, job.mi_col_start, job.mi_col_end)
     }
@@ -926,6 +1165,18 @@ fn decode_tile_job(job: TileJob) -> TileBandResult {
     )
 }
 
+fn publish_decode_abandoned(wave: &TileWave<'_>, tile_col: usize) {
+    if let Some(watermarks) = wave.decode_watermarks
+        && let Some(watermark) = watermarks.get(tile_col)
+    {
+        DecodeBandProgress {
+            watermark,
+            sb_rows: wave.config.frame_mis.0.div_ceil(MI_BLOCK_64),
+        }
+        .publish_abandoned();
+    }
+}
+
 fn parse_tile_band(
     wave: &TileWave<'_>,
     tile_col: usize,
@@ -946,6 +1197,10 @@ fn parse_tile_band(
         tile_index: tile_col,
         error,
     })?;
+    let decode_progress = wave.decode_watermarks.map(|watermarks| DecodeBandProgress {
+        watermark: &watermarks[tile_col],
+        sb_rows: config.frame_mis.0.div_ceil(MI_BLOCK_64),
+    });
 
     for tile_row in 0..tile_rows {
         let tile_index = tile_row
@@ -977,8 +1232,12 @@ fn parse_tile_band(
                 current_frame: &mut *current_frame,
                 reference_frames: wave.reference_frames,
             },
+            decode_progress,
         )
         .map_err(|error| TileBandError { tile_index, error })?;
+    }
+    if let Some(progress) = decode_progress {
+        progress.publish_abandoned();
     }
     Ok(())
 }
@@ -1040,6 +1299,64 @@ fn column_mi_range(
     Ok((start, end))
 }
 
+fn precompute_loop_filter_band_gates(
+    mi_cols: usize,
+    sb_cols: usize,
+    tile_cols: usize,
+    band_mi_starts: &[usize],
+    band_mi_ends: &[usize],
+    sb_col_band_start: &mut [u8],
+    sb_col_band_end: &mut [u8],
+) -> Result<(), TileSyntaxError> {
+    if tile_cols == 0
+        || band_mi_starts.len() < tile_cols
+        || band_mi_ends.len() < tile_cols
+        || sb_col_band_start.len() < sb_cols
+        || sb_col_band_end.len() < sb_cols
+    {
+        return Err(TileSyntaxError::InvalidBitstream);
+    }
+
+    for sb_col in 0..sb_cols {
+        let left_sb = sb_col.saturating_sub(1);
+        let right_sb = core::cmp::min(
+            sb_col
+                .checked_add(1)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            sb_cols - 1,
+        );
+        let mi_start = left_sb
+            .checked_mul(MI_BLOCK_64)
+            .ok_or(TileSyntaxError::InvalidBitstream)?;
+        let mi_end = core::cmp::min(
+            right_sb
+                .checked_add(1)
+                .and_then(|value| value.checked_mul(MI_BLOCK_64))
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            mi_cols,
+        );
+
+        let mut first = 0usize;
+        while first < tile_cols && band_mi_ends[first] <= mi_start {
+            first += 1;
+        }
+        if first == tile_cols || band_mi_starts[first] >= mi_end {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+
+        let mut end = first;
+        while end < tile_cols && band_mi_starts[end] < mi_end {
+            end += 1;
+        }
+        sb_col_band_start[sb_col] =
+            u8::try_from(first).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        sb_col_band_end[sb_col] =
+            u8::try_from(end).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TileParserConfig {
     frame_is_intra: bool,
@@ -1068,12 +1385,30 @@ struct TileParseShared<'a, 'f, 'r> {
     reference_frames: Option<ReferenceFrames<'r>>,
 }
 
+#[derive(Clone, Copy)]
+struct DecodeBandProgress<'a> {
+    watermark: &'a AtomicU32,
+    sb_rows: usize,
+}
+
+impl DecodeBandProgress<'_> {
+    fn publish_completed_mi_row(self, next_mi_row: usize) {
+        let completed = core::cmp::min(next_mi_row / MI_BLOCK_64, self.sb_rows);
+        pool::watermark_store(self.watermark, completed as u32);
+    }
+
+    fn publish_abandoned(self) {
+        pool::watermark_store(self.watermark, self.sb_rows as u32);
+    }
+}
+
 fn parse_tile(
     frame: &[u8],
     tile: &TileDescriptor,
     config: TileParserConfig,
     mode_buffers: FrameModeBuffers<'_>,
     shared: TileParseShared<'_, '_, '_>,
+    decode_progress: Option<DecodeBandProgress<'_>>,
 ) -> Result<(), TileSyntaxError> {
     let TileParseShared {
         probabilities,
@@ -1153,6 +1488,9 @@ fn parse_tile(
         row = row
             .checked_add(MI_BLOCK_64)
             .ok_or(TileSyntaxError::InvalidBitstream)?;
+        if let Some(progress) = decode_progress {
+            progress.publish_completed_mi_row(row);
+        }
     }
 
     parser.decoder.finish()?;

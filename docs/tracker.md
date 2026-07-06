@@ -594,6 +594,21 @@ availability/MV search, no cross-tile pixel reads).
 - [x] demo: `VideoFrame` construction from SAB-backed views verified on Chrome
       and Cobalt (user-tested 2026-07-03; vite COOP/COEP headers landed with
       the ABI spike)
+- [x] fused decode+filter wave (2026-07-05, from the pipelining scoping in
+      temp/orchestrator-notes.md): one wave per frame — decode bands publish
+      per-band SB-row watermarks, filter rows claimed by shared fetch_add
+      with a decode-row gate over bands covering cols c-1..c+1. A55
+      jellyfish −15.1% (best clean read, ≈37.2 ms/f), BBB −7.4% (33.9 →
+      31.4), f247 −11.6% (≈36.4). Corpus 339/339 pooled, compliance 307/307
+      both modes, wasm tests 100/100
+- [ ] watermark notify hygiene (wanted-mark): notify only when a published
+      value crosses a waiter's registered target; kernel/futex share is the
+      metric (4-6% per thread in the 2026-07-05 profiles), timing win is a
+      bonus
+- [ ] later, if the coordinator tail still shows in post-fusion profiles:
+      parse next frame's headers in the join tail (flag=1 content only;
+      needs speculative header/probability state and JS-side input
+      pre-staging — see orchestrator notes)
 - [x] frame-parallel decode: out of scope (2026-07-03) — complexity. It breaks
       the one-frame-owns-all-mutable-state invariant (per-frame
       probability/segmentation/mode-grid snapshots, per-row reference progress

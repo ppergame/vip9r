@@ -477,22 +477,28 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     inferred from the CPU pin set, matching the no-quiet-fallbacks rule and
     keeping serial-on-4-cores and oversubscribed-on-3-cores (Pixel A720
     cluster) runs expressible.
-  - Dispatch (landed 2026-07-04): no job queue. The parallel unit is the
-    tile *column band* — spec `clear_above_context()` runs once per frame,
-    so above context carries across tile rows within a column; one thread
-    owns every tile row of a column, decoded in row order with its own
-    fresh `TileModeContexts` (equivalent to the frame-level clear because
-    bands never touch each other's columns). Coordinator dispatches a wave
-    of one column per worker, decodes all remaining columns itself between
-    dispatch and join, then joins. Modal cases degrade cleanly: 4 columns =
-    wave of 3 + own column; 2 columns = wave of 1 with two None slots;
-    single-column clips (and pool-off) take the untouched serial loop.
-    >4-column clips serialize the excess on the coordinator — accepted
-    until content demands a queue. No early return between dispatch and
-    join: workers write result cells in the coordinator's stack frame, so
-    every error (including job-construction failures in the mop-up loop)
-    funnels through per-slot results, aggregated after join by lowest tile
-    index to match serial error reporting.
+  - Dispatch (landed 2026-07-04; fused 2026-07-05): no job queue. The
+    parallel unit is the tile *column band* — spec `clear_above_context()`
+    runs once per frame, so above context carries across tile rows within a
+    column; one thread owns every tile row of a column, decoded in row
+    order with its own fresh `TileModeContexts` (equivalent to the
+    frame-level clear because bands never touch each other's columns).
+    Coordinator dispatches a wave of one column per worker, decodes all
+    remaining columns itself between dispatch and join, then joins. When
+    the frame loop-filters and the wavefront bounds hold (sb_rows 2..=1024,
+    sb_cols <= 1024), the wave is *fused* (`Job::FusedTileFilter`): every
+    worker gets a job — an optional decode band plus filter participation —
+    and each participant falls into the shared filter row pool after its
+    decode work (workers with no band immediately). Modal cases degrade
+    cleanly: 4 columns = wave of 3 + own column; 2 columns = one decode
+    band on a worker, two filter-only workers; single-column clips (and
+    pool-off) take the untouched serial decode loop; level-0 frames run
+    the wave decode-only. >4-column clips serialize the excess on the
+    coordinator — accepted until content demands a queue. No early return
+    between dispatch and join: workers write result cells in the
+    coordinator's stack frame, so every error funnels through per-slot
+    results, aggregated after join (lowest tile index; decode errors win
+    over filter errors to match serial phase ordering).
   - Cross-thread state: everything a job reads that is identical across the
     wave lives in one stack-resident `TileWave` on the coordinator's frame;
     a job slot carries just the wave pointer, the band's mi-column range,
@@ -526,23 +532,43 @@ threaded unconditionally, single ABI, old-ABI baselines retired):
     (watermark `>= min(c+2, sb_cols)`). Under it, every reorderable SB pair
     has disjoint touch windows — bit-exact vs serial raster order by
     commutation, no cross-thread pixel race.
-  - Wavefront mechanics: one pool wave per filtered frame
-    (`Job::LoopFilter`). Participant p of 4 (coordinator = 0, so filtering
-    starts before workers finish waking) owns SB rows p, p+4, ...; per-row
-    `AtomicU32` watermarks (stack array, 1024 rows = the 2^16 dimension cap;
-    larger stays serial) count completed SBs. Producers Release-store +
-    notify per SB; consumers Acquire-load and `memory.atomic.wait32` — the
-    Acquire also publishes the row-above pixels. Containment mirrors the
-    tile bands: each participant's aliased full-plane view carries a per-SB
-    window (SB extent + 8px margin, `set_superblock_window`), and
+  - Fused decode gate (landed 2026-07-05): in a fused wave, filtering also
+    races still-running decoders. Decode publishes one monotone watermark
+    per band — completed global SB rows, stored after each SB row of
+    `parse_tile` (tile rows stack vertically; tile boundaries are
+    SB-aligned). Filter (r, c) additionally waits for decode row
+    min(r+2, sb_rows) in every band intersecting SB columns c-1..c+1
+    (precomputed per-sb-col contiguous band ranges): intra prediction in
+    decode row r+1 reads above/above-left/above-right, and (r, c+1) reads
+    left, from pixels inside filter(r, c)'s touch window. Bands ending at
+    c-2 or earlier need no gate — max above-right reach (32 px, the
+    transform width cap) falls 56 px short of the left apron. The same
+    Acquire edge orders the filter's mode-grid reads (a read-only
+    full-grid view aliasing the decoders' band-mutable views) behind the
+    band's writes. Both decode and filter error paths force-publish their
+    watermarks to the row/frame end, so dependents drain and the joined
+    frame reports the error instead of hanging.
+  - Wavefront mechanics: filter participation rides the fused wave
+    (`Job::FusedTileFilter`); single-tile-column frames keep a standalone
+    filter wave (`Job::LoopFilter`) after serial decode. Participants claim
+    SB rows from a shared fetch_add counter (2026-07-05; replaced the
+    static p, p+4 stride so the last-finishing decode band doesn't own
+    blocked rows). Deadlock-free by claim order: the lowest unfinished
+    row's row-above is complete, and decode never waits. Per-row
+    `AtomicU32` watermarks (stack array, 1024 rows = the 2^16 dimension
+    cap; larger stays serial) count completed SBs. Producers Release-store
+    + notify per SB; consumers Acquire-load and `memory.atomic.wait32` —
+    the Acquire also publishes the row-above pixels. Containment mirrors
+    the tile bands: each participant's aliased full-plane view carries a
+    per-SB window (SB extent + 8px margin, `set_superblock_window`), and
     `loop_filter_segment` checks each segment's maximal touch rectangle
     against it before any raw kernel access, so a reach bug is an
     `InvalidBitstream` failure instead of a race. A failing participant
     marks its remaining rows complete without touching pixels (waiters
-    proceed against unfiltered pixels; the error still fails the frame after
-    join, lowest SB raster index wins to match serial reporting). Serial
-    path (pool off, or a single SB row) keeps the same per-SB traversal
-    with a full-plane window. the stack-layout ABI constants live
+    proceed against unfiltered pixels; the error still fails the frame
+    after join, lowest SB raster index wins to match serial reporting).
+    Serial path (pool off, or a single SB row) keeps the same per-SB
+    traversal with a full-plane window. the stack-layout ABI constants live
   in `js/src/wasm-driver/stack-layout.ts`, shared by both spawners. d8:
   `wasm-driver/pool.ts` (string-source worker, constants interpolated); the
   wasm-tests runner spawns + activates for `::pool::` tests. Web:

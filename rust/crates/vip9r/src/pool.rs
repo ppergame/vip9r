@@ -21,6 +21,7 @@ pub(crate) const WORKER_COUNT: usize = 3;
 #[derive(Clone, Copy)]
 pub(crate) enum Job {
     Tile(crate::tile_syntax::TileJob),
+    FusedTileFilter(crate::tile_syntax::FusedTileFilterJob),
     LoopFilter(crate::tile_syntax::LoopFilterJob),
     #[cfg(feature = "wasm-tests")]
     Fill(FillJob),
@@ -145,11 +146,7 @@ pub(crate) fn watermark_wait_at_least(watermark: &AtomicU32, target: u32) {
             return;
         }
         unsafe {
-            core::arch::wasm32::memory_atomic_wait32(
-                watermark.as_ptr().cast(),
-                current as i32,
-                -1,
-            );
+            core::arch::wasm32::memory_atomic_wait32(watermark.as_ptr().cast(), current as i32, -1);
         }
     }
 }
@@ -200,6 +197,7 @@ pub(crate) fn worker_main(worker_index: u32) -> ! {
 fn run_job(job: Job) {
     match job {
         Job::Tile(job) => crate::tile_syntax::run_tile_job(job),
+        Job::FusedTileFilter(job) => crate::tile_syntax::run_fused_tile_filter_job(job),
         Job::LoopFilter(job) => crate::tile_syntax::run_loop_filter_job(job),
         #[cfg(feature = "wasm-tests")]
         Job::Fill(job) => run_fill_job(job),

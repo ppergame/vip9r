@@ -1,7 +1,7 @@
 use super::*;
 
 use core::arch::wasm32::*;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct LoopFilterConfig<'a> {
@@ -101,13 +101,7 @@ pub(super) fn loop_filter_frame(
         .as_ref()
         .ok_or(TileSyntaxError::InvalidBitstream)?
         .as_view();
-    let config = LoopFilterConfig {
-        params: header.loop_filter,
-        segmentation: header.segmentation,
-        modes,
-        mi_rows: mi_size(header.frame_height)?,
-        mi_cols: mi_size(header.frame_width)?,
-    };
+    let config = loop_filter_config_from_modes(header, modes)?;
     let strengths = loop_filter_strength_lut(config.params, config.segmentation)?;
 
     let sb_rows = config.mi_rows.div_ceil(MI_BLOCK_64);
@@ -163,27 +157,56 @@ fn loop_filter_superblock_all(
 // against serial raster order, and simultaneously active windows never
 // alias (the containment `check_window_rect` in `loop_filter_segment`
 // verifies each segment stays inside its window).
+//
+// In the fused decode/filter wave, filtering also races against still-running
+// tile decoders.  Decode publishes one monotone watermark per tile-column band:
+// the count of completed global SB rows.  Before filtering (r, c), the
+// participant waits for row min(r + 2, sb_rows) in every band intersecting SB
+// columns c - 1 through c + 1 (clamped to the frame).  That covers the decode
+// operations that can observe pixels inside filter(r, c)'s touch window
+// [c*64-8, (c+1)*64) x [r*64-8, (r+1)*64): intra prediction in row r+1 can
+// read above/above-left/above-right from those columns, and decoding (r, c+1)
+// can read left from c.  Any band ending at c-2 or earlier is separated from
+// the rightmost possible above-right read by at least 56 pixels, greater than
+// the 32-pixel maximum transform width, so it needs no gate.  With one row of
+// decode lag, all remaining decode/filter reorderings have disjoint pixel
+// touch rectangles, and mode-grid reads are gated by the same watermark that
+// follows the decoder's band-restricted writes.
+//
+// Deadlock is excluded because decoders never wait.  Filter participants claim
+// rows by a single increasing fetch_add; row r can wait only on decode
+// watermarks and on row r-1's filter watermark, whose row was claimed earlier.
+// On decode or filter failure the abandoned producer publishes its watermark to
+// the row/frame end before returning so dependents can drain and the joined
+// frame reports the error instead of hanging.
 
 /// VP9 frame dimensions cap at 2^16, so 65536 / 64 superblock rows bound the
 /// watermark table. Larger (malformed) frames fall back to serial filtering.
-const MAX_WAVEFRONT_SB_ROWS: usize = 1024;
-
-/// Wavefront participants: the coordinator plus every pool worker.
-/// Participant p owns superblock rows p, p + 4, p + 8, ...
-const LOOP_FILTER_PARTICIPANTS: usize = WORKER_COUNT + 1;
+pub(super) const MAX_WAVEFRONT_SB_ROWS: usize = 1024;
+pub(super) const MAX_WAVEFRONT_SB_COLS: usize = 1024;
 
 /// Everything a wavefront participant needs. Lives on the coordinator's
 /// stack from before dispatch until after join; jobs carry a pointer to it.
 /// `watermarks[r]` counts fully filtered superblocks of row r; participants
 /// publish with Release stores and wait with Acquire loads, which also
 /// carries the filtered pixels of the row above.
+#[derive(Clone, Copy)]
+pub(super) struct LoopFilterDecodeGates<'a> {
+    pub(super) watermarks: &'a [AtomicU32],
+    pub(super) sb_col_band_start: &'a [u8],
+    pub(super) sb_col_band_end: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct LoopFilterWave<'a> {
-    config: LoopFilterConfig<'a>,
-    strengths: &'a LoopFilterStrengthLut,
-    current_frame: CurrentFrameRaw,
-    sb_rows: usize,
-    sb_cols: usize,
-    watermarks: &'a [AtomicU32],
+    pub(super) config: LoopFilterConfig<'a>,
+    pub(super) strengths: &'a LoopFilterStrengthLut,
+    pub(super) current_frame: CurrentFrameRaw,
+    pub(super) sb_rows: usize,
+    pub(super) sb_cols: usize,
+    pub(super) watermarks: &'a [AtomicU32],
+    pub(super) row_claim: &'a AtomicU32,
+    pub(super) decode_gates: Option<LoopFilterDecodeGates<'a>>,
 }
 
 /// One wavefront participant's job. Pointers are usize-erased because job
@@ -200,12 +223,12 @@ pub(crate) struct LoopFilterJob {
 /// attributed to; error selection across participants takes the lowest index
 /// to match serial filtering's first-failure reporting.
 #[derive(Clone, Copy)]
-struct LoopFilterBandError {
-    sb_index: usize,
-    error: TileSyntaxError,
+pub(super) struct LoopFilterBandError {
+    pub(super) sb_index: usize,
+    pub(super) error: TileSyntaxError,
 }
 
-type LoopFilterBandResult = Result<(), LoopFilterBandError>;
+pub(super) type LoopFilterBandResult = Result<(), LoopFilterBandError>;
 
 pub(crate) fn run_loop_filter_job(job: LoopFilterJob) {
     // SAFETY: The wave lives in loop_filter_frame_wavefront's stack frame,
@@ -227,6 +250,7 @@ fn loop_filter_frame_wavefront(
     sb_cols: usize,
 ) -> Result<(), TileSyntaxError> {
     let watermarks = [const { AtomicU32::new(0) }; MAX_WAVEFRONT_SB_ROWS];
+    let row_claim = AtomicU32::new(0);
     let wave = LoopFilterWave {
         config,
         strengths,
@@ -234,6 +258,8 @@ fn loop_filter_frame_wavefront(
         sb_rows,
         sb_cols,
         watermarks: &watermarks[..sb_rows],
+        row_claim: &row_claim,
+        decode_gates: None,
     };
 
     let mut worker_results: [LoopFilterBandResult; WORKER_COUNT] = [Ok(()); WORKER_COUNT];
@@ -249,8 +275,8 @@ fn loop_filter_frame_wavefront(
     pool::dispatch(&jobs);
 
     // No early return between dispatch and join: workers hold pointers into
-    // this frame's stack. The coordinator owns row 0, so filtering starts
-    // before the workers finish waking.
+    // this frame's stack. The coordinator claims the first available row, so
+    // filtering starts before the workers finish waking.
     let mut best = loop_filter_band(&wave, 0);
 
     if !pool::join(-1) {
@@ -271,7 +297,10 @@ fn loop_filter_frame_wavefront(
     best.map_err(|failure| failure.error)
 }
 
-fn loop_filter_band(wave: &LoopFilterWave<'_>, participant: usize) -> LoopFilterBandResult {
+pub(super) fn loop_filter_band(
+    wave: &LoopFilterWave<'_>,
+    _participant: usize,
+) -> LoopFilterBandResult {
     // SAFETY: Every participant holds an aliased full-plane view, but all
     // accesses stay inside the current superblock window (checked per
     // segment) and simultaneously active windows are disjoint under the
@@ -280,8 +309,11 @@ fn loop_filter_band(wave: &LoopFilterWave<'_>, participant: usize) -> LoopFilter
     let mut current_frame = unsafe { CurrentFrameMut::from_raw_windowed(wave.current_frame) };
 
     let mut failure: LoopFilterBandResult = Ok(());
-    let mut sb_row = participant;
-    while sb_row < wave.sb_rows {
+    loop {
+        let sb_row = wave.row_claim.fetch_add(1, Ordering::Relaxed) as usize;
+        if sb_row >= wave.sb_rows {
+            break;
+        }
         for sb_col in 0..wave.sb_cols {
             if failure.is_err() {
                 break;
@@ -302,7 +334,6 @@ fn loop_filter_band(wave: &LoopFilterWave<'_>, participant: usize) -> LoopFilter
         // abandoned row filter against unfiltered pixels; the error still
         // fails the frame after join, so the output is never used.
         pool::watermark_store(&wave.watermarks[sb_row], wave.sb_cols as u32);
-        sb_row += LOOP_FILTER_PARTICIPANTS;
     }
     failure
 }
@@ -313,6 +344,33 @@ fn loop_filter_wavefront_superblock(
     sb_row: usize,
     sb_col: usize,
 ) -> Result<(), TileSyntaxError> {
+    if let Some(gates) = wave.decode_gates {
+        let target = core::cmp::min(
+            sb_row
+                .checked_add(2)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+            wave.sb_rows,
+        );
+        let target = u32::try_from(target).map_err(|_| TileSyntaxError::InvalidBitstream)?;
+        let band_start = usize::from(
+            *gates
+                .sb_col_band_start
+                .get(sb_col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        );
+        let band_end = usize::from(
+            *gates
+                .sb_col_band_end
+                .get(sb_col)
+                .ok_or(TileSyntaxError::InvalidBitstream)?,
+        );
+        if band_start >= band_end || band_end > gates.watermarks.len() {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        for watermark in &gates.watermarks[band_start..band_end] {
+            pool::watermark_wait_at_least(watermark, target);
+        }
+    }
     if sb_row > 0 {
         let target = core::cmp::min(
             sb_col
@@ -331,6 +389,19 @@ fn loop_filter_wavefront_superblock(
     loop_filter_superblock_all(current_frame, wave.config, wave.strengths, row, col)?;
     pool::watermark_store(&wave.watermarks[sb_row], sb_col as u32 + 1);
     Ok(())
+}
+
+pub(super) fn loop_filter_config_from_modes<'a>(
+    header: &UncompressedFrameHeader,
+    modes: ModeInfoView<'a>,
+) -> Result<LoopFilterConfig<'a>, TileSyntaxError> {
+    Ok(LoopFilterConfig {
+        params: header.loop_filter,
+        segmentation: header.segmentation,
+        modes,
+        mi_rows: mi_size(header.frame_height)?,
+        mi_cols: mi_size(header.frame_width)?,
+    })
 }
 
 pub(super) fn loop_filter_strength_lut(

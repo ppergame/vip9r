@@ -130,6 +130,26 @@ impl<'a> ModeInfoView<'a> {
         })
     }
 
+    pub(crate) unsafe fn from_raw_full(
+        raw: ModeInfoViewMutRaw,
+        mi_cols: usize,
+    ) -> Result<Self, TileSyntaxError> {
+        if mi_cols == 0 || !raw.len.is_multiple_of(STORED_MODE_INFO_BYTES) {
+            return Err(TileSyntaxError::InvalidBitstream);
+        }
+        // SAFETY: The raw parts came from the live current-frame mode grid.
+        // Fused decode/filter creates this read-only full-grid view while
+        // decoders hold band-restricted mutable views; its callers gate every
+        // read on the corresponding decode-row watermarks.
+        let data = unsafe { core::slice::from_raw_parts(raw.data as *const u8, raw.len) };
+        Ok(Self {
+            data,
+            mi_cols,
+            band_mi_col_start: 0,
+            band_mi_col_end: mi_cols,
+        })
+    }
+
     fn entry(self, index: usize) -> Result<&'a [u8], TileSyntaxError> {
         self.check_band(index)?;
         let start = mode_info_offset(index)?;
@@ -324,9 +344,10 @@ impl<'a> ModeInfoViewMut<'a> {
             return Err(TileSyntaxError::InvalidBitstream);
         }
         // SAFETY: The band splitter creates one mutable view per
-        // column-disjoint band from this raw full-grid region, and the pool's
-        // Release/Acquire protocol joins all users before the coordinator
-        // reuses the original grid.
+        // column-disjoint band from this raw full-grid region.  In a decode-only
+        // wave, the pool join orders all users before the coordinator reuses
+        // the original grid; in a fused decode/filter wave, loop-filter readers
+        // are additionally gated by per-band decode-row watermarks.
         let data = unsafe { core::slice::from_raw_parts_mut(raw.data as *mut u8, raw.len) };
         Ok(Self {
             data,
