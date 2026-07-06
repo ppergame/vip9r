@@ -110,6 +110,7 @@
           pnpm
           python3
           qemu
+          rclone
           ripgrep
           rustToolchain
           wabt

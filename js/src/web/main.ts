@@ -54,6 +54,9 @@ const CANNED: CannedClip[] = [
 ];
 
 const CUSTOM = "custom";
+const MEDIA_BASE_URL = import.meta.env.DEV
+  ? "/media"
+  : "https://media.xzrq.net/vip9r";
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -151,7 +154,7 @@ function selectedMedia(): MediaChoice | undefined {
   if (clip === undefined) {
     return undefined;
   }
-  return { label: clip.name, url: `/media/${clip.path}` };
+  return { label: clip.name, url: `${MEDIA_BASE_URL}/${clip.path}` };
 }
 
 let playback: PlaybackHandle | undefined;

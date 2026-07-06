@@ -4,5 +4,8 @@ minimumReleaseAgeIgnoreMissingTime: false
 trustLockfile: false
 allowBuilds:
   "@google/genai": true
+  esbuild: true
   protobufjs: true
+  sharp: true
+  workerd: true
 storeDir: ${HOME}/.local/share/pnpm/store
