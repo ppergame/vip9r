@@ -23,7 +23,8 @@
       config.allowUnfreePredicate = pkg: let
         name = nixpkgs.lib.getName pkg;
       in
-        name == "android-sdk-ndk"
+        name
+        == "android-sdk-ndk"
         || name == "ndk"
         || nixpkgs.lib.hasPrefix "system-image-" name
         || nixpkgs.lib.hasPrefix "aarch64-unknown-linux-android-" name
@@ -103,6 +104,7 @@
           binaryen
           bubblewrap
           cacert
+          chromium
           git
           grinder
           libvpx
