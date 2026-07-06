@@ -9,11 +9,22 @@ export type BenchHandle = {
   stop(): void;
 };
 
+export type BenchRow = {
+  label: string;
+  skipped?: string;
+  msPerFrame?: number;
+  realtime?: number;
+  frames?: number;
+  wallMs?: number;
+  decodeMsPerFrame?: number;
+  videoFrameMsPerFrame?: number;
+};
+
 export type BenchOptions = {
   url: string;
   packetLimit: number;
   log: (message: string, kind?: "info" | "error") => void;
-  results: (text: string) => void;
+  results: (rows: BenchRow[], budgetMs: number) => void;
 };
 
 const LANE_LABELS: Record<BenchLane, string> = {
@@ -27,7 +38,7 @@ export function startBench(options: BenchOptions): BenchHandle {
   const worker = new Worker(new URL("./bench-worker.ts", import.meta.url), {
     type: "module",
   });
-  const lines: string[] = [];
+  const rows: BenchRow[] = [];
   let budgetMs = 0;
   let stopped = false;
 
@@ -37,29 +48,31 @@ export function startBench(options: BenchOptions): BenchHandle {
   };
   worker.postMessage(init);
 
-  function addLine(line: string): void {
-    lines.push(line);
-    options.results(lines.join("\n"));
+  function addRow(row: BenchRow): void {
+    rows.push(row);
+    options.results(rows, budgetMs);
   }
 
-  function formatLane(result: LaneResult): string {
+  function laneRow(result: LaneResult): BenchRow {
     const msPerFrame = result.frames === 0 ? 0 : result.wallMs / result.frames;
-    let line =
-      `${LANE_LABELS[result.lane].padEnd(19)} ${msPerFrame.toFixed(1).padStart(6)} ms/frame` +
-      ` · ${result.frames} frames in ${result.wallMs.toFixed(0)} ms`;
+    const row: BenchRow = {
+      label: LANE_LABELS[result.lane],
+      msPerFrame,
+      frames: result.frames,
+      wallMs: result.wallMs,
+    };
     if (budgetMs > 0 && msPerFrame > 0) {
-      line += ` · ${(budgetMs / msPerFrame).toFixed(1)}× realtime`;
+      row.realtime = budgetMs / msPerFrame;
     }
     if (
       result.decodeMs !== undefined &&
       result.videoFrameMs !== undefined &&
       result.frames > 0
     ) {
-      line +=
-        ` · decodeNext ${(result.decodeMs / result.frames).toFixed(1)}` +
-        ` + VideoFrame ${(result.videoFrameMs / result.frames).toFixed(1)} ms/frame`;
+      row.decodeMsPerFrame = result.decodeMs / result.frames;
+      row.videoFrameMsPerFrame = result.videoFrameMs / result.frames;
     }
-    return line;
+    return row;
   }
 
   function finish(): void {
@@ -84,12 +97,10 @@ export function startBench(options: BenchOptions): BenchHandle {
         options.log(message.message, message.error ? "error" : "info");
         break;
       case "lane":
-        addLine(formatLane(message.result));
+        addRow(laneRow(message.result));
         break;
       case "lane-skipped":
-        addLine(
-          `${LANE_LABELS[message.lane].padEnd(19)} skipped — ${message.reason}`,
-        );
+        addRow({ label: LANE_LABELS[message.lane], skipped: message.reason });
         break;
       case "done":
         options.log("bench done");

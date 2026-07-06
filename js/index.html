@@ -28,13 +28,18 @@
         line-height: 1.4;
         background: var(--bg);
         color: var(--ink);
+        /* Viewport-fit: the page never scrolls; the log pane scrolls itself. */
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
       }
       header {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
         gap: 0.625rem;
-        padding: 0.625rem 1.25rem;
+        padding: 0.4375rem 1.25rem;
         background: var(--panel);
         border-bottom: 1px solid var(--border);
       }
@@ -119,10 +124,15 @@
         width: 24rem;
         max-width: 60vw;
       }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        margin: 0.625rem 1.25rem 0;
+      }
       nav.tabs {
         display: inline-flex;
         gap: 0.25rem;
-        margin: 1rem 1.25rem 0;
         padding: 0.25rem;
         background: var(--panel);
         border: 1px solid var(--border);
@@ -138,22 +148,40 @@
       nav.tabs button:hover {
         color: var(--ink);
       }
+      /* Selected tab is a neutral raised chip; blue is reserved for the
+         start button so state and action stay visually distinct. */
       nav.tabs button.active {
-        background: var(--accent);
-        color: #fff;
+        background: var(--border);
+        color: var(--ink);
       }
       section.mode {
-        margin: 0.75rem 1.25rem 1rem;
-        padding: 1rem;
+        margin: 0.625rem 1.25rem;
+        padding: 0.625rem;
         background: var(--panel);
         border: 1px solid var(--border-soft);
         border-radius: var(--radius);
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+      }
+      /* hidden must beat the display: flex on sections and controls. */
+      [hidden] {
+        display: none !important;
+      }
+      /* Bench has no tall content: shrink the panel to fit and hand the
+         leftover space to the log. */
+      #bench:not([hidden]) {
+        flex: 0 0 auto;
+      }
+      #bench:not([hidden]) ~ #log {
+        height: auto;
+        flex: 1;
       }
       .controls {
         display: flex;
         align-items: center;
         gap: 0.625rem;
-        margin-bottom: 0.875rem;
       }
       #play-stats {
         color: var(--ink-muted);
@@ -163,8 +191,8 @@
       canvas.spark {
         display: block;
         width: 100%;
-        height: 48px;
-        margin-bottom: 0.875rem;
+        height: 36px;
+        margin-bottom: 0.625rem;
         background: var(--well);
         border: 1px solid var(--border);
         border-radius: calc(var(--radius) - 3px);
@@ -172,24 +200,33 @@
       .lanes {
         display: flex;
         gap: 1rem;
-        flex-wrap: wrap;
+        flex: 1;
+        min-height: 0;
       }
       .lane {
         flex: 1 1 20rem;
         min-width: 16rem;
         margin: 0;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
       }
       .lane figcaption {
-        margin-bottom: 0.375rem;
+        margin-bottom: 0.25rem;
         color: var(--ink-muted);
         font-size: 0.8125rem;
         text-transform: uppercase;
         letter-spacing: 0.06em;
       }
       .lane canvas {
-        width: 100%;
-        height: auto;
-        aspect-ratio: auto 16 / 9;
+        /* Height comes from the flex column; width follows the canvas's
+           intrinsic aspect ratio so the border hugs the video. */
+        flex: 1;
+        min-height: 0;
+        width: auto;
+        max-width: 100%;
+        align-self: center;
+        object-fit: contain;
         background: #000;
         border: 1px solid var(--border);
         border-radius: calc(var(--radius) - 3px);
@@ -203,18 +240,71 @@
         width: 5rem;
       }
       #bench-results {
-        margin: 0;
-        padding: 0.75rem;
+        padding: 0.375rem 0.875rem;
         font-family: ui-monospace, monospace;
         font-size: 0.85rem;
+        font-variant-numeric: tabular-nums;
         background: var(--well);
         border: 1px solid var(--border);
         border-radius: calc(var(--radius) - 3px);
         min-height: 4.5rem;
-        overflow-x: auto;
+        overflow: auto;
+      }
+      #bench-results table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      #bench-results th,
+      #bench-results td {
+        text-align: left;
+        white-space: nowrap;
+        padding: 0.4375rem 1.25rem 0.4375rem 0;
+      }
+      #bench-results th {
+        color: var(--ink-muted);
+        font-size: 0.75rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      #bench-results tbody td {
+        border-top: 1px solid var(--border-soft);
+      }
+      #bench-results .num {
+        text-align: right;
+      }
+      #bench-results .bar-cell {
+        width: 30%;
+      }
+      #bench-results .track {
+        position: relative;
+        display: flex;
+        align-items: center;
+        height: 0.875rem;
+      }
+      #bench-results .bar {
+        height: 8px;
+        min-width: 2px;
+        border-radius: 4px;
+        background: var(--accent);
+      }
+      #bench-results .bar.under {
+        background: var(--error);
+      }
+      #bench-results .tick {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        margin-left: -1px;
+        background: var(--ink-muted);
+      }
+      #bench-results .skip,
+      #bench-results .notes {
+        color: var(--ink-muted);
       }
       #log {
-        margin: 0 1.25rem 1.25rem;
+        margin: 0 1.25rem 0.625rem;
         padding: 0.625rem 0.75rem;
         font-family: ui-monospace, monospace;
         font-size: 0.8125rem;
@@ -223,7 +313,8 @@
         background: var(--well);
         border: 1px solid var(--border-soft);
         border-radius: var(--radius);
-        max-height: 14rem;
+        height: 6rem;
+        flex-shrink: 0;
         overflow-y: auto;
         white-space: pre-wrap;
       }
@@ -257,15 +348,24 @@
         GitHub
       </a>
     </header>
-    <nav class="tabs">
-      <button id="tab-play">play</button>
-      <button id="tab-bench">bench</button>
-    </nav>
-    <section id="play" class="mode" hidden>
-      <div class="controls">
+    <div class="toolbar">
+      <nav class="tabs">
+        <button id="tab-play">play</button>
+        <button id="tab-bench">bench</button>
+      </nav>
+      <div id="play-controls" class="controls" hidden>
         <button id="play-start" class="primary">start</button>
         <span id="play-stats"></span>
       </div>
+      <div id="bench-controls" class="controls" hidden>
+        <button id="bench-start" class="primary">start</button>
+        <label>
+          frames:
+          <input id="frames" type="number" min="0" />
+        </label>
+      </div>
+    </div>
+    <section id="play" class="mode" hidden>
       <canvas id="play-spark" class="spark"></canvas>
       <div class="lanes">
         <figure class="lane">
@@ -275,14 +375,7 @@
       </div>
     </section>
     <section id="bench" class="mode" hidden>
-      <div class="controls">
-        <button id="bench-start" class="primary">start</button>
-        <label>
-          frames:
-          <input id="frames" type="number" min="0" />
-        </label>
-      </div>
-      <pre id="bench-results"></pre>
+      <div id="bench-results"></div>
     </section>
     <div id="log"></div>
     <script type="module" src="/src/web/main.ts"></script>

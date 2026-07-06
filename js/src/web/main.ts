@@ -1,5 +1,5 @@
 import { Vp9Decoder } from "../wasm";
-import { startBench } from "./bench";
+import { startBench, type BenchRow } from "./bench";
 import type { BenchHandle } from "./bench";
 import { startPlayback } from "./player";
 import type { PlaybackHandle } from "./player";
@@ -76,6 +76,10 @@ const sections: Record<Mode, HTMLElement> = {
   play: el<HTMLElement>("play"),
   bench: el<HTMLElement>("bench"),
 };
+const controls: Record<Mode, HTMLElement> = {
+  play: el<HTMLElement>("play-controls"),
+  bench: el<HTMLElement>("bench-controls"),
+};
 const framesInput = el<HTMLInputElement>("frames");
 const logPane = el<HTMLDivElement>("log");
 
@@ -127,6 +131,7 @@ function setMode(mode: Mode): void {
   for (const m of ["play", "bench"] as const) {
     tabs[m].classList.toggle("active", m === mode);
     sections[m].hidden = m !== mode;
+    controls[m].hidden = m !== mode;
   }
   setParam("mode", mode);
 }
@@ -141,6 +146,21 @@ function onMediaChanged(): void {
   if (mediaSelect.value !== CUSTOM || mediaUrl.value.trim() !== "") {
     location.reload();
   }
+}
+
+// Steps through the canned clips only: the custom-URL entry needs a keyboard,
+// so the remote skips it. From a custom URL, the first step lands on the
+// nearest end of the canned list.
+function cycleMedia(step: number): void {
+  const index = CANNED.findIndex((c) => c.name === mediaSelect.value);
+  const next =
+    index === -1
+      ? step > 0
+        ? 0
+        : CANNED.length - 1
+      : (index + step + CANNED.length) % CANNED.length;
+  mediaSelect.value = CANNED[next].name;
+  onMediaChanged();
 }
 
 type MediaChoice = { label: string; url: string };
@@ -170,7 +190,7 @@ function resetSessions(): void {
   playSpark.reset();
   const canvas = el<HTMLCanvasElement>("play-canvas");
   canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
-  el<HTMLPreElement>("bench-results").textContent = "";
+  el<HTMLDivElement>("bench-results").innerHTML = "";
 }
 
 function switchMode(mode: Mode): void {
@@ -221,6 +241,51 @@ function startPlay(): void {
   });
 }
 
+function renderBenchResults(rows: BenchRow[], budgetMs: number): void {
+  // Bars encode realtime speed, so longer reads as better at a glance. The
+  // tick marks 1.0×; a lane that falls short of it draws all red.
+  const maxRt = Math.max(...rows.map((r) => r.realtime ?? 0), 1);
+  const lanes = rows.filter((r) => r.skipped === undefined);
+  const wallDigits = Math.max(
+    ...lanes.map((r) => r.wallMs!.toFixed(0).length),
+  );
+  const frameDigits = Math.max(...lanes.map((r) => String(r.frames).length));
+  // Pad with figure spaces so "60 in 24 ms" lines up under "60 in 128 ms".
+  const pad = (text: string, width: number) => text.padStart(width, " ");
+  const tick =
+    budgetMs > 0
+      ? `<div class="tick" style="left:${((1 / maxRt) * 100).toFixed(2)}%"></div>`
+      : "";
+  const cells = rows.map((row) => {
+    if (row.skipped !== undefined) {
+      return `<tr><td>${row.label}</td><td class="skip" colspan="5">skipped — ${row.skipped}</td></tr>`;
+    }
+    const notes =
+      row.decodeMsPerFrame === undefined
+        ? ""
+        : `decode ${row.decodeMsPerFrame.toFixed(1)} + VideoFrame ${row.videoFrameMsPerFrame!.toFixed(1)} ms`;
+    const rt = row.realtime;
+    const bar =
+      rt === undefined
+        ? ""
+        : `<div class="bar${rt < 1 ? " under" : ""}" style="width:${((rt / maxRt) * 100).toFixed(2)}%"></div>`;
+    return (
+      `<tr><td>${row.label}</td>` +
+      `<td class="num">${row.msPerFrame!.toFixed(1)}</td>` +
+      `<td class="num">${rt === undefined ? "" : `${rt.toFixed(1)}×`}</td>` +
+      `<td class="bar-cell"><div class="track">${bar}${tick}</div></td>` +
+      `<td class="num">${pad(String(row.frames), frameDigits)} in ${pad(row.wallMs!.toFixed(0), wallDigits)} ms</td>` +
+      `<td class="notes">${notes}</td></tr>`
+    );
+  });
+  el<HTMLDivElement>("bench-results").innerHTML =
+    `<table><thead><tr>` +
+    `<th>decoder</th><th class="num">ms/frame</th><th class="num">realtime</th>` +
+    `<th>${budgetMs > 0 ? "vs 1.0×" : ""}</th>` +
+    `<th class="num">frames</th><th></th>` +
+    `</tr></thead><tbody>${cells.join("")}</tbody></table>`;
+}
+
 function startBenchRun(): void {
   const choice = selectedMedia();
   if (choice === undefined) {
@@ -233,9 +298,7 @@ function startBenchRun(): void {
     url: choice.url,
     packetLimit: Math.max(0, Number(framesInput.value) || 0),
     log,
-    results: (text) => {
-      el<HTMLPreElement>("bench-results").textContent = text;
-    },
+    results: renderBenchResults,
   });
 }
 
@@ -276,6 +339,9 @@ function initControls(): void {
   framesInput.addEventListener("change", () =>
     setParam("frames", framesInput.value),
   );
+  framesInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") startBenchRun();
+  });
   tabs.play.addEventListener("click", () => switchMode("play"));
   tabs.bench.addEventListener("click", () => switchMode("bench"));
   el<HTMLButtonElement>("play-start").addEventListener("click", () =>
@@ -284,6 +350,40 @@ function initControls(): void {
   el<HTMLButtonElement>("bench-start").addEventListener("click", () =>
     startBenchRun(),
   );
+  // Google TV remote: Android delivers the D-pad to web content as
+  // Enter/arrow keys. When focus isn't on a control that owns those keys
+  // itself, select starts the active tab, left/right toggles play/bench,
+  // up/down steps through the canned clips.
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    if (
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLSelectElement ||
+      target instanceof HTMLButtonElement
+    ) {
+      return;
+    }
+    switch (event.key) {
+      case "Enter":
+        if (getParam("mode") === "bench") {
+          startBenchRun();
+        } else {
+          startPlay();
+        }
+        break;
+      case "ArrowLeft":
+      case "ArrowRight":
+        switchMode(getParam("mode") === "bench" ? "play" : "bench");
+        break;
+      case "ArrowUp":
+      case "ArrowDown":
+        cycleMedia(event.key === "ArrowDown" ? 1 : -1);
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
+  });
 }
 
 async function main(): Promise<void> {
