@@ -20,7 +20,7 @@ and they didn't.
 
 The model weights do contain a not-so-blurry-anymore snapshot of open source
 software. I think the Wasm optimization target is far enough off the beaten path
-make this an interesting exercise.
+to make this an interesting exercise.
 
 ## Results
 
