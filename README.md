@@ -88,7 +88,8 @@ agent tooling and let the friendly robots do the work. In practice, I couldn't
 resist tweaking prompts and arguing about the implementation details. There were
 only a handful of autonomous multi-hour sessions. Perhaps Fable would've done
 something reasonable with a simple "make me a decoder" prompt and a new car's
-worth of API costs.
+worth of API costs. As it is, this only cost about $3,256.97 of subsidized
+tokens.
 
 These were the critical tools / feedback mechanisms:
 
