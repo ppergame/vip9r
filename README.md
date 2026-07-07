@@ -114,7 +114,7 @@ These were the critical tools / feedback mechanisms:
   decision fatigue for the model and helped it focus on the task. It was
   certainly cheaper: Fable 5 has tight subscription quotas but a $200/mo OpenAI
   plan is basically unlimited.
-- Orchestrator keeps a historical record in `docs/log.md`.
+- Orchestrator keeps a historical record in [docs/log.md](docs/log.md).
 
 ## Random thoughts
 
