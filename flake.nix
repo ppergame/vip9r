@@ -57,11 +57,14 @@
       EOF
             exit 1
     '';
+    rustcUnchecked = import ./nix/unchecked-rustc.nix {
+      inherit pkgs rustToolchain;
+    };
     wasmTools = import ./nix/wasm-tools.nix {
-      inherit pkgs rustToolchain v8;
+      inherit pkgs rustToolchain v8 rustcUnchecked;
     };
     grinder = import ./nix/grinder.nix {
-      inherit pkgs rustToolchain codex armIsaXml;
+      inherit pkgs rustToolchain codex armIsaXml rustcUnchecked;
     };
   in {
     packages.${system} = {
@@ -75,6 +78,12 @@
       # Threaded-wasm build: lets stable cargo honor the [unstable] build-std
       # table in rust/.cargo/config.toml.
       RUSTC_BOOTSTRAP = "1";
+
+      # Bounds-check-free wasm builds (nix/unchecked-rustc.nix). Every build
+      # path must agree: this devshell var, the wasm-* wrappers, and the
+      # grinder sandbox all point at the same wrapper. Unset RUSTC to build a
+      # stock module for comparison.
+      RUSTC = "${rustcUnchecked}/bin/rustc-unchecked";
 
       V8_LINUX64 = "${v8.linux64}";
       V8_ANDROID_ARM32 = "${v8.androidArm32}";

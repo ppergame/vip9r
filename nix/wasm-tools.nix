@@ -2,11 +2,16 @@
   pkgs,
   rustToolchain,
   v8,
+  rustcUnchecked,
 }: let
   common = ''
     # Threaded-wasm build: stable cargo honors the [unstable] build-std table
     # in rust/.cargo/config.toml only with this in its environment.
     export RUSTC_BOOTSTRAP=1
+
+    # Bounds-check-free wasm builds (nix/unchecked-rustc.nix). Exported here,
+    # not inherited, so `nix run` outside the devshell builds the same module.
+    export RUSTC=${rustcUnchecked}/bin/rustc-unchecked
 
     locate_project() {
       local git_root

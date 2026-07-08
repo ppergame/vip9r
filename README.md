@@ -32,11 +32,11 @@ Multiples of realtime, higher is better.
 
 |                                           | Google TV Streamer 4K | Pixel 9a       | PC  |
 | ----------------------------------------- | --------------------- | -------------- | --- |
-| vip9r, [d8 shell](https://v8.dev/docs/d8) | 1.11×                 | 5.8×           | 24× |
+| vip9r, [d8 shell](https://v8.dev/docs/d8) | 1.13×                 | 5.8×           | 24× |
 | ffvp9 single core                         | 1.5×                  | 13×            | 30× |
 | ffvp9 4 cores                             | 4.3×                  | <sup>[1]</sup> | 60× |
 | _in browser:_ <sup>[2]</sup>              |                       |                |     |
-| vip9r                                     | 1.04×                 | 8.5×           | 24× |
+| vip9r                                     | 1.05×                 | 8.5×           | 24× |
 | ogv.js (libvpx Wasm)                      | 0.59×                 | 4.1×           | 11× |
 | WebCodecs (libvpx)                        | 4.5×                  | 30×            | 83× |
 
@@ -45,11 +45,11 @@ Multiples of realtime, higher is better.
 
 |                                           | Google TV Streamer 4K | Pixel 9a       | PC   |
 | ----------------------------------------- | --------------------- | -------------- | ---- |
-| vip9r, [d8 shell](https://v8.dev/docs/d8) | 30.09                 | 5.70           | 1.41 |
+| vip9r, [d8 shell](https://v8.dev/docs/d8) | 29.55                 | 5.70           | 1.41 |
 | ffvp9 single core                         | 22.7                  | 2.56           | 1.11 |
 | ffvp9 4 cores                             | 7.82                  | <sup>[1]</sup> | 0.56 |
 | _in browser:_ <sup>[2]</sup>              |                       |                |      |
-| vip9r                                     | 32.1                  | 3.9            | 1.4  |
+| vip9r                                     | 31.7                  | 3.9            | 1.4  |
 | ogv.js (libvpx Wasm)                      | 56.7                  | 8.1            | 2.9  |
 | WebCodecs (libvpx)                        | 7.4                   | 1.1            | 0.4  |
 

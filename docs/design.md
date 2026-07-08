@@ -648,6 +648,43 @@ clips, where adaptation never runs — so "skip counts when adaptation is off"
 and per-thread counts merge both stay measured instead of optimized against
 a corpus that cannot see them.
 
+## Unchecked core (2026-07-07)
+
+The wasm module is built with a patched `core`: `panic_bounds_check` and
+`slice_index_fail` are `inline(always)` + `unreachable_unchecked()`, so LLVM
+deletes every slice/array bounds-check branch module-wide (301 callsites in
+the last stock build; decode_residual 107, loop filter 36, subpel 35, IDCT
+24). Measured on the compliance-green build: A55 serial −3.3..−4.0%, A55
+pooled −1.7..−2.2%, X4 serial −1.5% frame time. Out-of-bounds indexing is
+undefined behavior inside the module; the wasm sandbox is the containment
+boundary, and the in-tree containment guards (`check_band_*`,
+`check_window_rect`) stay — removing them measured only ~−0.4%.
+
+Mechanism (`nix/unchecked-rustc.nix` + `nix/disarm-core-checks.py`): a
+symlink-farm sysroot over the stock toolchain with the two core source files
+edited — anchor-matched disarm-and-append, not a context diff, so upstream
+body churn doesn't break it — and a `rustc-unchecked` wrapper pinning
+`--sysroot`. build-std
+recompiles `core` from sysroot sources, so no cargo/RUSTFLAGS changes are
+involved. All build paths must agree on `RUSTC`:
+
+- devshell env (interactive cargo, perf/golden python scripts inherit it),
+- `wasm-golden`/`wasm-microbench`/`wasm-tests` wrappers (self-export, so
+  `nix run` outside the devshell agrees),
+- grinder podman env (`--unsetenv-all` sandbox; without it the grinder builds
+  and benches a stock module against cooked baselines).
+
+Operational notes:
+
+- To debug a suspected OOB (garbage frames, hash mismatches with no panic):
+  rebuild stock with `env -u RUSTC cargo build ...` to restore trapping
+  bounds checks.
+- A toolchain bump that moves the two anchor lines fails the sysroot
+  derivation loudly; a signature change fails the core build (lang-item ABI
+  or callsite arity). Update `disarm-core-checks.py` then.
+- Perf baselines built before 2026-07-07 are stock; benching a cooked
+  candidate against one conflates the core patch with the change under test.
+
 ## Work shape
 
 - The interactive session owns intent, harness setup, measurement, and review.

@@ -109,4 +109,10 @@ Suggested layout:
 
 ## Notes from the orchestrator
 
-- TBD, nothing right now.
+- The toolchain compiles the wasm module with a patched `core`: slice/array
+  bounds checks are removed module-wide (out-of-bounds is undefined behavior,
+  contained by the wasm sandbox). Consequences for you:
+  - Keep writing idiomatic safe indexing. Do not reach for `get_unchecked` or
+    restructure code to "avoid bounds checks" — they already cost nothing.
+  - An out-of-bounds bug will not panic or trap; it shows up as frame hash
+    mismatches or garbage output. Validate hashes accordingly.

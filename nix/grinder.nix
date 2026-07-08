@@ -3,6 +3,7 @@
   rustToolchain,
   codex,
   armIsaXml,
+  rustcUnchecked,
 }: let
   inherit (pkgs) lib;
 
@@ -79,6 +80,10 @@
       # Threaded-wasm build: stable cargo honors the [unstable] build-std
       # table in rust/.cargo/config.toml only with this in its environment.
       ++ podmanEnv "RUSTC_BOOTSTRAP" "1"
+      # Bounds-check-free wasm builds (nix/unchecked-rustc.nix). Without this
+      # the sandbox builds a stock module and every grinder bench compares
+      # apples to oranges. Wrapper resolves via the ro /nix/store mount.
+      ++ podmanEnv "RUSTC" "${rustcUnchecked}/bin/rustc-unchecked"
       ++ podmanEnv "CODEX_HOME" "/codex-home"
       ++ podmanEnv "SSL_CERT_FILE" caBundle
       ++ podmanEnv "NIX_SSL_CERT_FILE" caBundle

@@ -1364,3 +1364,20 @@ streamer cpu0:
 - Decoder unaffected: the `v128_any_true` workaround is correct on every
   tier and is semantically what an emptiness check wants; it stays. Kernel
   comment and tracker updated to name the real mechanism.
+
+## 2026-07-07 — Slice bounds checks compiled out module-wide
+
+- The wasm module now builds against a patched `core` sysroot
+  (`nix/unchecked-rustc.nix`): `panic_bounds_check` and `slice_index_fail`
+  become `inline(always)` + `unreachable_unchecked()`, and LLVM deletes all
+  301 bounds-check branches (107 of them in decode_residual). Module size
+  288271 → 272672 B. Counterbalanced device benches: A55 serial −3.3%
+  (jellyfish) / −4.0% (BBB), A55 pooled −1.7..−2.2%, X4 serial −1.5%.
+- Out-of-bounds indexing is now UB contained by the wasm sandbox — garbage
+  frames instead of a trap. Compliance corpus stays bit-exact: 307/307
+  serial and pooled. The decoder's own containment guards stay (worth only
+  ~−0.4%, kept for debuggability).
+- `RUSTC` is pinned to the wrapper in the devshell, the `wasm-*` runners,
+  and the grinder sandbox, so interactive builds, golden/perf harnesses, and
+  implementor benches all measure the same module. Stock build for OOB
+  debugging: `env -u RUSTC cargo build ...`.

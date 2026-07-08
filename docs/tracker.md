@@ -653,3 +653,9 @@ not an expected harvest.
       clips need on top of threads; fusion's win came from tightening phase
       interleave, the opposite of phase batching. M6 threads own the remaining
       A55 gap; details in log.md
+
+- [x] toolchain: slice bounds checks compiled out module-wide via patched core
+      sysroot (2026-07-07). A55 serial −3.3..−4.0%, A55 pooled −1.7..−2.2%, X4
+      serial −1.5%; compliance 307/307 serial+pooled. Containment guards kept
+      (~−0.4%, debuggability). Mechanism and RUSTC wiring: design.md
+      "Unchecked core"
