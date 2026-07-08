@@ -4,8 +4,13 @@ import { spawnWorkerPool } from "./pool";
 import type { WorkerPool } from "./pool";
 import { parseIvf as demuxIvf } from "../ivf";
 import { parseWebm } from "../webm";
-import { createVip9rMemory, makeVip9rImports } from "./wasm-env";
+import {
+  createVip9rMemory,
+  makeVip9rImports,
+  VIP9R_MEMORY_PAGES,
+} from "./wasm-env";
 import type { WasmLog, WasmLogSink } from "./wasm-env";
+import { expandedVip9rModuleBytes, INPUT_TAIL_PAGES } from "./expanded-memory";
 
 export { formatWasmLog, WasmLogKind } from "./wasm-env";
 export type { WasmLog, WasmLogSink } from "./wasm-env";
@@ -110,8 +115,9 @@ export type ComparisonReport = {
   skippedOutputFrames: number;
   comparisons: FrameComparison[];
   expectedCount: number;
-  // Final linear memory size; fixed at link time, so this just confirms the
-  // session shape (createVip9rMemory in wasm-env.ts).
+  // Final linear memory size; non-growable, so this just confirms the session
+  // shape (the fixed 64 MiB, or the expanded d8-only shape for oversized
+  // vectors — see chooseVip9rSession).
   finalMemoryBytes?: number;
 };
 
@@ -358,12 +364,13 @@ export function compareWasmToGolden(
   args: DriverArgs,
   io: GoldenIo,
 ): ComparisonReport {
-  const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
+  const wasmBytes = new Uint8Array(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
+  const session = chooseVip9rSession(wasmBytes, decoderDimensions, io.log);
   // The single pool (if any) lives for the whole comparison; workers die with
   // the process (Worker.terminate at exit is the pinned shutdown story).
   const { decoder } = instantiateVp9Decoder(
-    wasm,
+    session,
     decoderDimensions,
     io.log,
     args.pool,
@@ -402,8 +409,9 @@ export function benchmarkWasmGolden(
     throw new Error("benchmark options missing");
   }
 
-  const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
+  const wasmBytes = new Uint8Array(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
+  const session = chooseVip9rSession(wasmBytes, decoderDimensions, io.log);
   const window = normalizeDecodeWindow(args.bench);
   const warmupMs = validNonNegativeInteger(
     "benchmark warmup ms",
@@ -422,7 +430,7 @@ export function benchmarkWasmGolden(
   const makeDecoder = () => {
     livePool?.terminate();
     const made = instantiateVp9Decoder(
-      wasm,
+      session,
       decoderDimensions,
       io.log,
       args.pool,
@@ -490,8 +498,9 @@ export function timedWasmGolden(args: DriverArgs, io: GoldenIo): TimedReport {
     throw new Error("timed options missing");
   }
 
-  const wasm = new WebAssembly.Module(io.readbuffer(args.wasmPath));
+  const wasmBytes = new Uint8Array(io.readbuffer(args.wasmPath));
   const { input, golden, decoderDimensions } = readGoldenWorkload(args, io);
+  const session = chooseVip9rSession(wasmBytes, decoderDimensions, io.log);
   const requested = args.timed.packets;
   if (requested !== undefined && requested > input.packets.length) {
     throw new Error(
@@ -510,7 +519,7 @@ export function timedWasmGolden(args: DriverArgs, io: GoldenIo): TimedReport {
   const makeDecoder = () => {
     livePool?.terminate();
     const made = instantiateVp9Decoder(
-      wasm,
+      session,
       decoderDimensions,
       io.log,
       args.pool,
@@ -1750,15 +1759,59 @@ function readGoldenWorkload(
   return { input, golden, decoderDimensions };
 }
 
+// One compiled module plus its memory page count, chosen once per run.
+// Vectors that fit the fixed 64 MiB session shape use the stock module; the
+// few that don't (libvpx resize vectors up to 4096x2304) run over a d8-only
+// limits-patched module sized to the vector's exact requirement plus the
+// standard packet-tail budget (expanded-memory.ts).
+type Vip9rSession = {
+  wasm: WebAssembly.Module;
+  memoryPages: number;
+};
+
+function chooseVip9rSession(
+  wasmBytes: Uint8Array<ArrayBuffer>,
+  decoderDimensions: { width: number; height: number },
+  log: WasmLogSink,
+): Vip9rSession {
+  const wasm = new WebAssembly.Module(wasmBytes);
+  // vip9r_required_pages is pure, so a throwaway stock instance answers the
+  // fit question; its memory is discarded (lazily committed, address space
+  // only).
+  const probe = new WebAssembly.Instance(
+    wasm,
+    makeVip9rImports(createVip9rMemory(), log),
+  );
+  const requiredPagesExport = probe.exports.vip9r_required_pages;
+  if (typeof requiredPagesExport !== "function") {
+    throw new Error("missing wasm export: vip9r_required_pages");
+  }
+  const { width, height } = decoderDimensions;
+  const requiredPages = requiredPagesExport(width, height) as number;
+  if (requiredPages < 0) {
+    throw new Error(
+      `vip9r_required_pages(${width}x${height}): ${requiredPages}`,
+    );
+  }
+  const pages = requiredPages + INPUT_TAIL_PAGES;
+  if (pages <= VIP9R_MEMORY_PAGES) {
+    return { wasm, memoryPages: VIP9R_MEMORY_PAGES };
+  }
+  return {
+    wasm: new WebAssembly.Module(expandedVip9rModuleBytes(wasmBytes, pages)),
+    memoryPages: pages,
+  };
+}
+
 function instantiateVp9Decoder(
-  wasm: WebAssembly.Module,
+  session: Vip9rSession,
   decoderDimensions: { width: number; height: number },
   log: WasmLogSink,
   pool: boolean,
 ): { decoder: Vp9Decoder; pool?: WorkerPool } {
-  const memory = createVip9rMemory();
+  const memory = createVip9rMemory(session.memoryPages);
   const instance = new WebAssembly.Instance(
-    wasm,
+    session.wasm,
     makeVip9rImports(memory, log),
   );
   const decoder = new Vp9Decoder(
@@ -1769,7 +1822,7 @@ function instantiateVp9Decoder(
   if (!pool) {
     return { decoder };
   }
-  const workers = spawnWorkerPool(wasm, memory);
+  const workers = spawnWorkerPool(session.wasm, memory);
   const activate = instance.exports.vip9r_pool_activate;
   if (typeof activate !== "function") {
     workers.terminate();

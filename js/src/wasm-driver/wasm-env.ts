@@ -20,19 +20,24 @@ const utf8Decoder =
 // exactly this shape — drift between this constant and the linker value fails
 // every instantiation loudly. The wasm side still sizes itself dynamically;
 // 1024 pages is policy, pinned by the corpus_ceiling_fits_fixed_memory wasm
-// test: corpus max (1080p) needs 541 pages, plus an 8 MiB packet-tail budget
+// test: the 1080p ceiling needs 541 pages, plus an 8 MiB packet-tail budget
 // (anchors: largest 1080p corpus packet 504 KiB, bbb_1920x1080 tile_1x4; VP9
 // level 4.1 CPB cap 3 MiB; lossless keyframe near raw 4:2:0, 3.1 MiB — a
 // multi-frame lossless superframe is the accepted fail-loud RESOURCE_LIMIT
 // case, hit when reserve_input can't grow the non-growable memory). V8
 // reserves the full 64 MiB upfront for shared memories, but physical pages
 // materialize on first touch, so untouched headroom is address space only.
-const VIP9R_MEMORY_PAGES = 1024;
+// A few libvpx resize vectors exceed the 1080p shape; the d8 golden driver
+// runs those over a limits-patched module (expanded-memory.ts) by passing an
+// expanded page count here. Web frontends always use the default.
+export const VIP9R_MEMORY_PAGES = 1024;
 
-export function createVip9rMemory(): WebAssembly.Memory {
+export function createVip9rMemory(
+  pages: number = VIP9R_MEMORY_PAGES,
+): WebAssembly.Memory {
   return new WebAssembly.Memory({
-    initial: VIP9R_MEMORY_PAGES,
-    maximum: VIP9R_MEMORY_PAGES,
+    initial: pages,
+    maximum: pages,
     shared: true,
   });
 }

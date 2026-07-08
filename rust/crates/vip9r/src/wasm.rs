@@ -556,10 +556,12 @@ mod tests {
     // Memory is pinned at link time (--initial-memory == --max-memory in
     // rust/.cargo/config.toml) while this module keeps sizing dynamically;
     // the test runner instantiates over a memory of exactly the link-time
-    // size. Pin the ceiling: the corpus maximum (1080p) plus the 8 MiB
+    // size. Pin the ceiling: the 1080p corpus ceiling plus the 8 MiB
     // packet-tail budget (anchors in createVip9rMemory, wasm-env.ts) must
     // fit, otherwise large sessions fail with RESOURCE_LIMIT at init on
-    // devices instead of here.
+    // devices instead of here. (A few resize vectors exceed this shape; the
+    // d8 golden driver runs those over a limits-patched module — see
+    // expanded-memory.ts.)
     #[test]
     fn corpus_ceiling_fits_fixed_memory() {
         let tail_pages = (8 << 20) / WASM_PAGE;

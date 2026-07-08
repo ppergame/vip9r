@@ -185,13 +185,21 @@ imported memory at exactly 1024 pages (`createVip9rMemory` in wasm-env.ts —
 a min == max declaration matches no other shape, so drift between the two
 constants fails every instantiation loudly). No scratch sizing step:
 instantiation is one compile, one instantiate. The ceiling is policy, pinned
-by the `corpus_ceiling_fits_fixed_memory` wasm test: corpus max (1080p)
+by the `corpus_ceiling_fits_fixed_memory` wasm test: the 1080p ceiling
 needs 541 pages plus an 8 MiB packet-tail budget (anchors: largest 1080p
 corpus packet 504 KiB, level 4.1 CPB 3 MiB, lossless keyframe ~3.1 MiB).
 The memory is non-growable: `reserve_input` never grows on the happy path
 (the tail is pre-granted; physical pages commit lazily), oversized sessions
 and packets fail with RESOURCE_LIMIT at `vip9r_init`/`reserve_input` (a
 multi-frame lossless superframe remains the accepted fail-loud case).
+Three libvpx resize vectors exceed the 1080p shape (up to 4096x2304, 2230
+required pages). The d8 golden driver alone covers them: it probes
+`vip9r_required_pages` over a throwaway stock instance and, when required +
+tail exceeds 1024 pages, rewrites the module's memory-import limits in place
+(same-length LEB128 splice, code section untouched, min == max preserved) and
+creates a matching memory (`chooseVip9rSession` in golden.ts,
+expanded-memory.ts). Web frontends never expand; those streams stay
+RESOURCE_LIMIT on the shipped ceiling.
 
 The result block is a `u32` table in wasm memory. `reserve_input` publishes the
 packet-tail pointer and capacity; JS copies one complete demuxed VP9
